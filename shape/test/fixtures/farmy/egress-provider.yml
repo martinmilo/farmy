@@ -1,0 +1,12 @@
+secrets:
+  provider: [bin/provider]
+  unlock: [TS_AUTHKEY]
+egress:
+  authkey: TS_AUTHKEY
+keys:
+  git:
+    secret: GIT_TOKEN
+    upstream: https://github.com
+    auth: basic
+    user: x-access-token
+    git: true

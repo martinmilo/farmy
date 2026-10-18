@@ -1,0 +1,87 @@
+# farmy.yml — copy this file into the containers folder as farmy.yml, then change what differs. Every key
+# is optional. No value in here is a secret: routes name secrets, and farmy obtains them when it starts.
+#
+# As it is, it fits the plainest setup: private repositories on GitHub over https with a token, Claude Code,
+# no secrets manager, no mesh. Without a secrets: section the shim asks for each route's secret on this
+# machine at the first start (FARMY_UNLOCK_COMMAND, the macOS Keychain or the Linux secret service under
+# farmy/<NAME>, else a hidden prompt), and the control container holds them until farmy lock
+# (docs/credentials.md).
+
+# farmy: '0.1.0'                         # optional exact folder pin (docs/distribution.md)
+# format: 1                             # absent means 1; newer formats need a capable release
+
+keys:
+  github:                                # git in the app containers goes through this route for repositories on its host
+    secret: GITHUB_TOKEN                 # a fine-grained token: Contents read and write on your repositories
+    upstream: https://github.com         # the host; one git route per host (codeberg.org, a Forgejo, a Gitea, a GitLab…)
+    auth: basic
+    user: x-access-token
+    git: true
+  anthropic:                             # Claude Code in api-key mode (agents below) goes through this route
+    secret: ANTHROPIC_API_KEY
+    upstream: https://api.anthropic.com
+    auth: header
+    header: x-api-key
+    # services: [shop]                   # only these services may use it; absent: every service
+  # codeberg:                            # a second host, its own token
+  #   secret: CODEBERG_TOKEN
+  #   upstream: https://codeberg.org
+  #   auth: basic
+  #   user: x-access-token               # check what your host expects as the user with a token
+  #   git: true
+  # github:                              # the same host over SSH instead: the secret is the private key's text;
+  #   secret: GITHUB_SSH_KEY             # the broker runs an SSH agent, the app gets its socket, an https repo: is cloned over SSH
+  #   upstream: ssh://git@github.com     # a port of its own: ssh://git@git.example.com:2222
+  #   auth: ssh
+  #   git: true
+  #   encoding: base64                   # when the key is stored base64-encoded
+  # openai:
+  #   secret: OPENAI_API_KEY
+  #   upstream: https://api.openai.com
+  #   auth: bearer
+  #   expose: OPENAI_BASE_URL            # the app containers get it, pointing at the route
+
+agents:                                  # the agents in every app image; none unless named here (farmy init asks and writes this)
+  claude:                                #   a catalogue name as it is, or fields that override the catalogue's
+    # mode: api-key                      #   (agents.yml next to farmy: claude, codex, gemini, opencode, cursor, copilot);
+  # codex: {}                            #   api-key: through the anthropic route above; default subscription: log in once inside
+                                         #   any container. An agent of your own has the same fields (FORMATS.md → Agents)
+
+# secrets:                               # a secrets manager instead of this machine: the provider fetches the routes' secrets,
+#   provider: [providers/env]            # and the shim obtains only the values under unlock: (docs/credentials.md, "Providers")
+#   unlock: [GITHUB_TOKEN, ANTHROPIC_API_KEY]
+#   # provider: [providers/infisical, --projectId, <id>, --env, dev]   with unlock: [INFISICAL_TOKEN], or universal auth:
+#   # provider: [providers/infisical, --client-id-from, INFISICAL_CLIENT_ID, --client-secret-from, INFISICAL_CLIENT_SECRET, --projectId, <id>, --env, dev]
+
+knowledge: true                          # the shared knowledge container for the agents
+setup_timeout: 30m                       # how long a service's setup command may run (s, m or h); it is stopped past that
+
+# egress:                                # filter apps without creating a mesh; factory agents are always filtered
+#   restrict: enforce                   # off, audit or enforce; audit records destinations and permits them
+#   allow: [docs.example.com]           # extra app destinations, beside registries, enabled agents and git hosts
+#   services:
+#     shop:
+#       allow: ['packages.example.com:443']
+# A service may also set restrict: true and egress: {allow: [...]} in its own definition.
+# Strongest wins across global restrict, definition restrict and definition egress.restrict:
+# enforce > audit > off (true/false remain aliases). Factory agents always stay enforced.
+# Filtering can combine with one of the upstream configurations below.
+# egress:                                # an existing HTTP proxy for every container and the provider (the corporate case):
+#   proxy: proxy.example.com:3128
+# egress:                                # or one node on your private mesh (Tailscale): a proxy every container and the provider use
+#   authkey: TS_AUTHKEY                  #   a value obtained like the others (list it under secrets.unlock); absent: start prints a registration URL
+#   join_timeout: 10m                    #   how long start waits for the node to register
+#   tailscale:
+#     login_server: https://headscale.example.com   # a control server of your own; omitted: Tailscale's
+
+# tools: [neovim, ripgrep]               # official verified pins; farmy toolbox bump writes tools.lock
+# packages: [imagemagick]                # distro packages, independent of pinned tools
+# shell: zsh                            # sh, bash or zsh; dev's interactive login shell
+# shared_data: [nvim]                    # only these names under .local/share and .cache; [] shares none
+# dotfiles:
+#   repo: https://git.example.com/dev/dotfiles.git
+#   install: install.sh                 # optional executable; omitted: merge dotted files into private HOME
+# notify:
+#   format: json                        # json, slack or ntfy
+#   url_secret: NOTIFY_URL               # alternatively a literal url; never copied to run state
+#   token_secret: NOTIFY_TOKEN

@@ -1,0 +1,11 @@
+repo: none
+image: debian:bookworm-slim
+commands:
+  setup: test -d .git || (git init -q -b main && mkdir -p src test && echo broken > src/app.txt && echo 'grep -q fixed src/app.txt' > test/check.sh && git add -A && git commit -q -m seed)
+  test: sh test/check.sh
+factory:
+  base: main
+  agent: fixer
+  protects: [test/]
+  max_iterations: 2
+  iteration_timeout: 2m

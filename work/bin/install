@@ -1,0 +1,66 @@
+#!/bin/sh
+# Standalone installer: Docker and POSIX utilities only.
+set -eu
+FARMY_DEFAULT_REGISTRY=''
+FARMY_DEFAULT_SOURCE=''
+FARMY_DEFAULT_GITHUB=''
+installer_root=$(cd "$(dirname "$0")/.." && pwd)
+release_scalar() {
+  awk -v key="$1" '$0 ~ ("^" key ":[[:space:]]*") {
+    sub("^" key ":[[:space:]]*", ""); sub(/[[:space:]]+$/, "")
+    if (($0 ~ /^\047/ && $0 ~ /\047$/) || ($0 ~ /^"/ && $0 ~ /"$/)) $0=substr($0,2,length($0)-2)
+    print; exit
+  }' "$2"
+}
+if [ -f "$installer_root/release.yml" ]; then
+  [ -n "$FARMY_DEFAULT_REGISTRY" ] || FARMY_DEFAULT_REGISTRY="ghcr.io/$(release_scalar owner "$installer_root/release.yml")/farmy"
+  [ -n "$FARMY_DEFAULT_GITHUB" ] || FARMY_DEFAULT_GITHUB=$(release_scalar github_url "$installer_root/release.yml")
+fi
+fail() { echo "farmy install: $*" >&2; exit 1; }
+valid_version() { printf '%s\n' "$1" | awk -F. 'NR!=1 || NF!=3 {exit 1} {for(i=1;i<=3;i++) if($i!~/^[0-9]+$/ || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; }
+quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+version=; destination=${HOME}/.local/bin
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --to) [ "$#" -ge 2 ] || fail '--to needs a version'; version=$2; shift 2 ;;
+    --dir) [ "$#" -ge 2 ] || fail '--dir needs a directory'; destination=$2; shift 2 ;;
+    *) fail "unknown argument $1; usage: bin/install [--to VERSION] [--dir DIR]" ;;
+  esac
+done
+[ -z "$version" ] || valid_version "$version" || fail 'version must be exact MAJOR.MINOR.PATCH'
+FARMY_REGISTRY=${FARMY_REGISTRY:-$FARMY_DEFAULT_REGISTRY}
+[ -n "$FARMY_REGISTRY" ] || fail 'release configuration is missing; obtain the installer release asset'
+registry=${FARMY_REGISTRY%/}
+command -v docker >/dev/null 2>&1 || fail 'Docker is required'
+pull() { echo "pulling $1" >&2; docker pull "$1" >/dev/null || fail "pull failed: $1"; }
+if [ -z "$version" ]; then
+  pull "$registry/farmy-control:latest"
+  version=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$registry/farmy-control:latest")
+  valid_version "$version" || fail 'latest has no valid farmy.version label'
+fi
+image=$registry/farmy-control:$version
+default_source=$FARMY_DEFAULT_SOURCE
+[ -z "$FARMY_DEFAULT_GITHUB" ] || default_source="${FARMY_DEFAULT_GITHUB%.git}.git#v$version:work"
+source_is_generated=1
+[ -z "${FARMY_SOURCE:-}" ] || source_is_generated=0
+pull "$image"
+mkdir -p "$destination"
+stage=$(mktemp -d "$destination/.farmy-install.XXXXXX")
+container=
+cleanup() { [ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$stage"; }
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+container=$(docker create "$image") || fail 'could not create an extraction container'
+docker cp "$container:/usr/local/lib/farmy/farmy" "$stage/source" || fail 'could not extract the standalone shim'
+[ -s "$stage/source" ] || fail 'the extracted shim is empty'
+sh -n "$stage/source" || fail 'the extracted shim is not valid POSIX shell'
+{
+  printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$version"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "$registry"
+  printf '\nFARMY_DEFAULT_SOURCE='; quote "${FARMY_SOURCE:-$default_source}"
+  printf '\nFARMY_DEFAULT_GITHUB='; quote "$FARMY_DEFAULT_GITHUB"
+  printf '\nFARMY_DEFAULT_SOURCE_IS_GENERATED='; quote "$source_is_generated"; printf '\n'
+  sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
+} > "$stage/farmy"
+chmod 755 "$stage/farmy"
+mv -f "$stage/farmy" "$destination/farmy"
+echo "installed farmy $version at $destination/farmy"

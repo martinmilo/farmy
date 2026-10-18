@@ -1,0 +1,1467 @@
+#!/usr/bin/env ruby
+# A fake `docker` for the acceptance tests. The Farmy vocabulary (support/farmy.rb) puts this folder
+# first on the PATH, so the program finds it the way it finds the real one. It never runs anything;
+# it records every call and keeps what it was asked for in the folder FAKE_DOCKER_JOURNAL names:
+#
+#   calls.log    one line per invocation, as a shell line
+#   state.json   containers, images, volumes, networks, and the commands run with exec
+#
+# What it understands is written in FORMATS.md ("Docker in the tests"); anything else is accepted,
+# answers nothing, exits 0, and is listed under "unhandled" in state.json. With FAKE_DOCKER_DOWN=1
+# every call fails the way the real client does when the daemon is not running.
+require "json"
+require "yaml"
+require "fileutils"
+require "shellwords"
+require "digest"
+require_relative "../egress"
+require_relative "../distribution"
+require_relative "../pipelines"
+require_relative "../toolbox"
+require_relative "../git_transport"
+
+# Files are read as UTF-8 whatever locale the machine has, as the kit reads the program's output.
+Encoding.default_external = Encoding::UTF_8
+
+JOURNAL = ENV["FAKE_DOCKER_JOURNAL"] or abort "fake docker: FAKE_DOCKER_JOURNAL is not set"
+FileUtils.mkdir_p(JOURNAL)
+File.open(File.join(JOURNAL, "calls.log"), "a") { |f| f.puts Shellwords.join(ARGV) }
+
+if ENV["FAKE_DOCKER_DOWN"] == "1"
+  $stderr.puts "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  exit 1
+end
+
+STATE_FILE = File.join(JOURNAL, "state.json")
+STATE_LOCK = File.open(File.join(JOURNAL, "state.lock"), "a+")
+STATE_LOCK.flock(File::LOCK_EX)
+$state_locked = true
+EMPTY = { "containers" => {}, "images" => {}, "volumes" => {}, "networks" => { "bridge" => { "project" => nil } },
+          "execs" => [], "runs" => [], "copies" => [], "logs" => {}, "unhandled" => [], "seq" => 0 }.freeze
+$state = File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : JSON.parse(JSON.generate(EMPTY))
+# a state a test prepared before any docker call (a log, a node on a volume) may lack the rest
+EMPTY.each { |k, v| $state[k] = JSON.parse(JSON.generate(v)) unless $state.key?(k) }
+def save_fake_state
+  temporary = "#{STATE_FILE}.#{Process.pid}.tmp"
+  File.write(temporary, JSON.pretty_generate($state))
+  File.rename(temporary, STATE_FILE)
+end
+
+# Docker calls may overlap. Only journal updates hold this lock: an agent or gate
+# waiting for another process must not serialize the containers being simulated.
+def release_fake_state
+  save_fake_state
+  $state_locked = false
+  STATE_LOCK.flock(File::LOCK_UN)
+end
+
+def acquire_fake_state
+  STATE_LOCK.flock(File::LOCK_EX)
+  $state_locked = true
+  $state = JSON.parse(File.read(STATE_FILE))
+end
+
+def finish_fake_run(record, status)
+  acquire_fake_state unless $state_locked
+  current = $state["runs"].find { |r| r["seq"] == record["seq"] }
+  current["exit"] = status if current
+  status
+end
+
+at_exit do
+  if $state_locked
+    save_fake_state
+    STATE_LOCK.flock(File::LOCK_UN)
+  end
+end
+
+def containers = $state["containers"]
+def images     = $state["images"]
+def volumes    = $state["volumes"]
+def networks   = $state["networks"]
+def next_seq   = $state["seq"] += 1
+def unhandled(what) = $state["unhandled"] << what
+def fail_with(message) = ($stderr.puts(message); exit 1)
+def short_id(name) = Digest::SHA256.hexdigest(name)[0, 12]
+def full_id(name)  = Digest::SHA256.hexdigest(name)
+
+# A pipeline test may hold a run's very first docker call (support/fakes/pipelines.rb).
+pipeline_hold_first_call_of_run
+
+# ── option parsing ────────────────────────────────────────────────────────────────────────────
+# Docker's options are many; each command lists the ones that take a value. Everything else that
+# starts with "-" is a flag. Returns [options, positionals]; a repeated option collects an array.
+def parse(argv, valued: [], stop_at_first_positional: false)
+  opts = Hash.new { |h, k| h[k] = [] }
+  positional = []
+  argv = argv.dup
+  until argv.empty?
+    arg = argv.shift
+    if arg == "--"
+      positional.concat(argv); break
+    elsif arg.start_with?("--") && arg.include?("=")
+      name, value = arg[2..].split("=", 2); opts[name] << value
+    elsif arg.start_with?("--")
+      name = arg[2..]
+      valued.include?(name) ? opts[name] << argv.shift : opts[name] << true
+    elsif arg.start_with?("-") && arg.length > 1
+      name = arg[1..]
+      if valued.include?(name) then opts[name] << (name.length == 1 && arg.length > 2 ? arg[2..] : argv.shift)
+      elsif name.length == 1 then opts[name] << true
+      elsif valued.include?(name[0]) then opts[name[0]] << name[1..]           # -t10
+      else name.each_char { |c| opts[c] << true }                                # -it
+      end
+    else
+      positional << arg
+      if stop_at_first_positional then positional.concat(argv); break end
+    end
+  end
+  [opts, positional]
+end
+
+def flag?(opts, *names) = names.any? { |n| opts.key?(n) && opts[n].any? }
+def value(opts, *names) = names.map { |n| opts.key?(n) ? opts[n].last : nil }.compact.first
+def values(opts, *names) = names.flat_map { |n| opts.key?(n) ? opts[n] : [] }
+
+# ── Go templates, the subset the tests expect a program to use ───────────────────────────────
+def render(template, object)
+  return JSON.generate(object) if template == "json"
+  tokens = template.sub(/\Atable\s+/, "").split(/(\{\{-?\s*.*?\s*-?\}\})/m).reject(&:empty?)
+  render_tokens(tokens, object, {}).gsub("\\n", "\n").gsub("\\t", "\t")
+end
+
+# {{range .X}} … {{end}} (with $k, $v := over a map or a list), {{if eq .A "b"}} … {{end}}, $k and $v,
+# and the single expressions evaluate knows: as much of Go's templates as the program uses.
+def render_tokens(tokens, object, vars)
+  out = +""
+  until tokens.empty?
+    token = tokens.shift
+    expr = token[/\A\{\{-?\s*(.*?)\s*-?\}\}\z/m, 1]
+    if expr.nil? then out << token
+    elsif expr == "end" then return out
+    elsif expr =~ /\Arange\s+(?:(\$\w+)\s*,\s*(\$\w+)\s*:=\s*)?(\.[\w.]*)\z/
+      k, v, path = $1, $2, $3
+      body = take_block(tokens)
+      collection = dig(object, path)
+      pairs = collection.is_a?(Hash) ? collection.to_a : Array(collection).each_with_index.map { |x, i| [i, x] }
+      pairs.each { |key, item| out << render_tokens(body.dup, item, vars.merge(k ? { k => key, v => item } : {})) }
+    elsif expr =~ /\Aif\s+eq\s+(\S+)\s+"([^"]*)"\z/
+      a, b = $1, $2
+      body = take_block(tokens)
+      left = a.start_with?("$") ? vars[a].to_s : dig(object, a).to_s
+      out << render_tokens(body.dup, object, vars) if left == b
+    elsif expr.start_with?("$") then out << vars[expr].to_s
+    else out << evaluate(expr, object)
+    end
+  end
+  out
+end
+
+# The tokens of a block up to its matching {{end}}, the end included (render_tokens stops there).
+def take_block(tokens)
+  depth = 0
+  body = []
+  while (t = tokens.shift)
+    body << t
+    e = t[/\A\{\{-?\s*(.*?)\s*-?\}\}\z/m, 1]
+    next unless e
+    depth += 1 if e =~ /\A(range|if)\b/
+    if e == "end"
+      break if depth.zero?
+      depth -= 1
+    end
+  end
+  body
+end
+
+def evaluate(expr, object)
+  case expr
+  when /\Aindex\s+(\.[\w.]*)\s+"([^"]*)"\z/ then format_value(dig(object, $1).then { |h| h.is_a?(Hash) ? h[$2] : nil })
+  when /\A\.Label\s+"([^"]*)"\z/            then object["_labels"]&.[]($1).to_s
+  when /\Ajson\s+(\.[\w.]*)\z/              then JSON.generate(dig(object, $1))
+  when /\A\.[\w.]*\z/                       then format_value(dig(object, expr))
+  when /\A"([^"]*)"\z/                      then $1
+  else unhandled("template: #{expr}"); ""
+  end
+end
+
+def dig(object, path)
+  path.split(".").reject(&:empty?).reduce(object) { |o, key| o.is_a?(Hash) ? o[key] : nil }
+end
+
+def format_value(v)
+  case v
+  when nil   then "<no value>"
+  when Hash  then "map[#{v.sort.map { |k, x| "#{k}:#{x}" }.join(" ")}]"
+  when Array then "[#{v.join(" ")}]"
+  else v.to_s
+  end
+end
+
+def print_table(objects, columns, format)
+  if format
+    objects.each { |o| puts render(format, o) }
+  else
+    puts columns.map { |c| c.upcase.ljust(16) }.join
+    objects.each { |o| puts columns.map { |c| o[c].to_s.ljust(16) }.join }
+  end
+end
+
+# ── containers ────────────────────────────────────────────────────────────────────────────────
+def find_container(name)
+  containers[name] || containers.find { |n, _| short_id(n) == name || full_id(n) == name }&.last
+end
+
+def container_name(name) = containers.key?(name) ? name : containers.keys.find { |n| short_id(n) == name || full_id(n) == name }
+
+def status_text(c)
+  case c["state"]
+  when "running" then "Up 2 minutes"
+  when "exited"  then "Exited (0) 2 minutes ago"
+  else "Created"
+  end
+end
+
+def ports_text(c) = c["ports"].map { |p| "#{p["ip"]}:#{p["host"]}->#{p["container"]}/#{p["proto"]}" }.join(", ")
+
+def ps_object(name, c)
+  { "ID" => short_id(name), "Names" => name, "Image" => c["image"], "Command" => "\"#{c["command"].join(" ")}\"",
+    "CreatedAt" => "2026-10-12 12:00:00 +0000 UTC", "RunningFor" => "2 minutes ago", "Status" => status_text(c),
+    "State" => c["state"], "Ports" => ports_text(c), "Labels" => c["labels"].map { |k, v| "#{k}=#{v}" }.join(","),
+    "_labels" => c["labels"], "Networks" => c["networks"].join(","), "Mounts" => c["volumes"].map { |v| v["name"] }.join(","),
+    "Size" => "0B", "Project" => c["project"], "Service" => c["service"] }
+end
+
+def inspect_object(name, c)
+  running = c["state"] == "running"
+  { "Id" => full_id(name), "Name" => "/#{name}", "Created" => "2026-10-12T12:00:00.000000000Z", "Path" => c["command"].first,
+    "Args" => c["command"].drop(1),
+    "State" => { "Status" => c["state"], "Running" => running, "Paused" => false, "Restarting" => false, "ExitCode" => 0,
+                 "Pid" => running ? 4242 : 0, "StartedAt" => "2026-10-12T12:00:00Z" }.merge(c["health"] ? { "Health" => { "Status" => c["health"], "FailingStreak" => 0 } } : {}),
+    "Image" => "sha256:#{full_id(c["image"])}",
+    "Config" => { "Hostname" => name, "Image" => c["image"], "Labels" => c["labels"], "Env" => c["env"].map { |k, v| "#{k}=#{v}" },
+                  "WorkingDir" => c["workdir"], "Cmd" => c["command"] },
+    "HostConfig" => { "Init" => c["init"], "Binds" => c["binds"].map { |b| "#{b["source"]}:#{b["target"]}" },
+                      "NetworkMode" => c["networks"].first || "default",
+                      "PortBindings" => c["ports"].to_h { |p| ["#{p["container"]}/#{p["proto"]}", [{ "HostIp" => p["ip"], "HostPort" => p["host"] }]] } },
+    "Mounts" => c["volumes"].map { |v| { "Type" => "volume", "Name" => v["name"], "Destination" => v["target"], "RW" => !v["ro"] } } +
+                c["binds"].map { |b| { "Type" => "bind", "Source" => b["source"], "Destination" => b["target"], "RW" => !b["ro"] } },
+    "NetworkSettings" => { "Ports" => c["ports"].to_h { |p| ["#{p["container"]}/#{p["proto"]}", [{ "HostIp" => p["ip"], "HostPort" => p["host"] }]] },
+                           "Networks" => c["networks"].to_h { |n| [n, { "IPAddress" => fake_ip(name), "Aliases" => [c["service"]].compact }] } } }
+end
+
+def match_filters?(filters, name, c)
+  filters.all? do |filter|
+    key, val = filter.split("=", 2)
+    case key
+    when "name"   then name.include?(val.to_s)
+    when "status" then c["state"] == val
+    when "label"  then val.include?("=") ? c["labels"][val.split("=", 2).first] == val.split("=", 2).last : c["labels"].key?(val)
+    when "id"     then full_id(name).start_with?(val.to_s)
+    when "ancestor" then c["image"] == val
+    when "network" then c["networks"].include?(val)
+    when "volume"  then c["volumes"].any? { |v| v["name"] == val }
+    else unhandled("ps filter #{filter}"); true
+    end
+  end
+end
+
+def cmd_ps(argv)
+  opts, = parse(argv, valued: %w[filter f format n last])
+  all = flag?(opts, "a", "all")
+  list = containers.select { |name, c| (all || c["state"] == "running") && match_filters?(values(opts, "filter", "f"), name, c) }
+  objects = list.map { |name, c| ps_object(name, c) }
+  if flag?(opts, "q", "quiet") then objects.each { |o| puts o["ID"] }
+  else print_table(objects, %w[ID Image Command CreatedAt Status Ports Names], value(opts, "format"))
+  end
+end
+
+def cmd_inspect(argv, kind: nil)
+  opts, names = parse(argv, valued: %w[format f type s])
+  kind ||= value(opts, "type")
+  format = value(opts, "format", "f")
+  failed = false
+  found = []
+  names.each do |name|
+    object = nil
+    object = inspect_object(container_name(name), find_container(name)) if (kind.nil? || kind == "container") && find_container(name)
+    object ||= image_object(name) if (kind.nil? || kind == "image") && find_image(name)
+    object ||= volume_object(name) if (kind.nil? || kind == "volume") && volumes.key?(name)
+    object ||= network_object(name) if (kind.nil? || kind == "network") && networks.key?(name)
+    if object then found << object
+    else
+      failed = true
+      $stderr.puts(case kind
+                   when "container" then "Error response from daemon: No such container: #{name}"
+                   when "image"     then "Error response from daemon: No such image: #{name}"
+                   else "Error: No such object: #{name}"
+                   end)
+    end
+  end
+  if format then found.each { |o| puts render(format, o) }
+  elsif !found.empty? || failed then puts JSON.pretty_generate(found)
+  end
+  exit 1 if failed
+end
+
+def set_state(argv, state, verb)
+  opts, names = parse(argv, valued: %w[t time s signal])
+  names.each do |name|
+    c = find_container(name) or fail_with("Error response from daemon: No such container: #{name}")
+    if verb == "rm" && c["state"] == "running" && !flag?(opts, "f", "force")
+      fail_with("Error response from daemon: cannot remove container \"#{name}\": container is running: stop the container before removing or force remove")
+    end
+    if verb == "rm" then containers.delete(container_name(name))
+    else
+      c["state"] = state
+      c["started_seq"] = next_seq if state == "running"
+    end
+    puts name
+  end
+end
+
+def cmd_exec(argv)
+  opts, rest = parse(argv, valued: %w[u user w workdir e env env-file detach-keys], stop_at_first_positional: true)
+  name, *command = rest
+  c = find_container(name.to_s) or fail_with("Error response from daemon: No such container: #{name}")
+  fail_with("Error response from daemon: container #{name} is not running") unless c["state"] == "running"
+  stdin = flag?(opts, "i", "interactive") && !$stdin.tty? ? $stdin.read(65_536).to_s : nil
+  $state["execs"] << { "container" => container_name(name), "command" => command, "user" => value(opts, "u", "user"), "env" => values(opts, "e", "env").to_h { |e| e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s] },
+                       "workdir" => value(opts, "w", "workdir"), "stdin" => stdin, "seq" => next_seq }
+  unlock_names(value(opts, "w", "workdir")) if command == %w[farmy unlock-names]
+  unlock_names(value(opts, "w", "workdir"), missing: held_names(container_name(name))) if command == %w[farmy unlock-names --missing]
+  rm_on_volumes(command, c["volumes"])
+  if command == ["farmy", "--version"]
+    labels = (find_image(c["image"]) || {})["labels"] || {}
+    puts "farmy #{labels['farmy.version']} (#{labels['farmy.hash']})"
+    exit 0
+  end
+  mesh_play(command, stdin, c)
+  gate_command(command, stdin, c)
+  keys_loaded(container_name(name), c) if command == %w[farmy-keys loaded]
+  toolbox_exec(opts, command, c, $state["execs"].last)
+  play(command, c)
+end
+
+# The one command whose output the shim may use: `farmy unlock-names` in the control container prints
+# the names under secrets.unlock of the farmy.yml in its working folder (the containers folder, mounted
+# at the same path), then, when that farmy.yml names no secrets.provider, the secret of every route under
+# keys:, once each, one per line, as the real farmy does.
+# The names the control container's holder has: every NAME a farmy command run in it received on stdin
+# (NAME=… or NAME:base64=…) since the container last started and since the last `farmy lock` run in it.
+def held_names(name)
+  c = containers[name] or return []
+  since = [c["started_seq"].to_i, *$state["execs"].select { |e| e["container"] == name && e["command"] == %w[farmy lock] }.map { |e| e["seq"].to_i }].max
+  $state["execs"].select { |e| e["container"] == name && e["command"].first == "farmy" && e["stdin"] && e["seq"].to_i > since }
+                 .flat_map { |e| e["stdin"].lines.filter_map { |l| l[/\A([A-Za-z_][A-Za-z0-9_]*)(?::base64)?=/, 1] } }.uniq
+end
+
+def unlock_names(workdir, missing: [])
+  file = File.join(workdir || Dir.pwd, "farmy.yml")
+  config = File.exist?(file) ? (YAML.safe_load(File.read(file)) rescue nil) : nil
+  config = {} unless config.is_a?(Hash)
+  names = Array(config.dig("secrets", "unlock"))
+  names += (config["keys"] || {}).values.filter_map { |r| r["secret"] if r.is_a?(Hash) } unless (config["secrets"] || {})["provider"]
+  (names.uniq - missing).each { |n| puts n }
+  exit 0
+end
+
+# Two more things a command in a container may ask, both state a test set: a read of /proc/net/tcp for
+# a port in hex (`:0BB8 `) exits 0 when the test said something listens on that port in this container,
+# else 1; `cat <path>` of a file on a volume mounted in the container prints what the test put there
+# (volume_file), else fails as cat does.
+# The mesh egress node, played from the state on its volume (farmy-egress): `tailscale status --json`
+# answers Running with the node's name and address when the volume holds a registered node, else
+# NeedsLogin; a command given an auth key (--auth-key among its words, or tskey- on its stdin)
+# registers the node on the volume, as tailscaled would.
+def mesh_play(command, stdin, c)
+  text = command.join(" ")
+  vol = (c["volumes"] || []).find { |v| v["name"] == "farmy-egress" } or return
+  store = ($state["volumes"][vol["name"]] ||= {})
+  if text.include?("--auth-key") || text.include?("--authkey") || stdin.to_s.include?("tskey-")
+    store["mesh"] ||= { "name" => "farmy-egress.tailnet.example", "address" => "100.90.12.34" }
+  end
+  return unless text.include?("tailscale status")
+  if (m = store["mesh"])
+    puts JSON.generate("BackendState" => "Running", "Self" => { "DNSName" => "#{m["name"]}.", "TailscaleIPs" => [m["address"]] })
+  else
+    puts JSON.generate("BackendState" => "NeedsLogin")
+  end
+  exit 0
+end
+
+# `rm -f <path>` (as words, or through sh -c) removes a file from a volume mounted at a prefix of the path.
+def rm_on_volumes(command, mounts)
+  words = command.dup
+  words = (Shellwords.split(words[2]) rescue []) if words[0] == "sh" && words[1].to_s.start_with?("-") && words.size == 3
+  return unless words[0] == "rm" || words[0].to_s.end_with?("/rm")
+  words.drop(1).reject { |w| w.start_with?("-") }.each do |path|
+    m = Array(mounts).find { |v| path.start_with?("#{v["target"]}/") } or next
+    files = (volumes[m["name"]] || {})["files"] or next
+    files.delete(path.delete_prefix("#{m["target"]}/"))
+  end
+end
+
+# The entrypoint clones as the container starts. Over an SSH route (SSH_AUTH_SOCK in the app's
+# environment) git signs through the keys container's agent, so the clone works only when that
+# container was loaded since it last started.
+def ssh_clone_result(c)
+  return "ok\n" unless (c["env"] || {}).key?("SSH_AUTH_SOCK")
+  keys = containers["#{c["project"]}-keys"] or return "failed\nError connecting to agent: No such file or directory\n"
+  loaded = $state["execs"].any? do |e|
+    e["container"] == "#{c["project"]}-keys" && e["command"].include?("load") && e["stdin"] && e["seq"].to_i > keys["started_seq"].to_i &&
+      !((JSON.parse(e["stdin"])["secrets"] || {}).empty? rescue true)
+  end
+  loaded ? "ok\n" : "failed\ngit@host: Permission denied (publickey).\nfatal: Could not read from remote repository.\n"
+end
+
+# Over a token route (DEV_GIT_ROUTES rewrites the repository's host to http://keys:9181/<route>/) git goes
+# through the keys container. A private repository (private_repository) clones only when that container was
+# loaded with the route's secret since it last started; a public one clones either way.
+def token_clone_result(c)
+  env = c["env"] || {}
+  pair = env["DEV_GIT_ROUTES"].to_s.split.map { |p| p.split("=", 2) }.find { |upstream, _| env["REPO"].to_s.start_with?("#{upstream.chomp("/")}/") }
+  return "ok\n" unless pair
+  route = pair.last[%r{\Ahttp://keys:9181/([^/]+)/}, 1] or return "ok\n"
+  # without the route's secret the broker forwards a git route without credentials: a public repository
+  # clones, a private one (private_repository) fails as git does when the host asks for a user name
+  return "ok\n" unless ($state["private_repos"] || []).include?(c["project"])
+  refused = "failed\nCloning into '/workspace'...\nfatal: could not read Username for '#{pair.first.chomp("/")}': terminal prompts disabled\n"
+  keys = containers["#{c["project"]}-keys"] or return refused
+  secret = (keys["env"] || {})["FARMY_ROUTE_#{route.upcase.tr("-", "_")}"].to_s.split.last
+  loaded = $state["execs"].any? do |e|
+    e["container"] == "#{c["project"]}-keys" && e["command"].include?("load") && e["stdin"] && e["seq"].to_i > keys["started_seq"].to_i &&
+      ((JSON.parse(e["stdin"])["secrets"] || {}).key?(secret) rescue false)
+  end
+  loaded ? "ok\n" : refused
+end
+
+def clone_result(c)
+  ssh = ssh_clone_result(c)
+  ssh == "ok\n" ? token_clone_result(c) : ssh
+end
+
+def container_name_of(c) = containers.key(c)
+
+# `farmy-keys loaded` in a keys container: the names of the last load since the container last started
+# (a restart or a new container has lost what was loaded before), one per line.
+def keys_loaded(name, c)
+  load = $state["execs"].reverse.find { |e| e["container"] == name && e["command"].include?("load") && e["stdin"] && e["seq"].to_i > c["started_seq"].to_i }
+  names = load ? ((JSON.parse(load["stdin"])["secrets"] || {}).keys rescue []) : []
+  names.each { |n| puts n }
+  exit 0
+end
+
+def answer_from_container(command, c)
+  text = command.join(" ")
+  if text.include?("/proc/net/tcp")
+    wanted = text.scan(/:([0-9A-Fa-f]{4})[ "']/).flatten.map { |h| h.to_i(16) }
+    exit((c["listening"] || []).any? { |p| wanted.include?(p.to_i) } ? 0 : 1)
+  end
+  cat = case command
+        in ["cat", path] then path
+        in ["sh", "-c" | "-lc", script] if script =~ /\Acat\s+(\S+)(\s+2>\/dev\/null)?\z/ then $1
+        else nil
+        end
+  return unless cat&.start_with?("/")
+  mount = (c["volumes"] || []).select { |v| cat == v["target"] || cat.start_with?("#{v["target"]}/") }
+                             .max_by { |v| v["target"].length }
+  return unless mount
+  files = (volumes[mount["name"]] || {})["files"] || {}
+  rel = cat.delete_prefix(mount["target"]).delete_prefix("/")
+  rel = File.join(mount["subpath"], rel) unless mount["subpath"].to_s.empty?
+  if files.key?(rel) then print files[rel]; exit 0
+  elsif rel == ".farmy-clone" && mount["target"] == "/workspace" && (c["env"] || {}).key?("REPO") then print(($state["clone_results"] || {})[container_name_of(c)] || clone_result(c)); exit 0   # the entrypoint's marker, as a clone that worked leaves it
+  else $stderr.puts "cat: #{cat}: No such file or directory"; exit 1
+  end
+end
+
+# Commands run in a container print nothing and exit 0, with two exceptions that let a slow command be
+# played: `sleep <seconds>` takes that long, and `timeout <seconds> …` ends what it wraps at that limit
+# with exit 124, as the real commands do. The text is read through `sh -c`/`sh -lc` wrappers.
+def play(command, container = nil)
+  answer_from_container(command, container) if container
+  words = command.dup
+  limit = nil
+  loop do
+    if words.first == "timeout" && words[1].to_s =~ /\A\d+(\.\d+)?s?\z/
+      limit = [limit, words[1].to_f].compact.min
+      words = words[2..]
+    elsif %w[sh bash /bin/sh /bin/bash].include?(words.first) && words[1].to_s.start_with?("-") && words[1].include?("c") && words.size == 3
+      words = (Shellwords.split(words[2]) rescue [words[2]])
+    else
+      break
+    end
+  end
+  curl_play(words, container)
+  return unless words.first == "sleep" && words[1].to_s =~ /\A\d+(\.\d+)?\z/
+  wanted = words[1].to_f
+  if limit && limit < wanted
+    sleep limit
+    exit 124
+  end
+  sleep wanted
+end
+
+RUN_VALUED = %w[device cap-add name v volume e env env-file network net label l w workdir u user p publish entrypoint mount add-host h hostname
+                restart m memory cpus platform pull log-driver log-opt tmpfs device cap-add cap-drop security-opt stop-signal
+                health-cmd dns ipc pid userns cgroupns shm-size ulimit sysctl group-add expose mac-address ip network-alias
+                stop-timeout cidfile domainname label-file volumes-from workdir detach-keys].freeze
+
+# ── the factory ───────────────────────────────────────────────────────────────────────────────
+# A volume has a real folder too, for what the factory's containers do to files: JOURNAL/volumes/<name>.
+# A `docker run` labelled farmy.role=git or test runs its command for real on those folders (the mount
+# targets in its words replaced by the folders; a read-only mount made read-only while it runs; a tmpfs a
+# fresh folder; `timeout <s>` honoured); one labelled agent plays what the test said the agent does
+# (agent_plays); fail_roles makes Docker refuse a role's container. Every run is kept in state["runs"].
+def volume_dir(name) = File.join(JOURNAL, "volumes", name).tap { |d| FileUtils.mkdir_p(d) }
+
+# An app container whose REPO is a file:// URL gets a real clone in its checkout volume, as its entrypoint
+# would leave it (the factory clones the checkout).
+def real_clone(c)
+  repo = (c["env"] || {})["REPO"].to_s
+  return unless repo.start_with?("file://")
+  src = (c["volumes"] || []).find { |v| v["target"] == "/workspace" } or return
+  dir = volume_dir(src["name"])
+  return unless Dir.empty?(dir)
+  branch = (c["env"] || {})["BRANCH"].to_s
+  args = ["git", "clone", "--quiet"] + (branch.empty? ? [] : ["--branch", branch]) + [repo, dir]
+  system(git_env, *args, out: File::NULL, err: File::NULL)
+end
+
+def git_env
+  { "GIT_CONFIG_NOSYSTEM" => "1", "GIT_CONFIG_GLOBAL" => File::NULL, "GIT_TERMINAL_PROMPT" => "0",
+    "GIT_AUTHOR_NAME" => "Fake Docker", "GIT_AUTHOR_EMAIL" => "fake@example.com",
+    "GIT_COMMITTER_NAME" => "Fake Docker", "GIT_COMMITTER_EMAIL" => "fake@example.com" }
+end
+
+def run_volume_specs(opts)
+  values(opts, "v", "volume") + values(opts, "mount").map do |spec|
+    parts = spec.to_s.split(",").to_h { |part| key, val = part.split("=", 2); [key, val || true] }
+    { "type" => parts.fetch("type", "volume"), "source" => parts["source"] || parts["src"],
+      "target" => parts["target"] || parts["dst"] || parts["destination"],
+      "read_only" => [parts["readonly"], parts["ro"]].any? { |val| val == true || val == "true" || val == "1" },
+      "volume" => { "subpath" => parts["volume-subpath"] } }
+  end
+end
+
+def run_mounts(opts) = split_volumes(run_volume_specs(opts), nil, {}).first
+
+def run_tmpfs(opts)
+  values(opts, "tmpfs").map { |t| { "target" => t.to_s.split(":").first, "options" => t.to_s.split(":", 2)[1].to_s } }
+end
+
+# Replaces the mount targets in a word by their folders (longest first), where a target stands as a path.
+def map_paths(word, table)
+  table.sort_by { |t, _| -t.length }.reduce(word) do |w, (target, dir)|
+    w.gsub(%r{(?<![\w./-])#{Regexp.escape(target)}(?=/|\z|[\s'"):;=])}) { dir }
+  end
+end
+
+# The user a container runs as, as a uid: dev is 1001 (the toolbox's user), no -u is root.
+def run_uid(opts)
+  u = value(opts, "u", "user").to_s.split(":").first.to_s
+  { "" => "0", "root" => "0", "dev" => "1001" }.fetch(u, u)
+end
+
+# `chown <uid>[:<gid>] <mount target>` run as root makes that volume the uid's (it runs nowhere else).
+def chown_volume(opts, process, record)
+  words = process.reject { |w| w.start_with?("-") }
+  return unless words.first.to_s.end_with?("chown") && words.size == 3 && run_uid(opts) == "0"
+  m = run_mounts(opts).find { |x| x["target"] == words[2] } or return
+  volumes[m["name"]]["owner"] = words[1].split(":").first
+  record["exit"] = 0
+  exit 0
+end
+
+# git refuses a repository owned by someone else, and a folder it may not write: as the real git says it.
+def git_ownership_refusal(opts, mounts)
+  uid = run_uid(opts)
+  mounts.each do |m|
+    owner = (volumes[m["name"]] || {})["owner"]
+    next if owner.nil? || owner == uid
+    if File.directory?(File.join(volume_dir(m["name"]), ".git"))
+      $stderr.puts "fatal: detected dubious ownership in repository at '#{m["target"]}/.git'"
+      $stderr.puts "To add an exception for this directory, call:"
+      $stderr.puts ""
+      $stderr.puts "\tgit config --global --add safe.directory #{m["target"]}"
+      $stderr.puts "fatal: Could not read from remote repository."
+      $stderr.puts ""
+      $stderr.puts "Please make sure you have the correct access rights"
+      $stderr.puts "and the repository exists."
+      return true
+    elsif !m["ro"]
+      $stderr.puts "fatal: could not create work tree dir '#{m["target"]}': Permission denied"
+      return true
+    end
+  end
+  false
+end
+
+def factory_play(role, opts, process, record)
+  if Array($state["fail_roles"]).include?(role)
+    $stderr.puts "docker: Error response from daemon: failed to create task for container: OCI runtime create failed: unable to start container process."
+    record["exit"] = 125
+    exit 125
+  end
+  mounts = run_mounts(opts)
+  tmpfs = run_tmpfs(opts)
+  record["mounts"] = mounts
+  record["tmpfs"] = tmpfs
+  limit = nil
+  words = process.dup
+  if words.first == "timeout" && words[1].to_s =~ /\A\d+\z/
+    limit = words[1].to_i
+    words = words.drop(2)
+  end
+  if role == "git" && git_ownership_refusal(opts, mounts)
+    record["exit"] = 128
+    exit 128
+  end
+  role == "agent" ? play_agent(opts, mounts, tmpfs, limit, record) : run_for_real(opts, words, mounts, tmpfs, limit, record)
+end
+
+# A way out: a network made without --internal (or Docker's own bridge); none and internal networks have none.
+def outbound?(nets) = Array(nets).any? { |n| n == "bridge" || (n != "none" && networks[n] && !networks[n]["internal"]) }
+
+# Out to the internet: through the proxy its environment names (which must resolve, or be a DNS name on a
+# network with a way out), else directly on a network with a way out.
+def reaches_out?(nets, env)
+  proxy = (env["HTTPS_PROXY"] || env["https_proxy"]).to_s[%r{\A\w+://([^:/]+)}, 1]
+  return (proxy.include?(".") ? outbound?(nets) : resolvable_names(nets).include?(proxy)) if proxy
+  outbound?(nets)
+end
+
+# The agent's model: through its broker (a variable pointing at http://keys:9181/…: keys must resolve, and the
+# broker must reach out), else straight out.
+def agent_reaches_model?(record)
+  env = record["env"] || {}
+  nets = Array(record["networks"])
+  return reaches_out?(nets, env) unless env.values.any? { |v| v.to_s.start_with?("http://keys:9181/") }
+  return false unless resolvable_names(nets).include?("keys")
+  broker = containers.values.find { |c| !(Array(c["networks"]) & nets).empty? && (Array(c["aliases"]).include?("keys") || c["service"] == "keys") }
+  broker && reaches_out?(broker["networks"], broker["env"] || {})
+end
+
+def play_agent(opts, mounts, tmpfs, limit, record)
+  unless agent_reaches_model?(record)
+    puts "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+    record["exit"] = 1
+    save_fake_state
+    exit 1
+  end
+  service = values(opts, "label", "l").to_h { |l| l.split("=", 2) }["farmy.service"]
+  plays = ($state["agent_plays"] ||= {})[service] || []
+  index = (($state["agent_played"] ||= {})[service] ||= 0)
+  $state["agent_played"][service] = index + 1
+  play = plays[index] || {}
+  Array(play["requests"]).each do |request|
+    network_request(record, record["name"], request.fetch("url"), direct: request["direct"] == true, proxy: request["proxy"])
+  end
+  save_fake_state
+  work = mounts.find { |m| m["target"] == "/workspace" }
+  if work && !work["ro"]
+    dir = volume_dir(work["name"])
+    covered = tmpfs.map { |t| t["target"] }
+    (play["writes"] || {}).each do |path, text|
+      full = "/workspace/#{path}"
+      next if covered.any? { |c| full == c || full.start_with?("#{c}/") }   # under a tmpfs: lands nowhere that lasts
+      file = File.join(dir, path)
+      FileUtils.mkdir_p(File.dirname(file))
+      File.write(file, text)
+    end
+    (play["deletes"] || []).each { |path| FileUtils.rm_f(File.join(dir, path)) }
+  end
+  print play["says"].to_s
+  release_fake_state
+  pipeline_agent_barrier(play, record) if respond_to?(:pipeline_agent_barrier, true)
+  idle = play["idle"].to_f
+  if limit && idle > limit
+    sleep limit
+    exit finish_fake_run(record, 124)
+  end
+  sleep idle if idle > 0
+  exit finish_fake_run(record, (play["exit"] || 0).to_i)
+end
+
+# The names a container can resolve: the containers on the networks it is attached to, by container name,
+# compose service and alias. The default bridge and none resolve nothing.
+def resolvable_names(nets)
+  nets = Array(nets) - ["bridge", "none", "default"]
+  names = []
+  containers.each do |n, c|
+    next if (Array(c["networks"]) & nets).empty?
+    names << n << c["service"]
+    names.concat(Array(c["aliases"]))
+  end
+  Array($state["network_joins"]).each { |j| names.concat(j["aliases"]) if j["action"] == "connect" && nets.include?(j["network"]) }
+  names.compact.uniq
+end
+
+# The container names a git container's environment leans on: its proxies, its ProxyCommand, its broker.
+def names_needed(env)
+  out = []
+  %w[HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy].each do |k|
+    host = env[k].to_s[%r{\A\w+://([^:/]+)}, 1]
+    out << [host, "proxy", env[k].to_s[%r{:(\d+)}, 1]] if host
+  end
+  env.each do |k, v|
+    v.to_s.scan(/-x ([^\s:']+):(\d+)/) { |h, port| out << [h, "proxy", port] }
+    k.to_s.start_with?("GIT_CONFIG_VALUE_") || next
+    key = env["GIT_CONFIG_KEY_#{k.delete_prefix("GIT_CONFIG_VALUE_")}"].to_s
+    out << [$1, "route", nil] if key =~ %r{\Aurl\.http://([^:/]+)}
+  end
+  out.reject { |h, _, _| h.include?(".") || h == "localhost" }.uniq
+end
+
+def unresolved_refusal(opts, words, record)
+  return false unless words.join(" ") =~ /git (fetch|push|pull|ls-remote)/
+  missing = names_needed(record["env"]).reject { |h, _, _| resolvable_names(record["networks"]).include?(h) }
+  return false if missing.empty?
+  host, kind, port = missing.first
+  if kind == "proxy"
+    $stderr.puts "nc: getaddrinfo for host \"#{host}\" port #{port}: Name or service not known"
+    $stderr.puts "kex_exchange_identification: Connection closed by remote host"
+    $stderr.puts "fatal: Could not read from remote repository."
+  else
+    $stderr.puts "fatal: unable to access 'http://#{host}:9181/': Could not resolve host: #{host}"
+  end
+  true
+end
+
+def run_for_real(opts, words, mounts, tmpfs, limit, record)
+  if record["labels"]["farmy.role"] == "git" && unresolved_refusal(opts, words, record)
+    record["exit"] = 128
+    exit 128
+  end
+  table = {}
+  mounts.each { |m| table[m["target"]] = File.join(volume_dir(m["name"]), m["subpath"].to_s) }
+  Array(record["binds"]).each { |m| table[m["target"]] = m["source"] }
+  tmpfs.each { |t| table[t["target"]] = File.join(JOURNAL, "tmpfs", "#{next_seq}").tap { |d| FileUtils.mkdir_p(d) } }
+  env = git_env.merge("PATH" => ENV["PATH"], "HOME" => File.join(JOURNAL, "home").tap { |d| FileUtils.mkdir_p(d) })
+  values(opts, "e", "env").each { |e| k, v = e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s]; env[k] = map_paths(v, table) }
+  env.merge!(pipeline_real_env(record))
+  workdir = value(opts, "w", "workdir")
+  cwd = workdir ? map_paths(workdir, table) : JOURNAL
+  argv = words.map { |w| map_paths(w, table) }
+  if $state["required_git_transport"] && record["labels"]["farmy.role"] == "git"
+    argv = toolbox_git_process(record, argv, env, table)
+  end
+  readonly = mounts.select { |m| m["ro"] }.map { |m| table[m["target"]] }
+  readonly.each { |d| system("chmod", "-R", "a-w", d) }
+  release_fake_state
+  status = nil
+  begin
+    pid = Process.spawn(env, *argv, chdir: cwd, unsetenv_others: false)
+    if limit
+      deadline = Time.now + limit
+      until (done = Process.wait(pid, Process::WNOHANG)) || Time.now > deadline
+        sleep 0.05
+      end
+      if done then status = $?.exitstatus || (128 + $?.termsig.to_i)
+      else Process.kill("KILL", pid) rescue nil; Process.wait(pid) rescue nil; status = 124
+      end
+    else
+      Process.wait(pid)
+      status = $?.exitstatus || (128 + $?.termsig.to_i)
+    end
+  rescue Errno::ENOENT => e
+    $stderr.puts "docker: Error response from daemon: #{e.message}"
+    status = 127
+  ensure
+    readonly.each { |d| system("chmod", "-R", "u+w", d) }
+  end
+  exit finish_fake_run(record, status.to_i)
+end
+
+def cmd_run(argv, start: true, attached: nil)
+  opts, rest = parse(argv, valued: RUN_VALUED, stop_at_first_positional: true)
+  image, *command = rest
+  name = value(opts, "name")
+  name ||= "created-#{next_seq}" unless start
+  env = values(opts, "e", "env").to_h { |e| e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s] }
+  volumes_named, binds = split_volumes(run_volume_specs(opts), nil, {})
+  built = find_image(image) || {}
+  entrypoint = value(opts, "entrypoint") ? [value(opts, "entrypoint")] : (built["entrypoint"] || [])
+  process = entrypoint + (command.empty? ? (built["cmd"] || []) : command)
+  rm_on_volumes(process, volumes_named)
+  labels = values(opts, "label", "l").to_h { |l| l.split("=", 2) }
+  stdin = flag?(opts, "i", "interactive") && !$stdin.tty? ? $stdin.read : nil
+  record = { "image" => image, "command" => command, "name" => name, "env" => env, "seq" => next_seq,
+             "volumes" => volumes_named.map { |v| v["name"] }, "binds" => binds, "process" => process,
+             "labels" => labels, "networks" => attached || values(opts, "network", "net"), "user" => value(opts, "u", "user"), "stdin" => stdin }
+  volumes_named.each { |v| volumes[v["name"]] ||= { "project" => nil, "labels" => {}, "owner" => "0" } }
+  if !start && labels["farmy.role"] && name
+    # created now, played when `docker start -a` runs it, on the networks it is attached to by then
+    ($state["created_runs"] ||= {})[name] = argv
+  else
+    $state["runs"] << record
+    check_git_container_transport(record, volumes_named)
+    chown_volume(opts, process, record)
+    play_service_clone(record, volumes_named)
+    toolbox_run(opts, process, record)
+    factory_play(labels["farmy.role"], opts, process, record) if labels["farmy.role"] && labels["farmy.role"] != "egress-gate"
+  end
+  if name && (!start || flag?(opts, "d", "detach") || !flag?(opts, "rm"))
+    containers[name] = { "project" => nil, "service" => nil, "image" => image, "command" => command.empty? ? ["/bin/sh"] : command,
+                         "state" => start ? "running" : "created", "labels" => values(opts, "label", "l").to_h { |l| l.split("=", 2) },
+                         "ports" => values(opts, "p", "publish").map { |p| port_entry(p) }.flatten, "env" => env, "init" => flag?(opts, "init"),
+                         "volumes" => volumes_named, "binds" => binds, "networks" => values(opts, "network", "net").then { |n| n.empty? ? ["bridge"] : n },
+                         "workdir" => value(opts, "w", "workdir"), "started_seq" => next_seq, "compose_file" => nil, "process" => process,
+                         "aliases" => values(opts, "network-alias") }
+    puts full_id(name) if flag?(opts, "d", "detach") || !start
+  end
+end
+
+# ── images ────────────────────────────────────────────────────────────────────────────────────
+def find_image(ref)
+  images[ref] || images["#{ref}:latest"] || images.find { |tag, _| short_id(tag) == ref || full_id(tag) == ref.to_s.delete_prefix("sha256:") }&.last
+end
+
+def image_object(ref)
+  tag = images.key?(ref) ? ref : images.find { |t, i| i.equal?(find_image(ref)) }&.first
+  i = find_image(ref)
+  { "Id" => "sha256:#{full_id(tag)}", "RepoTags" => [tag], "Created" => "2026-10-12T12:00:00Z",
+    "Config" => { "Labels" => i["labels"], "Env" => [], "Cmd" => nil }, "Metadata" => {}, "Size" => 0,
+    "_build" => i }
+end
+
+BUILD_VALUED = %w[t tag label f file target build-arg platform progress cache-from cache-to secret ssh network iidfile o output builder
+                  add-host m memory cpu-shares shm-size ulimit isolation attest provenance sbom annotation build-context].freeze
+
+def cmd_build(argv)
+  opts, positional = parse(argv, valued: BUILD_VALUED)
+  context = positional.last or fail_with("ERROR: \"docker buildx build\" requires exactly 1 argument.")
+  stdin_text = (context == "-" || value(opts, "f", "file") == "-") ? $stdin.read : nil
+  context_dir = context == "-" ? nil : File.expand_path(context)
+  dockerfile_path = value(opts, "f", "file")
+  dockerfile = if dockerfile_path == "-" || context == "-" then stdin_text.to_s.scrub
+               else
+                 path = dockerfile_path ? File.expand_path(dockerfile_path) : File.join(context_dir, "Dockerfile")   # -f is relative to the working directory, as for docker
+                 File.exist?(path) ? File.read(path).scrub : ""
+               end
+  files = context_dir && File.directory?(context_dir) ? Dir.glob("**/*", File::FNM_DOTMATCH, base: context_dir).select { |f| File.file?(File.join(context_dir, f)) }.sort : []
+  labels = dockerfile.scan(/^\s*LABEL\s+(.*)$/i).flatten.flat_map { |line| Shellwords.split(line).map { |kv| kv.split("=", 2) } }.to_h
+  entrypoint = exec_form(dockerfile.scan(/^\s*ENTRYPOINT\s+(.*)$/i).flatten.last)
+  cmd = exec_form(dockerfile.scan(/^\s*CMD\s+(.*)$/i).flatten.last)
+  labels.merge!(values(opts, "label").to_h { |l| l.split("=", 2) })
+  build_args = dockerfile.scan(/^\s*ARG\s+(\w+)=(.*)$/).to_h.merge(values(opts, "build-arg").to_h { |a| a.split("=", 2) })
+  labels.transform_values! { |v| v.to_s.gsub(/\$\{(\w+)\}|\$(\w+)/) { build_args[$1 || $2].to_s } }
+  tags = values(opts, "t", "tag")
+  tags = ["<none>:#{short_id(dockerfile + files.join)}"] if tags.empty?
+  tags.each do |tag|
+    hashes = files.first(50).to_h { |f| [f, (File.size(File.join(context_dir, f)) < 1_000_000 ? Digest::SHA256.file(File.join(context_dir, f)).hexdigest : nil)] } rescue {}
+    texts = files.first(50).filter_map { |f| p = File.join(context_dir, f); [f, File.read(p).scrub] if File.size(p) < 65_536 && f.end_with?(".tsv", ".txt", ".yml", ".yaml", ".json", ".sh") } .to_h rescue {}
+    images[tag] = { "labels" => labels, "target" => value(opts, "target"), "files" => files.first(200), "file_hashes" => hashes, "file_texts" => texts, "dockerfile" => dockerfile,
+                    "context" => context_dir, "source" => context, "args" => values(opts, "build-arg"), "seq" => next_seq, "entrypoint" => entrypoint, "cmd" => cmd }
+  end
+  if flag?(opts, "q", "quiet")
+    puts "sha256:#{full_id(tags.first)}"
+  else
+    ["#1 [internal] load build definition from Dockerfile", "#5 [2/4] RUN apt-get update && apt-get install -y git curl", "#5 0.912 Reading package lists...", "#8 exporting to image", "#8 naming to #{tags.first} done"].each { |l| $stderr.puts l }
+  end
+end
+
+# An ENTRYPOINT/CMD line as words: the exec form (["a", "b"]) or the shell form (sh -c "...").
+def exec_form(line)
+  return nil if line.nil? || line.strip.empty?
+  line = line.strip
+  line.start_with?("[") ? JSON.parse(line) : ["/bin/sh", "-c", line]
+rescue JSON::ParserError
+  ["/bin/sh", "-c", line]
+end
+
+def cmd_images(argv)
+  opts, = parse(argv, valued: %w[filter f format])
+  list = images.select do |tag, i|
+    values(opts, "filter", "f").all? do |filter|
+      key, val = filter.split("=", 2)
+      case key
+      when "reference" then File.fnmatch(val, tag) || File.fnmatch(val, tag.split(":").first)
+      when "label" then val.include?("=") ? i["labels"][val.split("=", 2).first] == val.split("=", 2).last : i["labels"].key?(val)
+      when "dangling" then val == "false"
+      else unhandled("images filter #{filter}"); true
+      end
+    end
+  end
+  objects = list.map do |tag, i|
+    repo, version = tag.split(":", 2)
+    { "ID" => short_id(tag), "Repository" => repo, "Tag" => version || "latest", "Size" => "0B", "CreatedAt" => "2026-10-12 12:00:00 +0000 UTC",
+      "CreatedSince" => "2 minutes ago", "Labels" => i["labels"].map { |k, v| "#{k}=#{v}" }.join(","), "_labels" => i["labels"] }
+  end
+  if flag?(opts, "q", "quiet") then objects.each { |o| puts o["ID"] }
+  else print_table(objects, %w[Repository Tag ID CreatedSince Size], value(opts, "format"))
+  end
+end
+
+def cmd_image(argv)
+  sub = argv.shift
+  case sub
+  when "inspect" then cmd_inspect(argv, kind: "image")
+  when "ls", "list" then cmd_images(argv)
+  when "rm", "remove" then cmd_rmi(argv)
+  when "build" then cmd_build(argv)
+  when "tag" then cmd_tag(argv)
+  when "pull" then cmd_pull(argv)
+  when "push", "prune", "save", "load", "history" then nil
+  else unhandled("image #{sub}")
+  end
+end
+
+def cmd_rmi(argv)
+  opts, names = parse(argv, valued: [])
+  names.each do |name|
+    tag = images.key?(name) ? name : "#{name}:latest"
+    next images.delete(tag) if images.key?(tag)
+    fail_with("Error response from daemon: No such image: #{name}") unless flag?(opts, "f", "force")
+  end
+end
+
+def cmd_tag(argv)
+  source, target = argv
+  i = find_image(source.to_s) or fail_with("Error response from daemon: No such image: #{source}")
+  images[target.include?(":") ? target : "#{target}:latest"] = i.dup
+end
+
+# ── volumes and networks ──────────────────────────────────────────────────────────────────────
+def volume_object(name) = { "Name" => name, "Driver" => "local", "Mountpoint" => "/var/lib/docker/volumes/#{name}/_data", "Labels" => volumes[name]["labels"] || {}, "Scope" => "local", "_labels" => volumes[name]["labels"] || {} }
+def network_object(name) = { "Name" => name, "Id" => full_id(name), "Driver" => "bridge", "Scope" => "local", "Internal" => networks[name]["internal"] || false, "Containers" => containers.select { |_, c| c["networks"].include?(name) }.to_h { |n, _| [full_id(n), { "Name" => n }] }, "Labels" => networks[name]["labels"] || {}, "_labels" => networks[name]["labels"] || {} }
+
+def cmd_volume(argv)
+  sub = argv.shift
+  case sub
+  when "create"
+    opts, names = parse(argv, valued: %w[d driver label o opt name])
+    name = names.first || value(opts, "name") || short_id(next_seq.to_s)
+    volumes[name] ||= { "project" => nil, "labels" => values(opts, "label").to_h { |l| l.split("=", 2) }, "owner" => "0" }
+    pipeline_checkout_event("create", name)
+    pipeline_checkout_volume_barrier(name)
+    puts name
+  when "connect", "disconnect"
+    _, names = parse(argv, valued: %w[alias ip ip6 link link-local-ip driver-opt])
+    net, cname = names
+    networks.key?(net) or fail_with("Error response from daemon: network #{net} not found")
+    c = find_container(cname.to_s) or fail_with("Error response from daemon: No such container: #{cname}")
+    if sub == "connect"
+      fail_with("Error response from daemon: endpoint with name #{cname} already exists in network #{net}") if c["networks"].include?(net)
+      c["networks"] << net
+    else
+      c["networks"].delete(net)
+    end
+  when "ls", "list"
+    opts, = parse(argv, valued: %w[filter f format])
+    list = volumes.select do |name, v|
+      values(opts, "filter", "f").all? do |filter|
+        key, val = filter.split("=", 2)
+        case key
+        when "name" then name.include?(val.to_s)
+        when "label" then val.include?("=") ? (v["labels"] || {})[val.split("=", 2).first] == val.split("=", 2).last : (v["labels"] || {}).key?(val)
+        when "dangling" then true
+        else unhandled("volume filter #{filter}"); true
+        end
+      end
+    end
+    objects = list.keys.map { |name| volume_object(name) }
+    if flag?(opts, "q", "quiet") then objects.each { |o| puts o["Name"] }
+    else print_table(objects, %w[Driver Name], value(opts, "format"))
+    end
+  when "inspect" then cmd_inspect(argv, kind: "volume")
+  when "rm", "remove"
+    opts, names = parse(argv, valued: [])
+    names.each do |name|
+      fail_with("Error response from daemon: get #{name}: no such volume") unless volumes.key?(name) || flag?(opts, "f", "force")
+      if containers.any? { |_, c| c["volumes"].any? { |v| v["name"] == name } }
+        fail_with("Error response from daemon: remove #{name}: volume is in use")
+      end
+      pipeline_checkout_event("rm", name)
+      volumes.delete(name)
+      FileUtils.rm_rf(File.join(JOURNAL, "volumes", name))
+      puts name
+    end
+  when "prune" then nil
+  else unhandled("volume #{sub}")
+  end
+end
+
+def cmd_network(argv)
+  sub = argv.shift
+  case sub
+  when "create"
+    opts, names = parse(argv, valued: %w[d driver subnet gateway o opt label ip-range aux-address scope])
+    name = names.first or fail_with("\"docker network create\" requires exactly 1 argument.")
+    fail_with("Error response from daemon: network with name #{name} already exists") if networks.key?(name)
+    networks[name] = { "project" => nil, "internal" => flag?(opts, "internal"), "labels" => values(opts, "label").to_h { |l| l.split("=", 2) } }
+    ($state["networks_made"] ||= []) << { "name" => name, "internal" => flag?(opts, "internal"), "seq" => next_seq }   # kept after rm
+    puts full_id(name)
+  when "ls", "list"
+    opts, = parse(argv, valued: %w[filter f format])
+    list = networks.select do |name, n|
+      values(opts, "filter", "f").all? do |filter|
+        key, val = filter.split("=", 2)
+        case key
+        when "name" then name.include?(val.to_s)
+        when "label" then val.include?("=") ? (n["labels"] || {})[val.split("=", 2).first] == val.split("=", 2).last : (n["labels"] || {}).key?(val)
+        else unhandled("network filter #{filter}"); true
+        end
+      end
+    end
+    objects = list.keys.map { |name| { "ID" => short_id(name), "Name" => name, "Driver" => "bridge", "Scope" => "local", "_labels" => networks[name]["labels"] || {} } }
+    if flag?(opts, "q", "quiet") then objects.each { |o| puts o["ID"] }
+    else print_table(objects, %w[ID Name Driver Scope], value(opts, "format"))
+    end
+  when "inspect" then cmd_inspect(argv, kind: "network")
+  when "rm", "remove"
+    _, names = parse(argv, valued: [])
+    names.each { |name| networks.delete(name) or fail_with("Error response from daemon: network #{name} not found"); puts name }
+  when "connect", "disconnect"
+    opts, names = parse(argv, valued: %w[alias ip ip6 link link-local-ip driver-opt])
+    net, cname = names
+    networks.key?(net) or fail_with("Error response from daemon: network #{net} not found")
+    c = find_container(cname.to_s) or fail_with("Error response from daemon: No such container: #{cname}")
+    if sub == "connect"
+      fail_with("Error response from daemon: endpoint with name #{cname} already exists in network #{net}") if c["networks"].include?(net)
+      c["networks"] << net
+    else
+      c["networks"].delete(net)
+    end
+    # who joined which network under which names, kept after they leave
+    ($state["network_joins"] ||= []) << { "action" => sub, "network" => net, "container" => container_name(cname.to_s), "aliases" => values(opts, "alias"), "seq" => next_seq }
+  when "prune" then nil
+  else unhandled("network #{sub}")
+  end
+end
+
+# ── compose ───────────────────────────────────────────────────────────────────────────────────
+def port_entry(spec)
+  if spec.is_a?(Hash)
+    published = spec["published"].to_s
+    target = spec["target"].to_s
+    return [{ "ip" => spec["host_ip"] || "0.0.0.0", "host" => published, "container" => target, "proto" => spec["protocol"] || "tcp" }]
+  end
+  text, proto = spec.to_s.split("/", 2)
+  parts = text.split(":")
+  ip = parts.length == 3 ? parts.shift : "0.0.0.0"
+  host, container = parts.length == 2 ? parts : ["", parts.first]
+  expand = ->(range) { range.include?("-") ? Range.new(*range.split("-", 2).map(&:to_i)).map(&:to_s) : [range] }
+  hosts, targets = expand.(host), expand.(container)
+  hosts = [""] * targets.length if hosts == [""]
+  targets = [targets.first] * hosts.length if targets.length == 1 && hosts.length > 1
+  hosts.zip(targets).map { |h, t| { "ip" => ip, "host" => h, "container" => t, "proto" => proto || "tcp" } }
+end
+
+def split_volumes(specs, project, top_volumes)
+  named, binds = [], []
+  specs.each do |spec|
+    if spec.is_a?(Hash)
+      target = spec["target"]
+      source = spec["source"]
+      next if spec["type"] == "tmpfs"
+      if spec["type"] == "bind" then binds << { "source" => source, "target" => target, "ro" => spec["read_only"] == true }
+      else named << { "name" => real_volume_name(source, project, top_volumes), "target" => target,
+                      "ro" => spec["read_only"] == true, "subpath" => (spec["volume"] || {})["subpath"] }
+      end
+    else
+      parts = spec.to_s.split(":")
+      if parts.length == 1 then next
+      elsif parts.first.start_with?("/", ".", "~") then binds << { "source" => parts[0], "target" => parts[1], "ro" => parts[2].to_s.split(",").include?("ro") }
+      else named << { "name" => real_volume_name(parts[0], project, top_volumes), "target" => parts[1], "ro" => parts[2].to_s.split(",").include?("ro") }
+      end
+    end
+  end
+  [named, binds]
+end
+
+def real_volume_name(key, project, top_volumes)
+  declared = top_volumes[key]
+  return declared["name"] if declared.is_a?(Hash) && declared["name"]
+  return key if declared.is_a?(Hash) && declared["external"]
+  project ? "#{project}_#{key}" : key
+end
+
+def real_network_name(key, project, top_networks)
+  declared = top_networks[key]
+  return declared["name"] if declared.is_a?(Hash) && declared["name"]
+  return key if declared.is_a?(Hash) && declared["external"]
+  "#{project}_#{key}"
+end
+
+def read_env_file(path)
+  return {} unless File.exist?(path)
+  File.readlines(path).each_with_object({}) do |line, env|
+    line = line.strip.delete_prefix("export ")
+    next if line.empty? || line.start_with?("#") || !line.include?("=")
+    key, val = line.split("=", 2)
+    val = val.strip
+    val = val[1..-2] if (val.start_with?('"') && val.end_with?('"')) || (val.start_with?("'") && val.end_with?("'"))
+    env[key.strip] = val
+  end
+end
+
+# As compose interpolates: `$$` is a literal `$`; `${NAME}`, `${NAME:-default}`, `${NAME-default}` and
+# `$NAME` come from the --env-file / .env variables, then the environment; an unset one without a default
+# becomes blank, with compose's warning on stderr.
+def interpolate(text, vars)
+  warned = []
+  text.gsub(/\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)((?::?-)([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)/) do
+    next "$" if $& == "$$"
+    name = $1 || $4
+    default = $2 ? $3.to_s : nil
+    vars.fetch(name) do
+      ENV.fetch(name) do
+        if default.nil? && !warned.include?(name)
+          warned << name
+          $stderr.puts "WARN[0000] The \"#{name}\" variable is not set. Defaulting to a blank string."
+        end
+        default.to_s
+      end
+    end
+  end
+end
+
+def load_compose(opts)
+  files = values(opts, "f", "file")
+  project_dir = value(opts, "project-directory")
+  if files.empty?
+    base = project_dir || Dir.pwd
+    found = %w[compose.yaml compose.yml docker-compose.yaml docker-compose.yml].map { |f| File.join(base, f) }.find { |f| File.exist?(f) }
+    found or fail_with("no configuration file provided: not found")
+    files = [found]
+  end
+  files = files.map { |f| File.expand_path(f) }
+  project_dir ||= File.dirname(files.first)
+  vars = values(opts, "env-file").map { |f| read_env_file(File.expand_path(f, project_dir)) }.reduce({}, :merge)
+  vars = read_env_file(File.join(project_dir, ".env")).merge(vars) if values(opts, "env-file").empty?
+  docs = files.map { |f| YAML.safe_load(interpolate(File.read(f), vars), aliases: true, permitted_classes: [Symbol]) || {} }
+  doc = docs.reduce({}) { |merged, d| deep_merge(merged, d) }
+  project = value(opts, "p", "project-name") || ENV["COMPOSE_PROJECT_NAME"] || doc["name"] || File.basename(project_dir).downcase.gsub(/[^a-z0-9_-]/, "")
+  [doc, project, project_dir, files]
+end
+
+def deep_merge(a, b)
+  a.merge(b) { |_, x, y| x.is_a?(Hash) && y.is_a?(Hash) ? deep_merge(x, y) : y }
+end
+
+def compose_service_names(doc) = (doc["services"] || {}).keys
+
+def with_dependencies(doc, names)
+  ordered = []
+  visit = lambda do |name|
+    next if ordered.include?(name)
+    deps = (doc["services"][name] || {})["depends_on"]
+    deps = deps.is_a?(Hash) ? deps.keys : Array(deps)
+    deps.each { |d| visit.(d) }
+    ordered << name
+  end
+  names.each { |n| visit.(n) }
+  ordered
+end
+
+def compose_container_name(doc, project, service) = (doc["services"][service] || {})["container_name"] || "#{project}-#{service}-1"
+
+def project_containers(project) = containers.select { |_, c| c["project"] == project }
+
+def compose_up(doc, project, project_dir, files, services, build: false)
+  services = compose_service_names(doc) if services.empty?
+  with_dependencies(doc, services).each do |service|
+    s = doc["services"][service] or fail_with("service \"#{service}\" is not defined")
+    name = compose_container_name(doc, project, service)
+    image = s["image"] || "#{project}-#{service}"
+    build_image(s["build"], image, project_dir) if s["build"] && (build || !images.key?(image))
+    env = {}
+    Array(s["env_file"]).each do |entry|
+      path = entry.is_a?(Hash) ? entry["path"] : entry
+      env.merge!(read_env_file(File.expand_path(path, project_dir)))
+    end
+    environment = s["environment"] || {}
+    environment = environment.to_h { |e| e.to_s.include?("=") ? e.to_s.split("=", 2) : [e.to_s, ENV[e.to_s]] } if environment.is_a?(Array)
+    environment.each { |k, v| env[k.to_s] = v.nil? ? ENV[k.to_s].to_s : v.to_s }
+    labels = s["labels"] || {}
+    labels = labels.to_h { |l| l.to_s.split("=", 2) } if labels.is_a?(Array)
+    labels = labels.transform_values(&:to_s).merge("com.docker.compose.project" => project, "com.docker.compose.service" => service,
+                                                   "com.docker.compose.container-number" => "1", "com.docker.compose.project.config_files" => files.join(","),
+                                                   "com.docker.compose.project.working_dir" => project_dir)
+    named, binds = split_volumes(Array(s["volumes"]), project, doc["volumes"] || {})
+    external = (doc["volumes"] || {}).filter_map { |k, v| (v.is_a?(Hash) && v["external"]) ? (v["name"] || k) : nil }
+    named.each do |v|
+      existing = volumes[v["name"]]
+      if existing && !external.include?(v["name"]) && (existing["labels"] || {})["com.docker.compose.project"] != project && !Array($state["warned_volumes"]).include?(v["name"])
+        $stderr.puts "volume \"#{v["name"]}\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
+        ($state["warned_volumes"] ||= []) << v["name"]
+      end
+      volumes[v["name"]] ||= { "project" => project, "labels" => { "com.docker.compose.project" => project } }
+    end
+    nets = s["networks"]
+    nets = nets.is_a?(Hash) ? nets.keys : Array(nets)
+    nets = ["default"] if nets.empty? && !s["network_mode"]
+    nets = nets.map { |n| real_network_name(n, project, doc["networks"] || {}) }
+    nets.each do |n|
+      source = (doc["networks"] || {}).find { |key, _| real_network_name(key, project, doc["networks"] || {}) == n }&.last || {}
+      networks[n] ||= { "project" => project, "internal" => source["internal"] == true, "labels" => { "com.docker.compose.project" => project } }
+    end
+    command = s["command"].is_a?(Array) ? s["command"] : Shellwords.split(s["command"].to_s)
+    command = ["/bin/sh"] if command.empty?
+    depends = s["depends_on"]
+    depends = depends.is_a?(Hash) ? depends.to_h { |d, v| [d.to_s, (v.is_a?(Hash) && v["condition"]) || "service_started"] } : Array(depends).to_h { |d| [d.to_s, "service_started"] }
+    depends.each do |d, condition|
+      fail_with("service \"#{service}\" depends on undefined service \"#{d}\"") unless doc["services"].key?(d)
+      fail_with("dependency failed to start: container #{compose_container_name(doc, project, d)} has no healthcheck configured") if condition == "service_healthy" && !doc["services"][d]["healthcheck"]
+    end
+    devices = Array(s["devices"]).map { |d| d.to_s.split(":").first }
+    refused = devices & Array($state["refused_devices"])
+    fail_with("Error response from daemon: error gathering device information while adding custom device \"#{refused.first}\": no such file or directory") unless refused.empty?
+    containers[name] = { "project" => project, "service" => service, "image" => image, "command" => command, "state" => "running",
+                         "devices" => devices, "cap_add" => Array(s["cap_add"]).map(&:to_s),
+                         "labels" => labels, "ports" => Array(s["ports"]).flat_map { |p| port_entry(p) }, "env" => env,
+                         "init" => s["init"] == true, "volumes" => named, "binds" => binds, "networks" => nets,
+                         "workdir" => s["working_dir"], "started_seq" => next_seq, "compose_file" => files.first, "depends" => depends,
+                         "health" => (s["healthcheck"] ? "healthy" : nil) }
+    if service == "app"
+      src = named.find { |v| v["target"] == "/workspace" }
+      volumes[src["name"]]["owner"] = "1001" if src
+      real_clone(containers[name])
+      toolbox_app_start(name, containers[name])
+    end
+  end
+  pipeline_record_compose(doc, project)
+end
+
+def build_image(build, image, project_dir)
+  build = { "context" => build } if build.is_a?(String)
+  context = File.expand_path(build["context"] || ".", project_dir)
+  argv = ["-t", image, context]
+  argv.unshift("--target", build["target"]) if build["target"]
+  argv.unshift("-f", File.expand_path(build["dockerfile"], context)) if build["dockerfile"] && build["dockerfile"] != "-"
+  (build["labels"] || {}).each { |k, v| argv.unshift("--label", "#{k}=#{v}") }
+  (build["args"] || {}).each { |k, v| argv.unshift("--build-arg", "#{k}=#{v}") }
+  cmd_build(argv)
+end
+
+COMPOSE_GLOBAL_VALUED = %w[p project-name f file env-file project-directory profile progress ansi parallel].freeze
+
+def cmd_compose(argv)
+  # global options come before the subcommand; stop at it
+  opts, rest = parse(argv, valued: COMPOSE_GLOBAL_VALUED, stop_at_first_positional: true)
+  sub, *args = rest
+  case sub
+  when "version" then puts "Docker Compose version v2.29.0"; return
+  when "ls" then containers.values.map { |c| c["project"] }.compact.uniq.each { |p| puts p }; return
+  when nil then return
+  end
+  doc, project, project_dir, files = load_compose(opts)
+  case sub
+  when "up"
+    o, services = parse(args, valued: %w[scale t timeout pull exit-code-from wait-timeout])
+    compose_up(doc, project, project_dir, files, services, build: flag?(o, "build"))
+    if flag?(o, "wait") && project_containers(project).any? { |_, c| c["health"] == "unhealthy" }
+      fail_with("dependency failed to start: container is unhealthy")
+    end
+    project_containers(project).each_key { |n| containers[n]["state"] = "created" } if flag?(o, "no-start")
+  when "create"
+    o, services = parse(args, valued: %w[scale pull])
+    compose_up(doc, project, project_dir, files, services, build: flag?(o, "build"))
+    project_containers(project).each_key { |n| containers[n]["state"] = "created" }
+  when "down"
+    o, = parse(args, valued: %w[rmi t timeout])
+    project_containers(project).each_key { |n| containers.delete(n) }
+    if flag?(o, "v", "volumes")
+      # as compose does: an external volume is never removed
+      declared = (doc["volumes"] || {}).reject { |_, v| v.is_a?(Hash) && v["external"] }.keys.map { |k| real_volume_name(k, project, doc["volumes"]) }
+      # and only those it made (its project label): a volume made otherwise stays, as with the real compose
+      gone = volumes.select { |n, v| (declared.include?(n) || v["project"] == project) && (v["labels"] || {})["com.docker.compose.project"] == project }.keys
+      gone.each { |n| volumes.delete(n); FileUtils.rm_rf(File.join(JOURNAL, "volumes", n)) }
+    end
+    networks.delete_if { |_, n| n["project"] == project }
+  when "start", "stop", "restart", "kill", "pause", "unpause"
+    o, services = parse(args, valued: %w[t timeout s signal])
+    services = compose_service_names(doc) if services.empty?
+    state = %w[stop kill pause].include?(sub) ? "exited" : "running"
+    services.each do |service|
+      name = compose_container_name(doc, project, service)
+      next unless containers[name]
+      containers[name]["state"] = state
+      containers[name]["started_seq"] = next_seq if state == "running"
+    end
+  when "rm"
+    o, services = parse(args, valued: [])
+    services = compose_service_names(doc) if services.empty?
+    services.each { |service| containers.delete(compose_container_name(doc, project, service)) }
+  when "ps"
+    o, services = parse(args, valued: %w[format status filter])
+    wanted = services.empty? ? compose_service_names(doc) : services
+    list = project_containers(project).select { |_, c| wanted.include?(c["service"]) }
+    list = list.select { |_, c| c["state"] == "running" } unless flag?(o, "a", "all") || !values(o, "status").empty?
+    list = list.select { |_, c| values(o, "status").include?(c["state"]) } unless values(o, "status").empty?
+    if flag?(o, "services") then list.each_value { |c| puts c["service"] }
+    elsif flag?(o, "q", "quiet") then list.each_key { |n| puts full_id(n) }
+    else
+      objects = list.map do |name, c|
+        { "ID" => full_id(name), "Name" => name, "Service" => c["service"], "Project" => project, "State" => c["state"], "Status" => status_text(c),
+          "Image" => c["image"], "ExitCode" => 0, "Command" => c["command"].join(" "), "Health" => "", "Labels" => c["labels"].map { |k, v| "#{k}=#{v}" }.join(","),
+          "_labels" => c["labels"], "Ports" => ports_text(c),
+          "Publishers" => c["ports"].map { |p| { "URL" => p["ip"], "TargetPort" => p["container"].to_i, "PublishedPort" => p["host"].to_i, "Protocol" => p["proto"] } } }
+      end
+      format = value(o, "format")
+      if format == "json" then objects.each { |ob| puts JSON.generate(ob.reject { |k, _| k.start_with?("_") }) }
+      else print_table(objects, %w[Name Image Command Service State Status Ports], format)
+      end
+    end
+  when "exec"
+    o, rest2 = parse(args, valued: %w[u user w workdir e env index], stop_at_first_positional: true)
+    service, *command = rest2
+    name = compose_container_name(doc, project, service.to_s)
+    c = containers[name] or fail_with("service \"#{service}\" is not running container #1")
+    fail_with("service \"#{service}\" is not running container #1") unless c["state"] == "running"
+    stdin = flag?(o, "i", "interactive") && !flag?(o, "T") && !$stdin.tty? ? $stdin.read(65_536).to_s : nil
+    $state["execs"] << { "container" => name, "command" => command, "user" => value(o, "u", "user"), "workdir" => value(o, "w", "workdir"), "stdin" => stdin, "seq" => next_seq }
+    play(command, c)
+  when "run"
+    o, rest2 = parse(args, valued: %w[e env v volume w workdir u user entrypoint name l label p publish], stop_at_first_positional: true)
+    service, *command = rest2
+    s = doc["services"][service.to_s] or fail_with("service \"#{service}\" is not defined")
+    $state["runs"] << { "image" => s["image"] || "#{project}-#{service}", "command" => command, "name" => value(o, "name"), "service" => service,
+                        "project" => project, "env" => values(o, "e", "env").to_h { |e| e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s] }, "seq" => next_seq, "volumes" => [], "binds" => [] }
+  when "build"
+    o, services = parse(args, valued: %w[build-arg m memory progress ssh])
+    services = compose_service_names(doc) if services.empty?
+    services.each do |service|
+      s = doc["services"][service] or next
+      build_image(s["build"], s["image"] || "#{project}-#{service}", project_dir) if s["build"]
+    end
+  when "config"
+    o, = parse(args, valued: %w[format o output hash])
+    if flag?(o, "services") then compose_service_names(doc).each { |n| puts n }
+    elsif flag?(o, "volumes") then (doc["volumes"] || {}).keys.each { |n| puts n }
+    else puts files.map { |f| File.read(f) }.join("\n")
+    end
+  when "images"
+    project_containers(project).each { |name, c| puts "#{name} #{c["image"]}" }
+  when "port"
+    _, rest2 = parse(args, valued: %w[protocol index])
+    service, port = rest2
+    c = containers[compose_container_name(doc, project, service.to_s)]
+    c&.dig("ports")&.each { |p| puts "0.0.0.0:#{p["host"]}" if p["container"] == port.to_s }
+  when "logs", "pull", "push", "top", "events", "wait", "cp", "watch", "attach", "stats", "scale"
+    nil
+  else unhandled("compose #{sub}")
+  end
+end
+
+# ── the command line ──────────────────────────────────────────────────────────────────────────
+argv = ARGV.dup
+while argv.first&.start_with?("-")
+  arg = argv.shift
+  case arg
+  when "--version", "-v" then puts "Docker version 27.3.1, build fake"; exit 0
+  when "--context", "-c", "-H", "--host", "-l", "--log-level", "--config", "--tlscacert", "--tlscert", "--tlskey" then argv.shift
+  end
+end
+command = argv.shift
+
+case command
+when nil then puts "Usage:  docker [OPTIONS] COMMAND"
+when "info" then puts "Client:\n Version: 27.3.1\nServer:\n Containers: #{containers.size}\n Images: #{images.size}\n Operating System: fake"
+when "version" then puts "Client:\n Version: 27.3.1\nServer:\n Version: 27.3.1"
+when "compose" then cmd_compose(argv)
+when "ps" then cmd_ps(argv)
+when "inspect" then cmd_inspect(argv)
+when "exec" then cmd_exec(argv)
+when "run" then cmd_run(argv)
+when "create" then cmd_run(argv, start: false)
+when "build" then cmd_build(argv)
+when "buildx"
+  if argv.first == "build"
+    argv.shift
+    record_buildx(argv)
+    cmd_build(argv)
+  elsif argv.first == "version"
+    puts "github.com/docker/buildx fake"
+  end
+when "pull" then cmd_pull(argv)
+when "images" then cmd_images(argv)
+when "image" then cmd_image(argv)
+when "rmi" then cmd_rmi(argv)
+when "tag" then cmd_tag(argv)
+when "volume" then cmd_volume(argv)
+when "network" then cmd_network(argv)
+when "stop", "kill" then set_state(argv, "exited", command)
+when "start"
+  # `docker start -a` of a factory container made with docker create: it runs now, attached, on the
+  # networks it was given (--network, then docker network connect); --rm removes it after
+  _, names = parse(argv, valued: %w[detach-keys])
+  saved = names.size == 1 && ($state["created_runs"] || {})[container_name(names.first.to_s) || names.first]
+  if saved && (argv.include?("-a") || argv.include?("--attach"))
+    cname = container_name(names.first) || names.first
+    nets = containers[cname]["networks"]
+    containers.delete(cname)
+    $state["created_runs"].delete(cname)
+    cmd_run(saved, start: true, attached: nets)
+  else
+    set_state(argv, "running", command)
+  end
+when "restart" then set_state(argv, "running", command)
+when "pause" then set_state(argv, "paused", command)
+when "unpause" then set_state(argv, "running", command)
+when "rm" then set_state(argv, nil, "rm")
+when "top"
+  # the container's main process and what a test said runs in it (process_in)
+  _, names = parse(argv, valued: [])
+  c = find_container(names.first.to_s) or fail_with("Error response from daemon: No such container: #{names.first}")
+  fail_with("Error response from daemon: container #{names.first} is not running") unless c["state"] == "running"
+  puts "UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD"
+  procs = [(c["process"] || c["command"]).join(" ")] + (c["processes"] || [])
+  procs.each_with_index { |p, i| puts "dev                 #{4242 + i}                #{i == 0 ? 4200 : 4242}                0                   12:00               ?                   00:00:00            #{p}" }
+when "logs"
+  _, names = parse(argv, valued: %w[n tail since until])
+  find_container(names.first.to_s) or fail_with("Error response from daemon: No such container: #{names.first}")
+  entry = ($state["logs"] || {})[container_name(names.first.to_s)]
+  if entry.is_a?(Hash)
+    entry["reads"] = entry["reads"].to_i + 1
+    if entry["reads"] > entry["after"].to_i
+      (entry["stream"] == "stdout" ? $stdout : $stderr).print(entry["text"].to_s)
+    end
+  else
+    print(entry.to_s)
+  end
+when "cp"
+  _, paths = parse(argv, valued: [])
+  $state["copies"] << { "from" => paths[0], "to" => paths[1], "seq" => next_seq }
+  copy_image_artifact(paths[0], paths[1])
+when "port"
+  _, names = parse(argv, valued: [])
+  c = find_container(names.first.to_s) or fail_with("Error response from daemon: No such container: #{names.first}")
+  c["ports"].each { |p| puts "#{p["container"]}/#{p["proto"]} -> #{p["ip"]}:#{p["host"]}" if names[1].nil? || names[1].split("/").first == p["container"] }
+when "stats"
+  opts, names = parse(argv, valued: %w[format])
+  list = containers.select { |n, c| (names.empty? ? c["state"] == "running" : names.include?(n)) }
+  objects = list.map { |n, c| { "Name" => n, "Container" => short_id(n), "ID" => short_id(n), "CPUPerc" => "0.50%", "MemUsage" => "23.5MiB / 7.748GiB", "MemPerc" => "0.30%", "NetIO" => "1kB / 1kB", "BlockIO" => "0B / 0B", "PIDs" => "12" } }
+  print_table(objects, %w[Container Name CPUPerc MemUsage MemPerc NetIO BlockIO PIDs], value(opts, "format"))
+when "container"
+  sub = argv.shift
+  case sub
+  when "ls", "list", "ps" then cmd_ps(argv)
+  when "inspect" then cmd_inspect(argv, kind: "container")
+  when "exec" then cmd_exec(argv)
+  when "run" then cmd_run(argv)
+  when "create" then cmd_run(argv, start: false)
+  when "stop", "kill" then set_state(argv, "exited", sub)
+  when "start", "restart" then set_state(argv, "running", sub)
+  when "rm" then set_state(argv, nil, "rm")
+  when "logs", "prune", "cp", "port", "stats", "wait", "top", "pause", "unpause", "attach" then nil
+  else unhandled("container #{sub}")
+  end
+when "context"
+  # the current context's endpoint, from FAKE_DOCKER_CONTEXT_HOST (a rootless or remote Docker), else the usual socket
+  host = ENV["FAKE_DOCKER_CONTEXT_HOST"] || "unix:///var/run/docker.sock"
+  case argv.first
+  when "show" then puts "default"
+  when "inspect"
+    opts, = parse(argv.drop(1), valued: %w[format f])
+    format = value(opts, "format", "f")
+    if format.to_s.include?(".Endpoints.docker.Host") then puts host
+    else puts JSON.pretty_generate([{ "Name" => "default", "Endpoints" => { "docker" => { "Host" => host } } }])
+    end
+  end
+when "system", "builder", "login", "logout", "wait", "events", "top", "attach", "pull", "push", "search", "save", "load", "commit", "diff", "export", "import", "history", "update", "rename", "manifest", "trust", "plugin", "swarm", "checkpoint"
+  nil
+else unhandled(command)
+end

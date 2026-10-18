@@ -1,0 +1,51 @@
+#!/usr/bin/env ruby
+# A fake macOS `security` for the tests. Generic passwords come from the JSON in FAKE_SECURITY_STORE:
+# {"locked": false, "items": [{"service": "farmy/GIT_TOKEN", "account": null, "password": "…"}]}.
+# `find-generic-password [-s service] [-a account] -w` prints the password of the item whose given
+# attributes match; an item not there exits 44 ("The specified item could not be found in the
+# keychain"), a locked keychain exits 36 ("User interaction is not allowed") until `unlock-keychain`
+# ran, which the fake accepts without a password. Every call's arguments go to FAKE_SECURITY_LOG.
+Encoding.default_external = Encoding::UTF_8 # whatever locale the caller has; the state files hold UTF-8
+require "json"
+
+store_path = ENV.fetch("FAKE_SECURITY_STORE") { abort "fake security: FAKE_SECURITY_STORE is not set" }
+store = JSON.parse(File.read(store_path))
+File.open(ENV["FAKE_SECURITY_LOG"], "a") { |f| f.puts ARGV.join(" ") } if ENV["FAKE_SECURITY_LOG"]
+
+def option(args, flag)
+  i = args.index(flag)
+  i && args[i + 1]
+end
+
+case ARGV[0]
+when "find-generic-password"
+  args = ARGV.drop(1)
+  if store["locked"]
+    warn "security: SecKeychainSearchCopyNext: User interaction is not allowed."
+    exit 36
+  end
+  service, account = option(args, "-s"), option(args, "-a")
+  item = store["items"].find { |i| (service.nil? || i["service"] == service) && (account.nil? || i["account"] == account) }
+  unless item
+    warn "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
+    exit 44
+  end
+  if args.include?("-w")
+    puts item["password"]
+  else
+    puts "keychain: \"login.keychain-db\"", "    \"svce\"<blob>=#{item["service"].inspect}", "    \"acct\"<blob>=#{item["account"].inspect}"
+  end
+when "unlock-keychain"
+  store["locked"] = false
+  File.write(store_path, JSON.generate(store))
+when "lock-keychain"
+  store["locked"] = true
+  File.write(store_path, JSON.generate(store))
+when "add-generic-password"
+  args = ARGV.drop(1)
+  password = args.include?("-w") && option(args, "-w") !~ /\A-/ ? option(args, "-w") : $stdin.read.to_s.chomp
+  store["items"] << { "service" => option(args, "-s"), "account" => option(args, "-a"), "password" => password }
+  File.write(store_path, JSON.generate(store))
+else
+  abort "fake security: cannot play: #{ARGV.join(" ")}"
+end

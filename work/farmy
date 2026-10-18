@@ -1,0 +1,399 @@
+#!/bin/sh
+# farmy — runs farmy in its control container. The host needs Docker and nothing else.
+#
+#   farmy                 attach to the persistent session (the TUI); without a terminal: the usage
+#   farmy <command> …     any farmy command, in the containers folder you are in
+#   farmy update          install the folder's pinned release, otherwise the newest published release
+#
+# The control container holds the Docker socket and this folder (at the same path, so the paths in the
+# compose files hold for the daemon). The values farmy asks the host for (farmy unlock-names: those under
+# farmy.yml's secrets.unlock, and without a provider every route's secret) come from one source on the
+# host, never from a file: the command in
+# FARMY_UNLOCK_COMMAND, the macOS Keychain or the Linux secret service (under <FARMY_SECRET_PREFIX><NAME>,
+# default farmy/<NAME>), else a hidden prompt; they are piped to farmy, never on a command line.
+set -eu
+FARMY_SHIM_VERSION='@VERSION@'
+FARMY_DEFAULT_REGISTRY=''
+FARMY_DEFAULT_SOURCE=''
+FARMY_DEFAULT_GITHUB=''
+FARMY_DEFAULT_SOURCE_IS_GENERATED='1'
+HERE=$(cd "$(dirname "$0")" && pwd)
+SELF=$HERE/$(basename "$0")
+# In a source checkout, these simple public build-time scalars come from the one release
+# configuration. Release artifacts have their values embedded and need no adjacent files.
+release_scalar() {
+  awk -v key="$1" '
+    $0 ~ ("^" key ":[[:space:]]*") {
+      sub("^" key ":[[:space:]]*", ""); sub(/[[:space:]]+$/, "")
+      if (($0 ~ /^\047/ && $0 ~ /\047$/) || ($0 ~ /^"/ && $0 ~ /"$/)) $0=substr($0,2,length($0)-2)
+      print; exit
+    }' "$2"
+}
+if [ -f "$HERE/release.yml" ]; then
+  [ -n "$FARMY_DEFAULT_REGISTRY" ] || FARMY_DEFAULT_REGISTRY="ghcr.io/$(release_scalar owner "$HERE/release.yml")/farmy"
+  [ -n "$FARMY_DEFAULT_GITHUB" ] || FARMY_DEFAULT_GITHUB=$(release_scalar github_url "$HERE/release.yml")
+fi
+# A checkout reads VERSION; release artifacts embed it and need no neighboring files.
+if [ "$FARMY_SHIM_VERSION" = '@VERSION@' ]; then
+  [ -f "$HERE/VERSION" ] || { echo 'farmy: missing embedded version or VERSION file' >&2; exit 1; }
+  FARMY_SHIM_VERSION=$(cat "$HERE/VERSION")
+fi
+[ -n "$FARMY_DEFAULT_SOURCE" ] || [ -z "$FARMY_DEFAULT_GITHUB" ] || FARMY_DEFAULT_SOURCE="${FARMY_DEFAULT_GITHUB%.git}.git#v$FARMY_SHIM_VERSION:work"
+FARMY_REGISTRY=${FARMY_REGISTRY:-$FARMY_DEFAULT_REGISTRY}
+FARMY_SOURCE_IS_GENERATED=$FARMY_DEFAULT_SOURCE_IS_GENERATED
+[ -z "${FARMY_SOURCE:-}" ] || FARMY_SOURCE_IS_GENERATED=0
+FARMY_SOURCE=${FARMY_SOURCE:-$FARMY_DEFAULT_SOURCE}
+FARMY_BUILD=${FARMY_BUILD-}
+export FARMY_REGISTRY FARMY_SOURCE FARMY_BUILD DOCKER_CLI_HINTS=false
+fail() { echo "farmy: $*" >&2; exit 1; }
+valid_version() { printf '%s\n' "$1" | awk -F. 'NR!=1 || NF!=3 {exit 1} {for(i=1;i<=3;i++) if($i!~/^[0-9]+$/ || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; }
+version_older() { awk -v a="$1" -v b="$2" 'BEGIN {split(a,x,".");split(b,y,".");for(i=1;i<=3;i++){if(length(x[i])!=length(y[i]))exit !(length(x[i])<length(y[i]));if(x[i]!=y[i])exit !(x[i]+0<y[i]+0)}exit 1}'; }
+quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+# One fingerprint for local control builds, release exports and the embedded binary identity.
+# Only declared build inputs are visited; generated binaries and user workspaces are excluded.
+inputs_hash() (
+  cd "$HERE" || exit 1
+  hash_tmp=$(mktemp -d "${TMPDIR:-/tmp}/farmy-inputs.XXXXXX") || exit 1
+  trap 'rm -rf "$hash_tmp"' 0
+  trap 'exit 1' HUP INT TERM
+  : > "$hash_tmp/paths"
+  : > "$hash_tmp/missing"
+  for input in VERSION Dockerfile release.Dockerfile .dockerignore Dockerfile.dockerignore release.Dockerfile.dockerignore Cargo.toml Cargo.lock farmy README.md .env.example farmy.example.yml agents.yml tools.yml egress-hosts.yml factory-prompt.md keys.Dockerfile knowledge.Dockerfile gate.Dockerfile release.yml crates docs toolbox providers bin/build bin/release bin/render-release bin/install; do
+    if [ -e "$input" ] || [ -L "$input" ]; then
+      find "$input" -exec sh -c 'for input do
+        case "$input" in *"
+"*) echo "control build input contains a newline" >&2; exit 1 ;; esac
+        printf "%s\n" "$input"
+      done' sh {} + >> "$hash_tmp/paths" || exit 1
+    else
+      printf '%s\n' "$input" >> "$hash_tmp/paths"
+      printf '%s\n' "$input" >> "$hash_tmp/missing"
+    fi
+  done
+  LC_ALL=C sort -u "$hash_tmp/paths" > "$hash_tmp/sorted" || exit 1
+  (
+    while IFS= read -r file; do
+      if [ -L "$file" ]; then
+        printf 'link\000%s\000' "$file"
+        readlink "$file" || exit 1
+        printf '\000'
+      elif [ -e "$file" ]; then
+        mode=$(stat -c %a "$file" 2>/dev/null) || mode=$(stat -f %Lp "$file") || exit 1
+        if [ -d "$file" ]; then printf 'dir\000%s\000%s\000' "$mode" "$file"
+        elif [ -f "$file" ]; then
+          printf 'file\000%s\000%s\000' "$mode" "$file"
+          size=$(wc -c < "$file") || exit 1
+          size=$((size + 0))
+          printf '%s\000' "$size"
+          cat "$file" || exit 1
+          printf '\000'
+        else echo "unsupported build input type: $file" >&2; exit 1; fi
+      elif grep -qxF "$file" "$hash_tmp/missing"; then printf 'missing\000%s\000' "$file"
+      else echo "control build input disappeared: $file" >&2; exit 1; fi
+    done < "$hash_tmp/sorted"
+  ) > "$hash_tmp/content" || exit 1
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum < "$hash_tmp/content" > "$hash_tmp/digest" || exit 1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < "$hash_tmp/content" > "$hash_tmp/digest" || exit 1
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 < "$hash_tmp/content" > "$hash_tmp/raw" || exit 1
+    sed 's/^.*= *//' "$hash_tmp/raw" > "$hash_tmp/digest" || exit 1
+  else cksum < "$hash_tmp/content" > "$hash_tmp/digest" || exit 1; fi
+  cut -d' ' -f1 "$hash_tmp/digest" || exit 1
+)
+if [ "${FARMY_HASH_ONLY:-}" = 1 ]; then inputs_hash || fail 'cannot fingerprint control build inputs'; exit 0; fi
+valid_version "$FARMY_SHIM_VERSION" || fail 'invalid installed version; reinstall farmy'
+case "${1:-}" in --version|-V|version) printf 'farmy %s\n' "$FARMY_SHIM_VERSION"; exit 0 ;; esac
+
+# Read only ordinary top-level compatibility scalars. No evaluation and no host YAML dependency.
+scalar() {
+  [ -f "$2" ] || return 0
+  awk -v key="$1" -v file="$2" '
+  function bad() {print file ": invalid or ambiguous " key " scalar" > "/dev/stderr"; exit 1}
+  /^[^[:space:]#]/ {
+    line=$0
+    if(line ~ ("^" key "[[:space:]]*:")) {
+      if(++seen>1)bad()
+      sub("^" key "[[:space:]]*:[[:space:]]*","",line)
+      if(substr(line,1,1)=="\047" || substr(line,1,1)=="\"") {
+        q=substr(line,1,1);line=substr(line,2);end=index(line,q);if(!end)bad()
+        value=substr(line,1,end-1);tail=substr(line,end+1)
+        if(tail !~ /^[[:space:]]*(#.*)?$/)bad()
+      } else {sub(/[[:space:]]+#.*$/,"",line);sub(/[[:space:]]*$/,"",line);value=line}
+      if(value=="" || value ~ /[[:space:]{}\[\]&*!|>]/)bad()
+      result=value
+    } else if(line ~ /^[{]/ || line ~ ("^[\047\"]" key "[\047\"]")) bad()
+  }
+  END {if(seen==1)print result}' "$2"
+}
+pin=$(scalar farmy farmy.yml) || exit 1
+[ -z "$pin" ] || valid_version "$pin" || fail 'farmy.yml: farmy must pin an exact MAJOR.MINOR.PATCH version'
+if [ "${1:-}" != update ] && [ -n "$pin" ] && [ "$pin" != "$FARMY_SHIM_VERSION" ]; then
+  fail "farmy.yml pins $pin, but this shim is $FARMY_SHIM_VERSION: farmy update --to $pin"
+fi
+command -v docker >/dev/null 2>&1 || fail 'docker is not installed — it is the one thing farmy needs on this machine'
+docker info >/dev/null 2>&1 || fail "Docker isn't running — start it (OrbStack, Docker Desktop or colima), then try again"
+pull() { echo "pulling $1" >&2; docker pull "$1" >/dev/null; }
+latest_version() {
+  [ -n "$FARMY_REGISTRY" ] || fail 'set FARMY_REGISTRY to select published releases'
+  latest=${FARMY_REGISTRY%/}/farmy-control:latest
+  pull "$latest" || fail "pull failed: $latest"
+  selected=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$latest")
+  valid_version "$selected" || fail 'latest has no valid farmy.version label'
+  printf '%s\n' "$selected"
+}
+check_format() {
+  requested=$(scalar format "$1") || exit 1
+  [ -n "$requested" ] || return 0
+  case "$requested" in *[!0-9]*|0) fail "$1: format must be a positive integer" ;; esac
+  [ "$requested" = 1 ] && return 0
+  reader=; supported=
+  if [ -n "$FARMY_REGISTRY" ]; then
+    latest=${FARMY_REGISTRY%/}/farmy-control:latest
+    if pull "$latest"; then
+      supported=$(docker image inspect -f '{{index .Config.Labels "farmy.format"}}' "$latest" 2>/dev/null || true)
+      reader=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$latest" 2>/dev/null || true)
+    fi
+  fi
+  case "$supported" in ''|*[!0-9]*) supported=0 ;; esac
+  if valid_version "$reader" && [ "$supported" -ge "$requested" ]; then
+    fail "$1: format $requested needs a newer reader; farmy $reader supports it: farmy update --to $reader"
+  fi
+  fail "$1: format $requested is unsupported; required version unknown: farmy update"
+}
+if [ "${1:-}" != update ]; then
+  check_format farmy.yml
+  for definition in services/*.yml; do [ ! -f "$definition" ] || check_format "$definition"; done
+fi
+
+
+LOCAL_INIT=
+[ "${1:-}" != init ] || [ ! -f "$HERE/Dockerfile" ] || LOCAL_INIT=1
+LOCAL_CHANGED=
+IMAGE=farmy:local
+NAME=farmy
+HASH=$FARMY_SHIM_VERSION
+[ ! -f "$HERE/Dockerfile" ] || HASH=$(inputs_hash) || fail 'cannot fingerprint control build inputs'
+build_image() {
+  if [ "$FARMY_BUILD" != 1 ] && [ "$LOCAL_CHANGED" != 1 ]; then
+    published=${FARMY_IMAGE:-}
+    [ -n "$published" ] || [ -z "$FARMY_REGISTRY" ] || published=${FARMY_REGISTRY%/}/farmy-control:$FARMY_SHIM_VERSION
+    if [ -n "$published" ]; then
+      if pull "$published"; then docker tag "$published" "$IMAGE"; return; fi
+      echo "farmy: pull failed for $published; trying a local build" >&2
+    else echo 'farmy: FARMY_REGISTRY is unset; trying a local build' >&2; fi
+  fi
+  if [ -f "$HERE/Dockerfile" ]; then context=$HERE
+  elif [ -n "$FARMY_SOURCE" ]; then context=$FARMY_SOURCE
+  else fail 'no checkout to build; set FARMY_SOURCE to a Docker remote build context URL'; fi
+  echo "building the control image $IMAGE" >&2
+  docker build -q --label "farmy.hash=$HASH" --label "farmy.version=$FARMY_SHIM_VERSION" --label farmy.format=1 --build-arg "FARMY_VERSION=$FARMY_SHIM_VERSION" --build-arg "FARMY_HASH=$HASH" -t "$IMAGE" "$context" >/dev/null
+}
+image_stale() {
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
+  if [ "${LOCAL_INIT:-}" = 1 ]; then
+    if [ "$(docker image inspect -f '{{index .Config.Labels "farmy.hash"}}' "$IMAGE" 2>/dev/null)" != "$HASH" ]; then
+      LOCAL_CHANGED=1
+      return 0
+    fi
+    return 1
+  elif [ "$FARMY_BUILD" = 1 ]; then
+    case "${1:-}" in init|update) [ "$(docker image inspect -f '{{index .Config.Labels "farmy.hash"}}' "$IMAGE" 2>/dev/null)" != "$HASH" ] ;; *) return 1 ;; esac
+  else [ "$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$IMAGE" 2>/dev/null)" != "$FARMY_SHIM_VERSION" ]; fi
+}
+if [ "${1:-}" = update ]; then
+  shift; target=
+  case "$#" in 0) ;; 2) [ "$1" = --to ] || fail 'usage: farmy update [--to VERSION]'; target=$2 ;; *) fail 'usage: farmy update [--to VERSION]' ;; esac
+  [ -z "$target" ] || valid_version "$target" || fail 'update version must be exact MAJOR.MINOR.PATCH'
+  if [ "$FARMY_BUILD" = 1 ] && [ -z "$target" ] && [ -f "$HERE/Dockerfile" ]; then
+    if image_stale update; then build_image; docker rm -f "$NAME" >/dev/null 2>&1 || true; echo 'farmy updated'; else echo 'farmy is up to date'; fi
+    exit 0
+  fi
+  [ -n "$target" ] || target=$pin
+  [ -n "$target" ] || target=$(latest_version)
+  [ -n "$FARMY_REGISTRY" ] || fail 'set FARMY_REGISTRY to update'
+  for role in control keys knowledge gate; do pull "${FARMY_REGISTRY%/}/farmy-$role:$target" || fail "pull failed for farmy-$role:$target; installed shim unchanged"; done
+  stage=$(mktemp -d "$HERE/.farmy-update.XXXXXX"); container=
+  cleanup() { [ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$stage"; }
+  trap cleanup 0
+  trap 'exit 1' HUP INT TERM
+  container=$(docker create "${FARMY_REGISTRY%/}/farmy-control:$target") || fail 'could not create extraction container; installed shim unchanged'
+  docker cp "$container:/usr/local/lib/farmy/farmy" "$stage/source" || fail 'shim extraction failed; installed shim unchanged'
+  [ -s "$stage/source" ] || fail 'extracted shim is empty; installed shim unchanged'
+  sh -n "$stage/source" || fail 'invalid extracted shim; installed shim unchanged'
+  {
+    printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$target"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "${FARMY_REGISTRY%/}"
+    next_source=$FARMY_SOURCE
+    if [ "$FARMY_SOURCE_IS_GENERATED" = 1 ] && [ -n "$FARMY_DEFAULT_GITHUB" ]; then next_source="${FARMY_DEFAULT_GITHUB%.git}.git#v$target:work"; fi
+    printf '\nFARMY_DEFAULT_SOURCE='; quote "$next_source"
+    printf '\nFARMY_DEFAULT_GITHUB='; quote "$FARMY_DEFAULT_GITHUB"
+    printf '\nFARMY_DEFAULT_SOURCE_IS_GENERATED='; quote "$FARMY_SOURCE_IS_GENERATED"; printf '\n'
+    sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
+  } > "$stage/farmy"
+  chmod 755 "$stage/farmy"
+  mv -f "$stage/farmy" "$SELF"
+  echo "farmy updated to $target"
+  exit 0
+fi
+running_version=
+for field in '{{.Image}}' '{{.Config.Image}}'; do
+  running_image=$(docker inspect -f "$field" "$NAME" 2>/dev/null || true)
+  if [ -n "$running_image" ]; then
+    running_version=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$running_image" 2>/dev/null || true)
+    valid_version "$running_version" && break
+  fi
+done
+if ! valid_version "$running_version"; then
+  running_version=$(docker inspect -f '{{index .Config.Labels "farmy.version"}}' "$NAME" 2>/dev/null || true)
+fi
+if valid_version "$running_version" && version_older "$FARMY_SHIM_VERSION" "$running_version"; then
+  echo "farmy: this shim is $FARMY_SHIM_VERSION, running control is newer ($running_version); farmy update" >&2
+fi
+if image_stale "${1:-}"; then build_image; docker rm -f "$NAME" >/dev/null 2>&1 || true; fi
+if valid_version "$running_version" && [ "$running_version" != "$FARMY_SHIM_VERSION" ]; then docker rm -f "$NAME" >/dev/null 2>&1 || true; fi
+if [ "$LOCAL_INIT" = 1 ] && [ -n "${running_image:-}" ]; then
+  running_hash=$(docker image inspect -f '{{index .Config.Labels "farmy.hash"}}' "$running_image" 2>/dev/null || true)
+  [ "$running_hash" = "$HASH" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true
+fi
+# The current local Docker context supplies the control socket.
+ENDPOINT=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+case "${ENDPOINT:-unix:///var/run/docker.sock}" in
+  unix://*) SOCK=${ENDPOINT#unix://}; [ -n "$SOCK" ] || SOCK=/var/run/docker.sock ;;
+  *) fail "the Docker context points at $ENDPOINT — farmy needs a local Docker, reached through its socket (docker context use default, or a unix:// context)" ;;
+esac
+[ "$(uname -s)" = Darwin ] && SOCK=/var/run/docker.sock
+TZV=${TZ:-$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')}
+
+# the control container: one per containers folder; made anew when the folder (its mount) changed
+WANT="$PWD"
+HAVE=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "'"$WANT"'"}}{{.Source}}{{end}}{{end}}' "$NAME" 2>/dev/null || true)
+# on the farmy network, where the egress node and the knowledge container resolve by name
+docker network inspect farmy >/dev/null 2>&1 || docker network create farmy >/dev/null
+if [ "$HAVE" != "$WANT" ]; then
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$NAME" --init --restart unless-stopped --network farmy \
+    -v "$SOCK:/var/run/docker.sock" -v "$WANT:$WANT" -w "$WANT" \
+    -e DOCKER_CLI_HINTS=false -e FARMY_REGISTRY -e FARMY_SOURCE -e FARMY_BUILD ${TZV:+-e TZ="$TZV"} -v farmy-control:/root "$IMAGE" tail -f /dev/null >/dev/null
+fi
+docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true || docker start "$NAME" >/dev/null
+# a control container from an older farmy, on the default bridge: attached to farmy as well
+docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$NAME" 2>/dev/null | grep -qw farmy || docker network connect farmy "$NAME" >/dev/null 2>&1 || true
+
+TTY=""; [ -t 0 ] && [ -t 1 ] && TTY="-t"
+if [ "$#" -eq 0 ]; then
+  [ -n "$TTY" ] && exec docker exec -i $TTY -w "$WANT" "$NAME" farmy session
+  exec docker exec -i -w "$WANT" "$NAME" farmy help
+fi
+# farmy init: the host's git identity, when the host has git, goes in through the environment; the control
+# container never sees the host's git configuration (farmy asks on a terminal for what is still missing)
+IDENT=""
+if [ "${1:-}" = init ] && command -v git >/dev/null 2>&1; then
+  GIT_USER_NAME=$(git config --global user.name 2>/dev/null || true); export GIT_USER_NAME
+  GIT_USER_EMAIL=$(git config --global user.email 2>/dev/null || true); export GIT_USER_EMAIL
+  IDENT="-e GIT_USER_NAME -e GIT_USER_EMAIL"
+fi
+
+# Unlocking values (farmy unlock-names: secrets.unlock, and without a provider every route's secret). farmy
+# never stores a secret on disk: before a command that
+# loads the brokers, the shim obtains each value from one source and pipes it to farmy, never on a command
+# line. The source is the command in FARMY_UNLOCK_COMMAND (a shell line run here with the name as $1; a line
+# without $1 gets the name appended) when it is set, else the macOS Keychain (security), else the Linux
+# secret service (secret-tool), both under the one name <FARMY_SECRET_PREFIX><NAME>, default farmy/<NAME>.
+# Only the names the control container does not hold yet are asked (farmy unlock-names --missing): it keeps
+# what it was given until farmy lock or a restart of the container. A locked keychain is unlocked once
+# (security unlock-keychain, on the terminal). What the source does not have is asked for here, hidden.
+# FARMY_SECRET_PREFIX and FARMY_UNLOCK_COMMAND: the environment, else .env of the containers folder
+from_env_file() {  # $1: the key; prints its value in .env (quotes taken off), nothing when absent
+  [ -f "$WANT/.env" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$WANT/.env" | tail -1 | sed 's/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/'
+}
+if [ -z "${FARMY_SECRET_PREFIX+set}" ]; then
+  FARMY_SECRET_PREFIX=$(from_env_file FARMY_SECRET_PREFIX)
+  [ -n "$FARMY_SECRET_PREFIX" ] || unset FARMY_SECRET_PREFIX
+fi
+if [ -z "${FARMY_UNLOCK_COMMAND:-}" ]; then
+  FARMY_UNLOCK_COMMAND=$(from_env_file FARMY_UNLOCK_COMMAND)
+fi
+PREFIX=${FARMY_SECRET_PREFIX-farmy/}
+SOURCE="no store on the PATH and no FARMY_UNLOCK_COMMAND"
+if [ -n "${FARMY_UNLOCK_COMMAND:-}" ]; then SOURCE="FARMY_UNLOCK_COMMAND"
+elif command -v security >/dev/null 2>&1; then SOURCE="the Keychain"
+elif command -v secret-tool >/dev/null 2>&1; then SOURCE="the secret service"
+fi
+from_command() {
+  case "$FARMY_UNLOCK_COMMAND" in
+    *'$1'*|*'${1}'*) sh -c "$FARMY_UNLOCK_COMMAND" farmy-unlock "$1" 2>/dev/null ;;
+    *) sh -c "$FARMY_UNLOCK_COMMAND \"\$1\"" farmy-unlock "$1" 2>/dev/null ;;
+  esac
+}
+keychain_lookup() { # the value; 36 while the keychain is locked, 1 when the item is not there
+  out=$(security find-generic-password -s "$PREFIX$1" -w 2>/dev/null) && { printf '%s\n' "$out"; return 0; }
+  [ $? -eq 36 ] && return 36
+  return 1
+}
+KEYCHAIN_UNLOCKED=""
+from_keychain() {
+  keychain_lookup "$1" && return 0
+  [ $? -eq 36 ] || return 1
+  [ -n "$KEYCHAIN_UNLOCKED" ] && return 1
+  KEYCHAIN_UNLOCKED=1
+  echo "farmy: the keychain is locked; unlocking it once (security unlock-keychain)" >&2
+  security unlock-keychain >&2 || true
+  keychain_lookup "$1"
+}
+from_secret_service() {
+  # a secret service that answers with an error (a locked collection, no D-Bus session on a headless host)
+  # is named once and asked nothing more for this command; every value is then asked for instead
+  [ -e "$SS_DOWN" ] && return 1
+  out=$(secret-tool lookup farmy "$PREFIX$1" 2>"$SS_DOWN.err") && [ -n "$out" ] && { rm -f "$SS_DOWN.err"; printf '%s\n' "$out"; return 0; }
+  msg=$(cat "$SS_DOWN.err" 2>/dev/null || true); rm -f "$SS_DOWN.err"
+  if [ -n "$msg" ]; then
+    echo "farmy: the secret service answers with an error, so it is not asked again; each value is asked for instead: $msg" >&2
+    : > "$SS_DOWN"
+    return 1
+  fi
+  return 1
+}
+unlock_value() {
+  case "$SOURCE" in
+    FARMY_UNLOCK_COMMAND) from_command "$1" ;;
+    "the Keychain") from_keychain "$1" ;;
+    "the secret service") from_secret_service "$1" ;;
+    *) return 1 ;;
+  esac
+}
+ask_hidden() { # on the terminal, never echoed
+  printf '%s (for farmy; not shown): ' "$1" >/dev/tty
+  stty -echo </dev/tty 2>/dev/null || true
+  IFS= read -r out </dev/tty || out=""
+  stty echo </dev/tty 2>/dev/null || true
+  echo >/dev/tty
+  printf '%s\n' "$out"
+}
+# the commands that load the brokers or run the provider, so take the unlocking values: start, restart,
+# rebuild, keys reload, keys --why, factory start and answer. Every one goes through the lookup below; a
+# command missing here would reach farmy with nothing on stdin and an empty holder, and farmy would prompt.
+LOADS=""
+case "${1:-}" in
+  start|restart|rebuild) LOADS=1 ;;
+  keys) case "${2:-}" in reload|--why) LOADS=1 ;; esac ;;
+  factory) case "${2:-}" in start|answer) LOADS=1 ;; esac ;;
+esac
+UNLOCK=""
+SS_DOWN="${TMPDIR:-/tmp}/farmy-secret-service-down.$$"   # a file: each lookup runs in a subshell
+rm -f "$SS_DOWN"
+if [ -n "$LOADS" ]; then
+  for n in $(docker exec -w "$WANT" "$NAME" farmy unlock-names --missing 2>/dev/null || true); do
+    v=$(unlock_value "$n" || true)
+    [ -n "$v" ] || [ -z "$TTY" ] || v=$(ask_hidden "$n")
+    # base64, so that a multi-line value (an SSH key) arrives byte for byte
+    if [ -n "$v" ]; then UNLOCK="${UNLOCK}${n}:base64=$(printf '%s' "$v" | base64 | tr -d '\n\r')
+"
+    else echo "farmy: $n: not found by $SOURCE and no terminal to ask on; the routes that need it stay locked" >&2
+    fi
+  done
+fi
+rm -f "$SS_DOWN"
+# with the values on stdin docker exec cannot have -t: tell farmy that its output reaches a terminal
+OUTTTY=""; [ -t 1 ] && OUTTTY="-e FARMY_TTY=1"
+if [ -n "$UNLOCK" ]; then printf '%s' "$UNLOCK" | docker exec -i $OUTTTY $IDENT -w "$WANT" "$NAME" farmy "$@"
+else exec docker exec -i $TTY $IDENT -w "$WANT" "$NAME" farmy "$@"; fi

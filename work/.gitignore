@@ -1,0 +1,10 @@
+# farmy's own state in a containers folder, and the env file
+/.env
+/.work/
+# Rust build output and the built binaries (bin/build puts them in bin/)
+/target/
+/bin/farmy
+/bin/farmy-keys
+/bin/farmy-knowledge
+/bin/farmy-gate
+/bin/.*.new

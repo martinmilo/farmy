@@ -1,0 +1,11 @@
+secrets:
+  provider: [bin/provider]
+agents:
+  claude:
+    mode: subscription
+keys:
+  anthropic:
+    secret: ANTHROPIC_API_KEY
+    upstream: https://api.anthropic.com
+    auth: header
+    header: x-api-key

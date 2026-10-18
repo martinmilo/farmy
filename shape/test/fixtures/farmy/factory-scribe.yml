@@ -1,0 +1,6 @@
+agents:
+  scribe:
+    install: "true"
+    login: null
+    token_env: CLAUDE_CODE_OAUTH_TOKEN
+    headless: {command: "scribe --batch", prompt: stdin}

@@ -1,0 +1,15 @@
+secrets:
+  provider: [bin/provider]
+keys:
+  git:
+    secret: GIT_TOKEN
+    upstream: https://github.com
+    auth: basic
+    user: x-access-token
+    git: true
+  anthropic:
+    secret: ANTHROPIC_API_KEY
+    upstream: https://api.anthropic.com
+    auth: header
+    header: x-api-key
+    expose: ANTHROPIC_BASE_URL

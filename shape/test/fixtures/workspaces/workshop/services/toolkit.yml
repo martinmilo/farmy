@@ -1,0 +1,5 @@
+repo: https://github.com/acme/toolkit.git
+dockerfile: Dockerfile
+target: base
+build_files: [Gemfile, Gemfile.lock]
+ports: ["3300:3000"]

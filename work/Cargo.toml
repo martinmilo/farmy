@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/farmy", "crates/farmy-keys", "crates/farmy-knowledge", "crates/farmy-gate"]
+
+# sanity rust @ rust-v0.1.0
+# Lints and the release profile from sanity/rust; every member has [lints] workspace = true.
+[workspace.package]
+# Internal Cargo package metadata; distributed versions come only from VERSION.
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"       # File::lock (1.89); the dependency tree needs 1.88. Raise it on purpose
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "deny"        # "forbid" in crate roots that will never need it; forbid cannot be overridden
+unused_must_use = "deny"
+unreachable_pub = "warn"    # pub(crate) for what the crate does not export
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# failure handling
+unwrap_used = "warn"                # expect("reason") on production paths; unwrap in tests is allowed by clippy.toml
+let_underscore_must_use = "warn"    # `let _ = fallible()` needs a local allow with the reason
+missing_errors_doc = "warn"         # lib: every pub fn returning Result documents its errors
+missing_panics_doc = "warn"         # lib: every pub fn that can panic says when
+# numeric boundaries
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
+# API hygiene
+return_self_not_must_use = "warn"   # lib: builders and guards carry #[must_use]
+unused_async = "warn"               # service: async only where something is awaited
+undocumented_unsafe_blocks = "warn"
+# suppressions
+allow_attributes_without_reason = "warn"    # #[expect(lint, reason = "...")]; see GUIDE.md
+# leftovers that must not reach a commit
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"               # allow in the binary crate root: #![allow(clippy::print_stdout)]
+
+[profile.release]
+strip = true                        # farmy's own; debug = "line-tables-only" from the baseline is left out, strip removes it anyway
+lto = "thin"                        # farmy's own
+overflow-checks = true              # integer overflow is a bug in release too
+panic = "abort"                     # a service with a supervisor aborts; choose unwind on purpose, and then watch every JoinHandle

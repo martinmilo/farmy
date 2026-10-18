@@ -1,0 +1,1 @@
+export FARMY_DOTFILES_BASH=applied

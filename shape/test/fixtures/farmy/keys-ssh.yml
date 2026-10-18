@@ -1,0 +1,8 @@
+secrets:
+  provider: [bin/provider]
+keys:
+  git:
+    secret: GIT_SSH_KEY
+    upstream: ssh://git@github.com
+    auth: ssh
+    git: true

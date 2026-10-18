@@ -1,0 +1,15 @@
+repo: https://github.com/acme/shop.git
+image: ruby:3.4
+ports: ["3100:3000"]
+compose:
+  postgres:
+    image: postgres:18
+    container_name: shop-pg
+    volumes: [pgdata:/var/lib/postgresql]
+    networks: [default, backnet]
+volumes:
+  pgdata:
+    name: shop-pg-data
+networks:
+  backnet:
+    name: shop-backnet

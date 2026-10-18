@@ -1,0 +1,14 @@
+# Package repositories available to restricted apps; factory agents do not inherit this set.
+registries:
+  - deb.debian.org
+  - security.debian.org
+  - dl-cdn.alpinelinux.org
+  - rubygems.org
+  - index.rubygems.org
+  - registry.npmjs.org
+  - pypi.org
+  - files.pythonhosted.org
+  - proxy.golang.org
+  - crates.io
+  - index.crates.io
+  - static.crates.io

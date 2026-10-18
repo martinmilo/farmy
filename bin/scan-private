@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+# Shared byte-oriented privacy scanner. PRIVATE_TERMS_FILE names the private denylist, a file kept outside
+# the repository; there is no default, and the scanner refuses to run without it. Release publication also
+# requires the list to be nonempty and scans the complete candidate repository.
+require "open3"
+require "yaml"
+require "uri"
+
+module PublicPrivacy
+  module_function
+  def git(*args)
+    output, error, status = Open3.capture3("git", *args, binmode: true)
+    raise "Git could not read the public candidate" unless status.success?
+    output
+  end
+  def terms(required: false)
+    path = ENV["PRIVATE_TERMS_FILE"].to_s
+    raise "PRIVATE_TERMS_FILE is unset: set it to the private denylist, a file kept outside the repository" if path.empty?
+    unless File.file?(path) && File.readable?(path) && (File.stat(path).mode & 0444) != 0
+      raise "PRIVATE_TERMS_FILE names #{path}, which is missing or unreadable"
+    end
+    result = File.binread(path).lines.map(&:strip).reject { |term| term.empty? || term.start_with?("#") }.map { |term| term.b.downcase }.uniq
+    raise "the private denylist #{path} (PRIVATE_TERMS_FILE) is empty" if required && result.empty?
+    result
+  end
+  # One active policy applies to every scanned object. Historical configuration can never
+  # authorize its own exceptions; only exact values in the selected current configuration do.
+  class Policy
+    URL_FIELDS = %w[github_url issues_url contributions_url].freeze
+    VERSION = /\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\z/
+
+    def self.document(bytes)
+      text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
+      return unless text.valid_encoding?
+      stream = YAML.parse_stream(text)
+      return unless stream.children.length == 1
+      mapping = stream.children.first.root
+      return unless mapping.is_a?(Psych::Nodes::Mapping)
+      keys = mapping.children.each_slice(2).map(&:first)
+      return unless keys.all? { |key| key.is_a?(Psych::Nodes::Scalar) }
+      return unless keys.map(&:value).uniq.length == keys.length
+      values = YAML.safe_load(text, aliases: false)
+      [values, mapping, text] if values.is_a?(Hash)
+    rescue Psych::Exception, ArgumentError
+      nil
+    end
+
+    def initialize(bytes, versions)
+      @values = {}
+      @urls = []
+      parsed = self.class.document(bytes)
+      return unless parsed
+      config = parsed.first
+      name, email = config.values_at("maintainer_name", "maintainer_email")
+      return unless name.is_a?(String) && !name.empty? && name == name.strip && !name.match?(/[<>\x00-\x1f\x7f]/)
+      return unless email.is_a?(String) && email.match?(/\A[^<>\s@]+@[^<>\s@]+\z/) && !email.match?(/[\x00-\x1f\x7f]/)
+      @name = name.b
+      @identity = "#{name} <#{email}>".b
+      @values = {"maintainer_name" => name, "maintainer_email" => email}
+      owner = config["owner"]
+      @values["owner"] = owner if owner.is_a?(String) && owner.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+      URL_FIELDS.each do |field|
+        value = config[field]
+        next unless value.is_a?(String) && !value.match?(/[\s<>"'`\\]/)
+        begin
+          url = URI.parse(value)
+          next unless url.is_a?(URI::HTTPS) && url.host && !url.userinfo && !url.query && !url.fragment
+          @values[field] = value
+        rescue URI::InvalidURIError
+          next
+        end
+      end
+      @urls = URL_FIELDS.filter_map { |field| @values[field]&.b }
+      if (github = @values["github_url"])
+        base = github.sub(%r{/+\z}, "").sub(/\.git\z/, "")
+        versions.select { |version| VERSION.match?(version) }.uniq.each do |version|
+          %w[install SHA256SUMS].each { |asset| @urls << "#{base}/releases/download/v#{version}/#{asset}".b }
+        end
+        %w[install SHA256SUMS].each { |asset| @urls << "#{base}/releases/latest/download/#{asset}".b }
+      end
+    end
+
+    def declaration(bytes)
+      parsed = self.class.document(bytes)
+      return bytes unless parsed
+      values, mapping, text = parsed
+      lines = text.lines
+      offsets = [0]
+      lines.each { |line| offsets << offsets.last + line.bytesize }
+      spans = mapping.children.each_slice(2).filter_map do |key, value|
+        next unless value.is_a?(Psych::Nodes::Scalar) && !value.anchor && !value.tag
+        next unless @values.key?(key.value) && values[key.value] == @values[key.value] && value.value == @values[key.value]
+        first = offsets[value.start_line] + lines.fetch(value.start_line, "")[0...value.start_column].bytesize
+        last = offsets[value.end_line] + lines.fetch(value.end_line, "")[0...value.end_column].bytesize
+        [first, last - first]
+      end
+      result = bytes.b.dup
+      spans.reverse_each { |first, length| result[first, length] = " " }
+      result
+    end
+
+    def file(name, bytes, regular: true)
+      return bytes unless regular
+      case name
+      when "work/release.yml"
+        declaration(bytes)
+      when "LICENSE"
+        return bytes unless @name
+        bytes.b.lines.map do |line|
+          pattern = /\A(Copyright \(c\)[ \t]+(?:[0-9]{4}(?:[ \t]*-[ \t]*[0-9]{4})?[ \t]+)?)#{Regexp.escape(@name)}([ \t]*\r?\n?\z)/n
+          line.sub(pattern) { "#{$1} #{$2}" }
+        end.join
+      when "README.md", "CONTRIBUTING.md"
+        # Consume the whole URL token, so suffixes, queries and fragments cannot inherit
+        # an allowed prefix. Markdown punctuation stays outside the URL and stays scanned.
+        bytes.b.gsub(%r{(?<![A-Za-z0-9_./:%?&=+#@~-])https?://[^\x00-\x20<>"'`()\[\]{}]+}n) do |url|
+          @urls.include?(url) ? " " : url
+        end
+      else
+        bytes
+      end
+    end
+
+    def metadata(bytes, kind)
+      return bytes unless @identity
+      headers, separator, message = bytes.b.partition("\n\n")
+      return bytes if separator.empty?
+      fields = kind == :commit ? "author|committer" : "tagger"
+      pattern = /\A(#{fields}) #{Regexp.escape(@identity)} (-?[0-9]+ [+-][0-9]{4})(\n?\z)/n
+      headers = headers.lines.map { |line| line.sub(pattern) { "#{$1} #{$2}#{$3}" } }.join
+      headers + separator + message
+    end
+  end
+
+  def policy_file(path, source)
+    case source
+    when :working
+      return nil if File.symlink?(path) || !File.file?(path)
+      File.binread(path)
+    when :index
+      entry = git("ls-files", "--stage", "--", path)
+      return nil unless entry.match?(/\A100(?:644|755) [0-9a-f]+ 0\t/)
+      git("show", ":#{path}")
+    when :head
+      entry = git("ls-tree", "--full-tree", "HEAD", "--", path)
+      return nil unless entry.match?(/\A100(?:644|755) blob /)
+      git("show", "HEAD:#{path}")
+    end
+  rescue RuntimeError
+    nil # Missing files or an unborn HEAD provide no policy, never a broad exception.
+  end
+
+  def policy(source)
+    versions = [policy_file("work/VERSION", source).to_s.strip]
+    versions.concat(git("for-each-ref", "--format=%(refname:strip=2)", "refs/tags").lines.filter_map do |tag|
+      tag = tag.strip
+      tag.delete_prefix("v") if tag.start_with?("v")
+    end)
+    Policy.new(policy_file("work/release.yml", source), versions)
+  end
+
+  def hits(text, terms)
+    bytes = text.b
+    folded = bytes.downcase
+    # Keep exact byte matching for binary input and the previous scanner's Unicode
+    # case-insensitivity for text, even when UTF-8 is embedded in a binary blob.
+    unicode = bytes.dup.force_encoding(Encoding::UTF_8).scrub.downcase.b
+    terms.select do |term|
+      decoded = term.dup.force_encoding(Encoding::UTF_8)
+      folded.include?(term) || (decoded.valid_encoding? && unicode.include?(decoded.downcase.b))
+    end
+  end
+  def report(label, bytes, terms)
+    found = hits(bytes, terms)
+    return false if found.empty?
+    warn "private term in #{label}: #{found.map(&:inspect).join(', ')}"
+    true
+  end
+  def tree(tree, terms, policy, seen = {})
+    failed = false
+    git("ls-tree", "-r", "-z", "--full-tree", tree).split("\0").each do |entry|
+      metadata, name = entry.split("\t", 2)
+      mode, type, object = metadata.split(" ")
+      failed = report("path #{name.inspect}", name, terms) || failed
+      next unless type == "blob"
+      key = [object, name, mode]
+      next if seen[key]
+      seen[key] = true
+      bytes = policy.file(name, git("cat-file", "blob", object), regular: mode != "120000")
+      failed = report("#{tree[0, 10]}:#{name.inspect}", bytes, terms) || failed
+    end
+    failed
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    terms = PublicPrivacy.terms(required: ENV["FARMY_SCAN_REQUIRED"] == "1")
+    exit 0 if terms.empty?
+    staged = ARGV.delete("--staged")
+    abort "usage: bin/scan-private [--staged]" unless ARGV.empty?
+    root = PublicPrivacy.git("rev-parse", "--show-toplevel").strip
+    Dir.chdir(root)
+    policy = PublicPrivacy.policy(staged ? :index : :working)
+    modes = PublicPrivacy.git("ls-files", "--stage", "-z").split("\0").to_h do |entry|
+      metadata, name = entry.split("\t", 2)
+      [name, metadata.split.first]
+    end
+    names = if staged
+      PublicPrivacy.git("diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR").split("\0")
+    else
+      PublicPrivacy.git("ls-files", "-z").split("\0")
+    end
+    failed = false
+    names.each do |name|
+      failed = PublicPrivacy.report("path #{name.inspect}", name, terms) || failed
+      path = File.join(root, name)
+      bytes = if staged
+        PublicPrivacy.git("show", ":#{name}")
+      elsif File.symlink?(path)
+        File.readlink(path).b
+      elsif File.file?(path)
+        File.binread(path)
+      else
+        next
+      end
+      regular = staged ? modes[name] != "120000" : !File.symlink?(path)
+      failed = PublicPrivacy.report(name.inspect, policy.file(name, bytes, regular: regular), terms) || failed
+    end
+    exit(failed ? 1 : 0)
+  rescue StandardError => error
+    warn "privacy scan failed: #{error.message}"
+    exit 1
+  end
+end

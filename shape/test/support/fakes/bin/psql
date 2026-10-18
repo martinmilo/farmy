@@ -1,0 +1,67 @@
+#!/usr/bin/env ruby
+# PostgreSQL's narrow client surface used by the concurrent gate fixture. Discovery follows the
+# invoking container's actual networks; data lives on the selected sidecar's real fake volume.
+# No run IDs, factory phases, approvals or expected gate outcomes are interpreted here.
+Encoding.default_external = Encoding::UTF_8 # whatever locale the caller has; the state files hold UTF-8
+require "json"
+require "fileutils"
+
+journal = ENV.fetch("FAKE_DOCKER_JOURNAL")
+args = ARGV.dup
+host = "postgres"
+sql = nil
+until args.empty?
+  arg = args.shift
+  case arg
+  when "-h", "--host" then host = args.shift
+  when "-c", "--command", "-Atc", "-tc" then sql = args.shift
+  when "-U", "-d", "-p" then args.shift
+  end
+end
+abort "fake psql: expected -c SQL" unless sql
+state = JSON.parse(File.read(File.join(journal, "state.json")))
+nets = JSON.parse(ENV.fetch("FAKE_GATE_NETWORKS", "[]"))
+name, sidecar = state.fetch("containers").find do |candidate, container|
+  !(Array(container["networks"]) & nets).empty? &&
+    ([candidate, container["service"], *Array(container["aliases"])].include?(host)) &&
+    container["state"] == "running"
+end
+abort "psql: could not translate host name #{host.inspect} to address" unless sidecar
+abort "psql: database system is not ready" if sidecar["health"] && sidecar["health"] != "healthy"
+mount = Array(sidecar["volumes"]).find { |volume| volume["target"].start_with?("/var/lib/postgresql") }
+abort "psql: database has no data volume" unless mount
+folder = File.join(journal, "volumes", mount.fetch("name"))
+FileUtils.mkdir_p(folder)
+path = File.join(folder, "postgres-data.json")
+result = +""
+File.open(File.join(folder, "postgres-data.lock"), "a+") do |lock|
+  lock.flock(File::LOCK_EX)
+  database = File.exist?(path) ? JSON.parse(File.read(path)) : { "tables" => [], "values" => [], "released" => false }
+  sql.split(";").map(&:strip).reject(&:empty?).each do |statement|
+    case statement
+    when /\ACREATE TABLE(?: IF NOT EXISTS)? (gate_values|gate_release)\b/i
+      database["tables"] |= [$1.downcase]
+    when /\AINSERT INTO gate_values\s*\(value\)\s*VALUES\s*\('([^']*)'\)\z/i
+      abort "ERROR: relation gate_values does not exist" unless database["tables"].include?("gate_values")
+      database["values"] << $1
+    when /\ASELECT value FROM gate_values(?: ORDER BY value)?\z/i
+      abort "ERROR: relation gate_values does not exist" unless database["tables"].include?("gate_values")
+      result << database["values"].sort.join("\n") << "\n"
+    when /\ASELECT count\(\*\) FROM gate_release\z/i
+      abort "ERROR: relation gate_release does not exist" unless database["tables"].include?("gate_release")
+      result << (database["released"] ? "1\n" : "0\n")
+    else
+      abort "fake psql: unsupported fixture SQL #{statement.inspect}"
+    end
+  end
+  temporary = "#{path}.#{Process.pid}.tmp"
+  File.write(temporary, JSON.generate(database))
+  File.rename(temporary, path)
+end
+event = { "container" => ENV["FAKE_GATE_CONTAINER"], "sidecar" => name, "volume" => mount["name"],
+          "networks" => nets, "sql" => sql, "result" => result }
+File.open(File.join(journal, "postgres-queries.jsonl"), "a") do |file|
+  file.flock(File::LOCK_EX)
+  file.puts JSON.generate(event)
+end
+print result

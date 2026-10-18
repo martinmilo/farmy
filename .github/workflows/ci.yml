@@ -1,0 +1,65 @@
+# sanity/rust rust-v0.1.0
+# The check job is bin/check and nothing more. The other jobs need a tool or a toolchain
+# that bin/check does not assume on a developer machine. The Cargo root is work/; the
+# semver job is left out because farmy publishes no library.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: work
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: bin/check
+
+  msrv:
+    # Builds with the rust-version declared in work/Cargo.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo build --workspace --locked
+
+  features:
+    # Every combination of features builds, so a minimal feature set is not broken.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: cargo hack --workspace --feature-powerset --locked check
+
+  docs:
+    # bin/check covers rustc and Clippy warnings; rustdoc has its own.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

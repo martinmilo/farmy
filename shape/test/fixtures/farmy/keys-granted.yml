@@ -1,0 +1,10 @@
+secrets:
+  provider: [bin/provider]
+keys:
+  anthropic:
+    secret: ANTHROPIC_API_KEY
+    upstream: https://api.anthropic.com
+    auth: header
+    header: x-api-key
+    expose: ANTHROPIC_BASE_URL
+    services: [notes]

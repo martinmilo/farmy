@@ -1,0 +1,243 @@
+#!/usr/bin/env ruby
+# Export committed, allowlisted content into an independent release-only public repository.
+require "yaml"
+require "open3"
+require "tmpdir"
+require "fileutils"
+require "time"
+require "uri"
+
+class Publication
+  VERSION = /\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\z/
+  def initialize(version)
+    # Repository-selection variables must not redirect the CWD contract or share object storage.
+    @env = %w[GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_PARAMETERS].to_h { |key| [key, nil] }
+    @version = version
+    raise "version must be exact MAJOR.MINOR.PATCH" unless VERSION.match?(version)
+    @root = git(Dir.pwd, "rev-parse", "--show-toplevel").strip
+    raise "dirty tracked source; commit or restore it before publishing" unless git(@root, "status", "--porcelain", "--untracked-files=no").empty?
+    raise "requested version differs from work/VERSION" unless source("work/VERSION").strip == version
+    @config = YAML.safe_load(source("work/release.yml"), aliases: false)
+    raise "work/release.yml must be a mapping" unless @config.is_a?(Hash)
+    %w[owner github_url public_remote maintainer_name maintainer_email issues_url contributions_url contribution_text].each do |key|
+      raise "release configuration needs #{key}" unless @config[key].is_a?(String) && !@config[key].strip.empty?
+    end
+    @identity = "#{@config['maintainer_name']} <#{@config['maintainer_email']}>"
+    raise "invalid public maintainer identity" if @identity.match?(/[\r\n\0]/) || @config['maintainer_name'].match?(/[<>]/) || @config['maintainer_email'].match?(/[<>\s]/)
+    remote = @config.fetch("public_remote")
+    raise "invalid public remote name" unless remote.match?(/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/)
+    @remote_url = git(@root, "remote", "get-url", "--push", remote).strip
+    raise "public remote must have one destination" if @remote_url.empty? || @remote_url.include?("\n")
+    if @remote_url.match?(%r{\Ahttps?://})
+      uri = URI.parse(@remote_url)
+      raise "public remote credentials must stay outside its URL" if uri.userinfo
+    end
+    @terms = ENV["PRIVATE_TERMS_FILE"].to_s
+    raise "publication requires PRIVATE_TERMS_FILE, naming the private denylist (a file kept outside the repository)" if @terms.empty?
+    unless File.file?(@terms) && File.readable?(@terms) && (File.stat(@terms).mode & 0444) != 0
+      raise "publication requires a readable private denylist; PRIVATE_TERMS_FILE names #{@terms}, which is missing or unreadable"
+    end
+    raise "publication requires a nonempty private denylist; #{@terms} (PRIVATE_TERMS_FILE) holds no term" if File.binread(@terms).lines.all? { |line| line.strip.empty? || line.strip.start_with?("#") }
+    @terms = File.expand_path(@terms)
+    @manifest = source("work/public-files.txt").lines.map(&:strip).reject { |line| line.empty? || line.start_with?("#") }
+    raise "public file allowlist is empty" if @manifest.empty?
+    @manifest.each do |path|
+      raise "unsafe public file allowlist path" if path.start_with?("/") || path.split("/").any? { |part| ["..", ".", ".git", ""].include?(part) } || path.include?("\0")
+    end
+    # Transport still needs the user's credential helpers, farmy routes and SSH settings.
+    # Only local object/metadata construction ignores ambient identity and signing config.
+    @network_env = @env.dup
+    @env.merge!({"GIT_CONFIG_NOSYSTEM" => "1", "GIT_CONFIG_GLOBAL" => File::NULL, "GIT_CONFIG_COUNT" => "0",
+            "GIT_AUTHOR_NAME" => @config['maintainer_name'], "GIT_AUTHOR_EMAIL" => @config['maintainer_email'],
+            "GIT_COMMITTER_NAME" => @config['maintainer_name'], "GIT_COMMITTER_EMAIL" => @config['maintainer_email'],
+            "GIT_AUTHOR_DATE" => Time.now.utc.iso8601, "GIT_COMMITTER_DATE" => Time.now.utc.iso8601})
+  end
+  def git(directory, *args, input: nil)
+    environment = @network_env && %w[ls-remote fetch push].include?(args.first) ? @network_env : (@env || {})
+    out, err, status = Open3.capture3(environment, "git", "-C", directory, *args, stdin_data: input, binmode: true)
+    unless status.success?
+      operation = args.first == "push" && args.include?("--atomic") ? "atomic public push" : "Git #{args.first}"
+      raise "#{operation} failed; check remote rejection, concurrent changes or unsupported atomic updates" if operation == "atomic public push"
+      raise "#{operation} failed; public refs were not intentionally changed"
+    end
+    out
+  end
+  def source(path)
+    git(@root, "show", "HEAD:#{path}")
+  end
+  def export(directory)
+    git(@root, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split("\0").each do |entry|
+      metadata, path = entry.split("\t", 2)
+      next unless @manifest.any? { |item| item.end_with?("/") ? path.start_with?(item) : path == item }
+      # An accidental broad allowlist must not copy private state or generated executables.
+      next if path.split("/").include?(".git") || path.match?(%r{(?:\A|/)(?:target|\.work)/}) || path == "work/.env" || path.end_with?("/QUESTIONS.md") || path.match?(%r{\Awork/bin/(?:farmy(?:-keys|-knowledge|-gate)?|\..*\.new)\z})
+      mode, type, object = metadata.split(" ")
+      raise "unsupported public entry type" unless type == "blob" && %w[100644 100755 120000].include?(mode)
+      target = File.join(directory, path)
+      FileUtils.mkdir_p(File.dirname(target))
+      bytes = git(@root, "cat-file", "blob", object)
+      if mode == "120000"
+        File.symlink(bytes, target)
+      else
+        File.binwrite(target, bytes)
+        File.chmod(mode == "100755" ? 0755 : 0644, target)
+      end
+    end
+    Dir.glob(File.join(directory, "**", "*"), File::FNM_DOTMATCH).each do |path|
+      next unless File.symlink?(path)
+      link = File.readlink(path)
+      raise "public symlink escapes the exported tree" if link.start_with?("/")
+      begin
+        resolved = File.realpath(path)
+      rescue SystemCallError
+        raise "public symlink has a dangling or excluded target"
+      end
+      raise "public symlink escapes the exported tree or targets excluded Git state" unless resolved.start_with?(directory + "/") && !resolved.start_with?(directory + "/.git/") && resolved != directory + "/.git"
+    end
+    render_documents(directory)
+    raise "public release notes are missing for #{@version}" unless File.file?(File.join(directory, "work/releases/#{@version}.md"))
+  end
+  def render_documents(directory)
+    registry = "ghcr.io/#{@config['owner']}/farmy"
+    github = @config['github_url'].sub(%r{/+\z}, "").sub(/\.git\z/, "")
+    replacements = @config.merge("registry" => registry, "version" => @version,
+      "install_url" => "#{github}/releases/download/v#{@version}/install",
+      "checksums_url" => "#{github}/releases/download/v#{@version}/SHA256SUMS")
+    %w[README.md CONTRIBUTING.md].each do |name|
+      path = File.join(directory, name)
+      next unless File.file?(path) && !File.symlink?(path)
+      text = File.binread(path)
+      replacements.each { |key, value| text = text.gsub("{{#{key}}}", value.to_s).gsub("{{ #{key} }}", value.to_s) }
+      # A marked policy block is also usable by ordinary source READMEs with working links.
+      policy = <<~POLICY.strip
+        <!-- farmy-public-policy -->
+        GitHub is a code mirror. Report [issues](#{@config['issues_url']}) and submit
+        [pull requests as proposals](#{@config['contributions_url']}) there. The public Forgejo
+        repository sits behind a mesh and cannot accept internet issues or contributions.
+
+        #{@config['contribution_text']}
+        GitHub proposals are not merged into the mirrored branch. Maintainers apply accepted
+        changes in the source repository, deliver them in the next release, and credit each
+        contributor in the release notes.
+        <!-- /farmy-public-policy -->
+      POLICY
+      if text.include?("<!-- farmy-public-policy -->")
+        text = text.sub(/<!-- farmy-public-policy -->.*?<!-- \/farmy-public-policy -->/m, policy)
+      else
+        text += "\n\n#{policy}\n"
+      end
+      if name == "README.md"
+        [github, "https://github.com/your-owner/farmy"].uniq.each do |base|
+          text = text.gsub(%r{#{Regexp.escape(base)}/releases/(?:latest/download|download/v[0-9.]+)/install}, replacements['install_url'])
+          text = text.gsub(%r{#{Regexp.escape(base)}/releases/(?:latest/download|download/v[0-9.]+)/SHA256SUMS}, replacements['checksums_url'])
+        end
+      end
+      File.binwrite(path, text)
+    end
+  end
+  def fetch_public(directory)
+    git(directory, "remote", "add", "public", @remote_url)
+    refs = git(directory, "ls-remote", "--refs", "public").lines.map { |line| line.strip.split("\t", 2) }
+    unexpected = refs.any? { |_, name| name != "refs/heads/main" && !name.start_with?("refs/tags/") }
+    raise "unexpected public refs; refuse publication" if unexpected
+    @old_main = refs.find { |_, name| name == "refs/heads/main" }&.first
+    if !@old_main && refs.any?
+      raise "public tags exist without main"
+    end
+    refspecs = []
+    refspecs << "refs/heads/main:refs/remotes/public/main" if @old_main
+    refspecs << "refs/tags/*:refs/tags/*" if refs.any? { |_, name| name.start_with?("refs/tags/") }
+    git(directory, "fetch", "--no-tags", "public", *refspecs) unless refspecs.empty?
+    raise "public main changed while fetching" if @old_main && git(directory, "rev-parse", "refs/remotes/public/main").strip != @old_main
+  end
+  def scan(directory)
+    %w[scan-private scan-history].each do |name|
+      scanner = File.join(@root, "bin", name)
+      raise "cannot execute bin/#{name}" unless File.file?(scanner) && File.executable?(scanner)
+      out, err, status = Open3.capture3(@env.merge("PRIVATE_TERMS_FILE" => @terms, "FARMY_SCAN_REQUIRED" => "1"), scanner, chdir: directory, binmode: true)
+      unless status.success?
+        # Scanner output names the hit, not arbitrary Git/network credential-bearing errors.
+        warn out unless out.empty?
+        warn err unless err.empty?
+        raise "bin/#{name} refused public publication"
+      end
+    end
+  end
+  def history(directory)
+    @tags = {}
+    git(directory, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags").lines.map(&:strip).each do |tag|
+      version = tag.delete_prefix("v")
+      raise "unexpected public tag" unless tag.start_with?("v") && VERSION.match?(version)
+      raise "public release tag must be annotated" unless git(directory, "cat-file", "-t", "refs/tags/#{tag}").strip == "tag"
+      commit = git(directory, "rev-parse", "refs/tags/#{tag}^{commit}").strip
+      @tags[version] = commit
+    end
+    return unless @old_main
+    remaining = @tags.dup
+    git(directory, "rev-list", "--parents", @old_main).lines.each do |line|
+      commit, *parents = line.split
+      raise "unexpected public merge history" if parents.length > 1
+      version = remaining.key(commit)
+      raise "unexpected untagged public main history" unless version
+      remaining.delete(version)
+      message = git(directory, "show", "-s", "--format=%B", commit).strip
+      raise "unexpected public release message" unless message == "farmy #{version}"
+    end
+    raise "public tags are outside main release history" unless remaining.empty?
+  end
+  def already_published?(directory, tree)
+    commit = @tags[@version]
+    return false unless commit
+    same_tree = git(directory, "rev-parse", "#{commit}^{tree}").strip == tree
+    author = git(directory, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", commit).lines.map(&:strip)
+    tag = git(directory, "cat-file", "tag", "refs/tags/v#{@version}")
+    same_tagger = tag.lines.any? { |line| line.start_with?("tagger #{@identity} ") }
+    raise "conflicting existing release version #{@version}" unless same_tree && author == [@identity, @identity] && same_tagger
+    true
+  end
+  def run
+    Dir.mktmpdir("farmy-public-") do |directory|
+      git(directory, "init", "-q", "--template=", "--initial-branch=main")
+      git(directory, "config", "core.hooksPath", File::NULL)
+      fetch_public(directory)
+      export(directory)
+      git(directory, "add", "--all")
+      tree = git(directory, "write-tree").strip
+      # Give history scanning a committed candidate policy at HEAD, including on the first
+      # release. Existing history is judged against this configuration, never its own.
+      args = ["commit-tree", tree]
+      args += ["-p", @old_main] if @old_main
+      commit = git(directory, *args, input: "farmy #{@version}\n").strip
+      git(directory, "update-ref", "refs/heads/main", commit)
+      # Check all old content before trusting old release metadata or allowing an idempotent retry.
+      scan(directory)
+      history(directory)
+      if already_published?(directory, tree)
+        puts "farmy #{@version} already published; no-op (public refs unchanged)"
+        puts "GitHub mirror synchronization and image/release CI remain unverified."
+        return
+      end
+      newest = @tags.keys.map { |v| v.split('.').map(&:to_i) }.max
+      raise "refuse an older release version" if newest && (@version.split('.').map(&:to_i) <=> newest) <= 0
+      git(directory, "tag", "-a", "v#{@version}", "-m", "farmy #{@version}", commit)
+      parents = git(directory, "rev-list", "--parents", "-n", "1", commit).split.drop(1)
+      raise "refuse public history replacement" unless parents == [@old_main].compact
+      scan(directory)
+      # The lease is a compare-and-swap precondition, never permission to replace history:
+      # the exact parent relation above has already been checked.
+      git(directory, "push", "--atomic", "--force-with-lease=refs/heads/main:#{@old_main}",
+        "--force-with-lease=refs/tags/v#{@version}:", "public",
+        "refs/heads/main:refs/heads/main", "refs/tags/v#{@version}:refs/tags/v#{@version}")
+      puts "Published farmy #{@version} main and v#{@version} to the public Forgejo repository."
+      puts "GitHub mirror synchronization and image/release CI are pending and unverified."
+    end
+  end
+end
+
+begin
+  abort "usage: bin/publish VERSION" unless ARGV.length == 1
+  Publication.new(ARGV.first).run
+rescue StandardError => error
+  warn "farmy publish: #{error.message}"
+  exit 1
+end

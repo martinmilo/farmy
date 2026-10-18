@@ -1,0 +1,9 @@
+repo: https://codeberg.org/acme/notes.git
+image: node:22
+ports: ["3200:5173", "3201:24678"]
+start_after: [shop]
+env:
+  VITE_API_URL: ${url:shop}
+  API_PORT: ${port:shop}
+commands:
+  start: npm run dev

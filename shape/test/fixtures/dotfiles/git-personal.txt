@@ -1,0 +1,12 @@
+[user]
+  name = Personal Developer
+  email = personal@example.com
+[core]
+  editor = nvim
+  sshCommand = ssh -o ProxyCommand=personal-direct-route
+[init]
+  defaultBranch = personal
+[url "ssh://personal.example.com/"]
+  insteadOf = https://git.example.com/
+[url "ssh://personal.example.com/acme/"]
+  insteadOf = https://git.example.com/acme/

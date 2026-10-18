@@ -1,0 +1,29 @@
+#!/usr/bin/env ruby
+# Scan all reachable public bytes and metadata, including deleted files and annotated tags.
+load File.join(__dir__, "scan-private")
+begin
+  abort "usage: bin/scan-history" unless ARGV.empty?
+  terms = PublicPrivacy.terms(required: true)
+  policy = PublicPrivacy.policy(:head)
+  failed = false
+  seen = {}
+  PublicPrivacy.git("rev-list", "--all").lines.map(&:strip).each do |commit|
+    metadata = policy.metadata(PublicPrivacy.git("cat-file", "commit", commit), :commit)
+    failed = PublicPrivacy.report("commit #{commit[0, 10]} metadata", metadata, terms) || failed
+    failed = PublicPrivacy.tree(commit, terms, policy, seen) || failed
+  end
+  PublicPrivacy.git("for-each-ref", "--format=%(refname)%00%(objectname)").lines.each do |line|
+    name, object = line.strip.split("\0", 2)
+    failed = PublicPrivacy.report("ref name", name, terms) || failed
+    while PublicPrivacy.git("cat-file", "-t", object).strip == "tag"
+      tag = PublicPrivacy.git("cat-file", "tag", object)
+      failed = PublicPrivacy.report("tag #{name.inspect}", policy.metadata(tag, :tag), terms) || failed
+      object = tag.lines.first.to_s.delete_prefix("object ").strip
+    end
+  end
+  puts "no reachable public history holds a private term" unless failed
+  exit(failed ? 1 : 0)
+rescue StandardError => error
+  warn "history scan failed: #{error.message}"
+  exit 1
+end

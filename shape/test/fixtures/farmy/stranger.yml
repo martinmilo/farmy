@@ -1,0 +1,15 @@
+keys:
+  github:
+    secret: GITHUB_TOKEN
+    upstream: https://github.com
+    auth: basic
+    user: x-access-token
+    git: true
+  anthropic:
+    secret: ANTHROPIC_API_KEY
+    upstream: https://api.anthropic.com
+    auth: header
+    header: x-api-key
+agents:
+  claude:
+    mode: api-key

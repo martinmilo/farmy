@@ -1,0 +1,9 @@
+#!/bin/sh
+# Builds the binaries and puts them where the tests (and the control image) expect them.
+set -eu
+cd "$(dirname "$0")/.."
+FARMY_SOURCE_HASH=$(FARMY_HASH_ONLY=1 sh ./farmy)
+export FARMY_SOURCE_HASH
+cargo build --release --quiet
+# copied beside and renamed: a binary still running (a holder, a run's controller) does not block the copy
+for b in farmy farmy-keys farmy-knowledge farmy-gate; do cp "target/release/$b" "bin/.$b.new" && mv -f "bin/.$b.new" "bin/$b"; done

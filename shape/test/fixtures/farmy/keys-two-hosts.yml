@@ -1,0 +1,15 @@
+secrets:
+  provider: [bin/provider]
+keys:
+  github:
+    secret: GITHUB_TOKEN
+    upstream: https://github.com
+    auth: basic
+    user: x-access-token
+    git: true
+  codeberg:
+    secret: CODEBERG_TOKEN
+    upstream: https://codeberg.org
+    auth: basic
+    user: x-access-token
+    git: true

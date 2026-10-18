@@ -1,0 +1,4 @@
+secrets:
+  unlock: [TS_AUTHKEY]
+egress:
+  authkey: TS_AUTHKEY

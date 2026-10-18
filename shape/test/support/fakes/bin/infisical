@@ -1,0 +1,57 @@
+#!/usr/bin/env ruby
+# A fake Infisical CLI for the tests: `secrets get <NAME> --plain …` answers from
+# FAKE_INFISICAL_SECRETS ("NAME=value;NAME2=value2"), exit 1 for a name not in there (as the real CLI
+# does). `login --method=universal-auth --plain …` prints the token of the identity whose client id
+# and secret (the --client-id/--client-secret flags, or INFISICAL_UNIVERSAL_AUTH_CLIENT_ID and
+# INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET in the environment) are in FAKE_INFISICAL_IDENTITIES
+# ("id:secret=token;…"), exit 1 for any other pair. Every call appends its arguments, the
+# INFISICAL_TOKEN it saw and, for a login, the identity it was given to FAKE_INFISICAL_LOG.
+Encoding.default_external = Encoding::UTF_8 # whatever locale the caller has; the state files hold UTF-8
+def option(args, flag)
+  i = args.index(flag)
+  i && args[i + 1]
+end
+
+log = ->(*lines) { File.open(ENV["FAKE_INFISICAL_LOG"], "a") { |f| f.puts(*lines) } if ENV["FAKE_INFISICAL_LOG"] }
+log.("args: #{ARGV.join(" ")}", "token: #{ENV["INFISICAL_TOKEN"]}")
+# With HTTPS_PROXY and a --domain, the CLI goes to its domain through the proxy by CONNECT, as the Go
+# CLI does, and fails as it would when the proxy does not answer 200; it logs "proxy: <host:port>".
+domain = option(ARGV, "--domain")
+proxy = ENV["HTTPS_PROXY"] || ENV["https_proxy"]
+if domain && proxy && !proxy.empty?
+  require "socket"
+  require "uri"
+  target = URI.parse(domain)
+  px = URI.parse(proxy)
+  begin
+    s = TCPSocket.new(px.host, px.port)
+    s.write "CONNECT #{target.host}:#{target.port} HTTP/1.1\r\nHost: #{target.host}:#{target.port}\r\n\r\n"
+    status = s.gets.to_s
+    abort "Error: proxyconnect tcp: #{status.strip}" unless status.split[1] == "200"
+    s.gets until s.gets.to_s == "\r\n" rescue nil
+    s.write "GET /api/status HTTP/1.1\r\nHost: #{target.host}\r\nConnection: close\r\n\r\n"
+    s.read
+    s.close
+  rescue SystemCallError, SocketError => e
+    abort "Error: proxyconnect tcp: #{e.message}"
+  end
+  File.open(ENV["FAKE_INFISICAL_LOG"], "a") { |f| f.puts "proxy: #{px.host}:#{px.port}" } if ENV["FAKE_INFISICAL_LOG"]
+end
+case ARGV
+in ["--version"] then puts "infisical version fake"
+in ["secrets", "get", name, *rest] if ENV["FAKE_INFISICAL_SECRETS_DIR"] && File.file?(File.join(ENV["FAKE_INFISICAL_SECRETS_DIR"], name))
+  print File.read(File.join(ENV["FAKE_INFISICAL_SECRETS_DIR"], name)) # a multi-line secret, as stored (FAKE_INFISICAL_SECRETS_DIR: a file per secret)
+in ["secrets", "get", name, *rest]
+  have = ENV.fetch("FAKE_INFISICAL_SECRETS", "").split(";").to_h { |pair| pair.split("=", 2) }
+  abort "Error: secret #{name} not found" unless have.key?(name)
+  rest.include?("--plain") ? puts(have[name]) : puts("┃ #{name} ┃ #{have[name]} ┃")
+in ["login", *rest] if rest.include?("--method=universal-auth")
+  id = option(rest, "--client-id") || ENV["INFISICAL_UNIVERSAL_AUTH_CLIENT_ID"]
+  secret = option(rest, "--client-secret") || ENV["INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET"]
+  log.("identity: #{id} #{secret}")
+  known = ENV.fetch("FAKE_INFISICAL_IDENTITIES", "").split(";").to_h { |pair| pair.split("=", 2) }
+  abort "Error: unable to authenticate with universal auth [err=invalid client secret]" unless known.key?("#{id}:#{secret}")
+  rest.include?("--plain") ? puts(known["#{id}:#{secret}"]) : puts("Logged in as machine identity #{id}")
+else
+  abort "fake infisical: cannot play: #{ARGV.join(" ")}"
+end

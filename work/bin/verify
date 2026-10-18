@@ -1,0 +1,4 @@
+#!/bin/sh
+# The suite, run from the work folder. Builds first when bin/build exists; see ../shape/test/run.rb.
+WORK="$(cd "$(dirname "$0")/.." && pwd)"
+SUT_ROOT="$WORK" exec ruby "$WORK/../shape/test/run.rb" "$@"

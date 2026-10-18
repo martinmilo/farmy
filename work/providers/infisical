@@ -1,0 +1,66 @@
+#!/bin/sh
+# A secrets provider on top of the Infisical CLI. In farmy.yml, one of:
+#
+#   secrets:
+#     provider: [providers/infisical, --projectId, <id>, --env, dev, --path, /farmy]
+#     unlock: [INFISICAL_TOKEN]                       # a machine identity's access token
+#
+#   secrets:
+#     provider: [providers/infisical, --client-id-from, INFISICAL_CLIENT_ID, --client-secret-from, INFISICAL_CLIENT_SECRET,
+#                --projectId, <id>, --env, dev]       # universal auth: the token is obtained first
+#     unlock: [INFISICAL_CLIENT_ID, INFISICAL_CLIENT_SECRET]
+#
+# The unlocking values reach this process in its environment and go to the CLI the same way
+# (INFISICAL_TOKEN; for universal auth INFISICAL_UNIVERSAL_AUTH_CLIENT_ID and
+# INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET, exchanged with `infisical login --method=universal-auth --plain`
+# for a token that lives in this process). Nothing is on a command line, nothing is written. `--domain
+# <url>` (a self-hosted Infisical) goes to the login and to every get. The control image has the CLI.
+set -eu
+request=$(cat)
+names=$(printf '%s' "$request" | tr -d '\n' | sed 's/.*"secrets"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/' | tr -d '" ' | tr ',' ' ')
+error() { printf '{"version":1,"error":"%s"}\n' "$1"; exit 0; }
+command -v infisical >/dev/null 2>&1 || error "the infisical CLI is not installed in the control image"
+
+# the provider's own options come out of the arguments; the rest go to every `infisical secrets get`
+id_from=""; secret_from=""; domain=""
+n=$#; i=0
+while [ "$i" -lt "$n" ]; do
+  a=$1; shift; i=$((i + 1))
+  case "$a" in
+    --client-id-from) id_from=${1:-}; shift; i=$((i + 1)) ;;
+    --client-secret-from) secret_from=${1:-}; shift; i=$((i + 1)) ;;
+    --domain) domain=${1:-}; set -- "$@" "$a" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+if [ -n "$id_from" ] || [ -n "$secret_from" ]; then
+  [ -n "$id_from" ] && [ -n "$secret_from" ] || error "--client-id-from and --client-secret-from go together"
+  for v in "$id_from" "$secret_from"; do
+    printf '%s' "$v" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || error "not an unlock name: $v"
+  done
+  eval "client_id=\${$id_from:-}"; eval "client_secret=\${$secret_from:-}"
+  [ -n "$client_id" ] && [ -n "$client_secret" ] || error "$id_from and $secret_from must be under secrets.unlock"
+  if [ -n "$domain" ]; then
+    token=$(INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="$client_id" INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET="$client_secret" \
+      infisical login --method=universal-auth --plain --domain "$domain") || token=""
+  else
+    token=$(INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="$client_id" INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET="$client_secret" \
+      infisical login --method=universal-auth --plain) || token=""
+  fi
+  [ -n "$token" ] || error "infisical login with universal auth failed (client id $id_from)"
+  INFISICAL_TOKEN=$token; export INFISICAL_TOKEN
+fi
+
+# a value as a JSON string's content: backslash, quote and every control character escaped, byte for byte
+json_escape() { awk 'BEGIN { RS = "\001"; ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\n/, "\\n"); gsub(/\r/, "\\r"); gsub(/\t/, "\\t"); print }'; }
+found=""; missing=""
+for name in $names; do
+  v=$(infisical secrets get "$name" --plain "$@" || true)   # the CLI's stderr is the provider's: farmy keys --why shows it
+  if [ -n "$v" ]; then
+    esc=$(printf '%s' "$v" | json_escape)
+    found="${found}${found:+,}\"$name\":\"$esc\""
+  else
+    missing="${missing}${missing:+,}\"$name\""
+  fi
+done
+printf '{"version":1,"secrets":{%s},"missing":[%s]}\n' "$found" "$missing"

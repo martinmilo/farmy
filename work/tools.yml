@@ -1,0 +1,238 @@
+# Official upstream releases; downloaded and SHA-256 verified on 2026-10-15.
+# min_libc is the highest GLIBC symbol version required by the verified ELF executable.
+---
+neovim:
+  version: 0.12.6
+  releases:
+    kind: github
+    repo: neovim/neovim
+    assets:
+      linux-amd64-glibc: nvim-linux-x86_64.tar.gz
+      linux-arm64-glibc: nvim-linux-arm64.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz
+      sha256: 474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87
+      format: tar.gz
+      min_libc: '2.34'
+    linux-arm64-glibc:
+      url: https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-arm64.tar.gz
+      sha256: 8f1f64a0bdb97247034038c3823c6cbad5bdf9ecd5751b85494b71c3ee04c815
+      format: tar.gz
+      min_libc: '2.34'
+  install:
+    apt: mkdir -p "$DESTDIR/usr/local"; tar -xzf "$ARCHIVE" --strip-components=1 -C
+      "$DESTDIR/usr/local"
+ripgrep:
+  version: 15.2.0
+  releases:
+    kind: github
+    repo: BurntSushi/ripgrep
+    assets:
+      linux-amd64-glibc: ripgrep-{version}-x86_64-unknown-linux-musl.tar.gz
+      linux-amd64-musl: ripgrep-{version}-x86_64-unknown-linux-musl.tar.gz
+      linux-arm64-glibc: ripgrep-{version}-aarch64-unknown-linux-gnu.tar.gz
+      linux-arm64-musl: ripgrep-{version}-aarch64-unknown-linux-musl.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz
+      sha256: 33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+      format: tar.gz
+    linux-amd64-musl:
+      url: https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-unknown-linux-musl.tar.gz
+      sha256: 33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+      format: tar.gz
+    linux-arm64-glibc:
+      url: https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-gnu.tar.gz
+      sha256: a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
+      format: tar.gz
+      min_libc: '2.18'
+    linux-arm64-musl:
+      url: https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-unknown-linux-musl.tar.gz
+      sha256: 800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+      format: tar.gz
+  install:
+    apt: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/rg
+      "$DESTDIR/usr/local/bin/rg"; rm -rf "$unpack"
+    apk: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/rg
+      "$DESTDIR/usr/local/bin/rg"; rm -rf "$unpack"
+fd:
+  version: 10.5.0
+  releases:
+    kind: github
+    repo: sharkdp/fd
+    assets:
+      linux-amd64-glibc: fd-v{version}-x86_64-unknown-linux-gnu.tar.gz
+      linux-amd64-musl: fd-v{version}-x86_64-unknown-linux-musl.tar.gz
+      linux-arm64-glibc: fd-v{version}-aarch64-unknown-linux-gnu.tar.gz
+      linux-arm64-musl: fd-v{version}-aarch64-unknown-linux-musl.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-gnu.tar.gz
+      sha256: a1259cd129636efbc3fef123525c1b49e88fe5088c012630983c310e52fdfa95
+      format: tar.gz
+      min_libc: '2.18'
+    linux-amd64-musl:
+      url: https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz
+      sha256: 761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+      format: tar.gz
+    linux-arm64-glibc:
+      url: https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-unknown-linux-gnu.tar.gz
+      sha256: c0ee43802e3313a317c5af2f4eabd6ba13eeedd595af9775f05e18a13ac4f52c
+      format: tar.gz
+      min_libc: '2.18'
+    linux-arm64-musl:
+      url: https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-aarch64-unknown-linux-musl.tar.gz
+      sha256: d76c4317f7d5dba69f8a2a15856c90c777e7f0dd4e85f0de8c76de6992c374d4
+      format: tar.gz
+  install:
+    apt: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/fd
+      "$DESTDIR/usr/local/bin/fd"; rm -rf "$unpack"
+    apk: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/fd
+      "$DESTDIR/usr/local/bin/fd"; rm -rf "$unpack"
+fzf:
+  version: 0.74.5
+  releases:
+    kind: github
+    repo: junegunn/fzf
+    assets:
+      linux-amd64-glibc: fzf-{version}-linux_amd64.tar.gz
+      linux-amd64-musl: fzf-{version}-linux_amd64.tar.gz
+      linux-arm64-glibc: fzf-{version}-linux_arm64.tar.gz
+      linux-arm64-musl: fzf-{version}-linux_arm64.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_amd64.tar.gz
+      sha256: d47d7f882972c7d674dbbba998ffa4116e68379616ffac7695d0671e9a722c5f
+      format: tar.gz
+    linux-amd64-musl:
+      url: https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_amd64.tar.gz
+      sha256: d47d7f882972c7d674dbbba998ffa4116e68379616ffac7695d0671e9a722c5f
+      format: tar.gz
+    linux-arm64-glibc:
+      url: https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_arm64.tar.gz
+      sha256: cf058001da21724a469b714a29cf4aab9cbe860d218a0d6c1b5b661efad7784c
+      format: tar.gz
+    linux-arm64-musl:
+      url: https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_arm64.tar.gz
+      sha256: cf058001da21724a469b714a29cf4aab9cbe860d218a0d6c1b5b661efad7784c
+      format: tar.gz
+  install:
+    apt: tar -xzf "$ARCHIVE" -C "$DESTDIR/usr/local/bin" fzf
+    apk: tar -xzf "$ARCHIVE" -C "$DESTDIR/usr/local/bin" fzf
+bat:
+  version: 0.26.1
+  releases:
+    kind: github
+    repo: sharkdp/bat
+    assets:
+      linux-amd64-glibc: bat-v{version}-x86_64-unknown-linux-gnu.tar.gz
+      linux-amd64-musl: bat-v{version}-x86_64-unknown-linux-musl.tar.gz
+      linux-arm64-glibc: bat-v{version}-aarch64-unknown-linux-gnu.tar.gz
+      linux-arm64-musl: bat-v{version}-aarch64-unknown-linux-musl.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-x86_64-unknown-linux-gnu.tar.gz
+      sha256: 726f04c8f576a7fd18b7634f1bbf2f915c43494c1c0f013baa3287edb0d5a2a3
+      format: tar.gz
+      min_libc: '2.18'
+    linux-amd64-musl:
+      url: https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-x86_64-unknown-linux-musl.tar.gz
+      sha256: 0dcd8ac79732c0d5b136f11f4ee00e581440e16a44eab5b3105b611bbf2cf191
+      format: tar.gz
+    linux-arm64-glibc:
+      url: https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-aarch64-unknown-linux-gnu.tar.gz
+      sha256: 422eb73e11c854fddd99f5ca8461c2f1d6e6dce0a2a8c3d5daade5ffcb6564aa
+      format: tar.gz
+      min_libc: '2.18'
+    linux-arm64-musl:
+      url: https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-aarch64-unknown-linux-musl.tar.gz
+      sha256: 6369242c584065f195fb20cb36fbd7cb63ae690605bbe89868a7596b596c2c23
+      format: tar.gz
+  install:
+    apt: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/bat
+      "$DESTDIR/usr/local/bin/bat"; rm -rf "$unpack"
+    apk: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/bat
+      "$DESTDIR/usr/local/bin/bat"; rm -rf "$unpack"
+lazygit:
+  version: 0.66.1
+  releases:
+    kind: github
+    repo: jesseduffield/lazygit
+    assets:
+      linux-amd64-glibc: lazygit_{version}_linux_x86_64.tar.gz
+      linux-amd64-musl: lazygit_{version}_linux_x86_64.tar.gz
+      linux-arm64-glibc: lazygit_{version}_linux_arm64.tar.gz
+      linux-arm64-musl: lazygit_{version}_linux_arm64.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/jesseduffield/lazygit/releases/download/v0.66.1/lazygit_0.66.1_linux_x86_64.tar.gz
+      sha256: 7b3f30c2c06a42cf575280f907e58d7ea08411408b6b62bc926bc91cbc6c3f46
+      format: tar.gz
+    linux-amd64-musl:
+      url: https://github.com/jesseduffield/lazygit/releases/download/v0.66.1/lazygit_0.66.1_linux_x86_64.tar.gz
+      sha256: 7b3f30c2c06a42cf575280f907e58d7ea08411408b6b62bc926bc91cbc6c3f46
+      format: tar.gz
+    linux-arm64-glibc:
+      url: https://github.com/jesseduffield/lazygit/releases/download/v0.66.1/lazygit_0.66.1_linux_arm64.tar.gz
+      sha256: add91327af13343f37d2d610512d0982ef5c75da5cc962b5159748adc8a11a86
+      format: tar.gz
+    linux-arm64-musl:
+      url: https://github.com/jesseduffield/lazygit/releases/download/v0.66.1/lazygit_0.66.1_linux_arm64.tar.gz
+      sha256: add91327af13343f37d2d610512d0982ef5c75da5cc962b5159748adc8a11a86
+      format: tar.gz
+  install:
+    apt: tar -xzf "$ARCHIVE" -C "$DESTDIR/usr/local/bin" lazygit
+    apk: tar -xzf "$ARCHIVE" -C "$DESTDIR/usr/local/bin" lazygit
+delta:
+  version: 0.20.1
+  releases:
+    kind: github
+    repo: dandavison/delta
+    assets:
+      linux-amd64-glibc: delta-{version}-x86_64-unknown-linux-gnu.tar.gz
+      linux-arm64-glibc: delta-{version}-aarch64-unknown-linux-gnu.tar.gz
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/dandavison/delta/releases/download/0.20.1/delta-0.20.1-x86_64-unknown-linux-gnu.tar.gz
+      sha256: 50f08c879f84c81ceb220e476491a7f492d2c9c671e79918cc44badf961a6240
+      format: tar.gz
+      min_libc: '2.34'
+    linux-arm64-glibc:
+      url: https://github.com/dandavison/delta/releases/download/0.20.1/delta-0.20.1-aarch64-unknown-linux-gnu.tar.gz
+      sha256: da7f4338f593572ff426ae153e0870e2fdc72729416eff551b40cdeb67940db8
+      format: tar.gz
+      min_libc: '2.18'
+  install:
+    apt: unpack=$(mktemp -d); tar -xzf "$ARCHIVE" -C "$unpack"; install -m 755 "$unpack"/*/delta
+      "$DESTDIR/usr/local/bin/delta"; rm -rf "$unpack"
+jq:
+  version: 1.8.2
+  releases:
+    kind: github
+    repo: jqlang/jq
+    assets:
+      linux-amd64-glibc: jq-linux-amd64
+      linux-amd64-musl: jq-linux-amd64
+      linux-arm64-glibc: jq-linux-arm64
+      linux-arm64-musl: jq-linux-arm64
+  artifacts:
+    linux-amd64-glibc:
+      url: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+      sha256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+      format: raw
+    linux-amd64-musl:
+      url: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
+      sha256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+      format: raw
+    linux-arm64-glibc:
+      url: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64
+      sha256: 8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+      format: raw
+    linux-arm64-musl:
+      url: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64
+      sha256: 8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+      format: raw
+  install:
+    apt: install -m 755 "$ARCHIVE" "$DESTDIR/usr/local/bin/jq"
+    apk: install -m 755 "$ARCHIVE" "$DESTDIR/usr/local/bin/jq"

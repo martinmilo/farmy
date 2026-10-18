@@ -1,0 +1,21 @@
+name: Explain proposal pull requests
+on:
+  pull_request_target:
+    types: [opened]
+permissions:
+  pull-requests: write
+jobs:
+  notice:
+    if: ${{ vars.FARMY_PR_NOTICE == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Explain the trusted mirror policy
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Thank you for the proposal. GitHub hosts a code mirror, and pull requests here are welcome as proposals. Maintainers apply accepted changes in the source repository; they appear in the next release, with the contributor credited in the release notes. This mirrored branch does not use the GitHub merge button. Issues are welcome here too.'
+            });

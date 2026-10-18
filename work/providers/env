@@ -1,0 +1,25 @@
+#!/bin/sh
+# A secrets provider for a machine without a secrets manager: the secrets are in this process's
+# environment (farmy passes the unlocking values there; export the rest before running farmy, or put
+# them in the Keychain under the names farmy.yml lists in secrets.unlock).
+#
+#   farmy.yml:   secrets: { provider: [providers/env], unlock: [GIT_TOKEN, ANTHROPIC_API_KEY] }
+#
+# Protocol (FORMATS.md): a JSON request on stdin naming the secrets; a JSON answer on stdout.
+set -eu
+request=$(cat)
+names=$(printf '%s' "$request" | tr -d '\n' | sed 's/.*"secrets"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/' | tr -d '" ' | tr ',' ' ')
+# a value as a JSON string's content: backslash, quote and every control character escaped, byte for byte
+json_escape() { awk 'BEGIN { RS = "\001"; ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\n/, "\\n"); gsub(/\r/, "\\r"); gsub(/\t/, "\\t"); print }'; }
+found=""; missing=""
+for n in $names; do
+  # the value as it is, a trailing newline included (printenv adds one more, taken off again)
+  v=$(printenv "$n" 2>/dev/null; printf x) || true; v=${v%x}; v=${v%?}
+  if [ -n "$v" ]; then
+    esc=$(printf '%s' "$v" | json_escape)
+    found="${found}${found:+,}\"$n\":\"$esc\""
+  else
+    missing="${missing}${missing:+,}\"$n\""
+  fi
+done
+printf '{"version":1,"secrets":{%s},"missing":[%s]}\n' "$found" "$missing"

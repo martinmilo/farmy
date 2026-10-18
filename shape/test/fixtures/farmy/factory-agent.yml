@@ -1,0 +1,10 @@
+secrets:
+  provider: [providers/env]
+  unlock: [FIXER_TOKEN]
+agents:
+  fixer:
+    install: ~
+    login: .fixer
+    headless_login: fixer login
+    headless: {command: "sh -c 'echo fixed > src/app.txt' --", prompt: argument}
+    token_env: FIXER_TOKEN

@@ -1,0 +1,17 @@
+secrets:
+  provider: [bin/provider]
+agents:
+  claude: {}
+  mytool:
+    install: npm install -g mytool@2.4.0
+    login: .mytool
+    headless_login: mytool login --device
+    token_env: MYTOOL_TOKEN
+    api: {key: MYTOOL_API_KEY, base_url: MYTOOL_BASE_URL, upstream: https://api.mytool.example}
+    process: mytool
+keys:
+  mytool:
+    secret: MYTOOL_API_KEY
+    upstream: https://api.mytool.example
+    auth: header
+    header: x-api-key
