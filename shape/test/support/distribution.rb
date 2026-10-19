@@ -3,9 +3,11 @@ require "rbconfig"
 module Distribution
   REGISTRY = "registry.example.com/acme"
   RELEASE_HASH = "1234567890abcdef1234567890abcdef12345678"
+  # The version this checkout ships (work/VERSION), set by the owner for each release.
+  SHIPPED = "0.1.1"
 
-  def published_release(version = "0.1.0", latest: true, format: 1, registry: REGISTRY)
-    artifact = version == "0.1.0" ? work_file("farmy") : "#!/bin/sh\ncase \"$1\" in --version) echo 'farmy #{version} (#{RELEASE_HASH})';; *) echo 'release #{version}';; esac\n"
+  def published_release(version = SHIPPED, latest: true, format: 1, registry: REGISTRY)
+    artifact = version == SHIPPED ? work_file("farmy") : "#!/bin/sh\ncase \"$1\" in --version) echo 'farmy #{version} (#{RELEASE_HASH})';; *) echo 'release #{version}';; esac\n"
     change_docker_state do |state|
       remote = state["registry"] ||= {}
       %w[control keys knowledge gate].each do |role|
@@ -50,6 +52,22 @@ module Distribution
     @install_dir = File.join(scratch, "installed-bin")
   end
 
+  # The installer as a GitHub release attaches it: work/bin/render-release renders the release's files.
+  def install_from_release(to: nil, with_folder_on_path: false)
+    standalone_host unless @host_path
+    dist = File.join(scratch, "release-dist")
+    unless File.exist?(File.join(dist, "install"))
+      out, status = Open3.capture2e(RbConfig.ruby, Target.path("bin/render-release"), dist, chdir: Target.root)
+      assert status.success?, "Expected work/bin/render-release <folder> to render the release's files (as the release workflow does); it failed:\n#{out}"
+    end
+    env = with_folder_on_path ? { "PATH" => "#{@install_dir}:#{@host_path}" } : {}
+    note_situation "The installer is the release's rendered install; #{with_folder_on_path ? "the install folder is on PATH" : "the install folder is not on PATH"}."
+    distribution_execute("/bin/sh", File.join(dist, "install"), "--dir", @install_dir, *(to ? ["--to", to] : []), env: env)
+    @installed_shim = File.join(@install_dir, "farmy")
+  end
+
+  def install_folder = @install_dir
+
   def install_distribution(version: nil, env: {})
     standalone_host unless @host_path
     installer = Target.path("bin/install")
@@ -60,7 +78,7 @@ module Distribution
 
   def installed_distribution
     published_release
-    install_distribution version: "0.1.0"
+    install_distribution version: SHIPPED
     assert_success
     assert_installed_only_shim
   end
@@ -111,7 +129,7 @@ module Distribution
     assert built.values.any? { |i| i["source"] == source }, "Expected Docker to consume FARMY_SOURCE #{source.inspect}.#{transcript}" if source
   end
 
-  def assert_image_release_labels(version = "0.1.0")
+  def assert_image_release_labels(version = SHIPPED)
     built = docker_state["images"].select { |_, data| data["context"] }
     refute_empty built, "Expected at least one farmy image build.#{transcript}"
     built.each do |name, data|
@@ -150,7 +168,7 @@ module Distribution
     end
   end
 
-  def release_distribution(version = "0.1.0", registry: REGISTRY)
+  def release_distribution(version = SHIPPED, registry: REGISTRY)
     distribution_execute(Target.path("bin/release"), version, env: { "FARMY_REGISTRY" => registry })
   end
 
@@ -178,7 +196,7 @@ module Distribution
   end
 
   def export_gate_image(role: "gate")
-    distribution_execute(Target.path("bin/release"), "0.1.0", "--image", role, "--output", File.join(scratch, "gate.oci.tar"), env: { "FARMY_REGISTRY" => "" })
+    distribution_execute(Target.path("bin/release"), SHIPPED, "--image", role, "--output", File.join(scratch, "gate.oci.tar"), env: { "FARMY_REGISTRY" => "" })
   end
 
   def assert_gate_export
@@ -190,11 +208,11 @@ module Distribution
   end
 
   def real_multi_platform_build
-    skip "needs real Docker and buildx" unless real_docker?
+    require_real_docker "a real Docker with buildx"
     out, status = Open3.capture2e("docker", "buildx", "inspect", "--bootstrap")
     skip "needs a buildx builder supporting amd64 and arm64" unless status.success? && out.include?("linux/amd64") && out.include?("linux/arm64")
     archive = File.join(scratch, "release.oci.tar")
-    out, status = Open3.capture2e(Target.path("bin/release"), "0.1.0", "--image", "gate", "--output", archive, chdir: dir)
+    out, status = Open3.capture2e(Target.path("bin/release"), SHIPPED, "--image", "gate", "--output", archive, chdir: dir)
     assert status.success?, "Expected the real farmy gate multi-platform OCI build to succeed: #{out}"
     assert File.size?(archive), "Expected an OCI archive containing both platforms."
     extracted = File.join(scratch, "oci")

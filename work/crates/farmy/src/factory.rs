@@ -20,8 +20,29 @@ use std::process::{Command, Stdio};
 include!("factory_gates.rs");
 include!("factory_pipelines.rs");
 include!("factory_notify.rs");
+include!("factory_logins.rs");
 
-const USAGE: &str = "usage: farmy factory start <name> --task <file or text> [--profile <name>] [--from <id|branch>] [--wait] | list [<name>] | show <id> | log <id> [<iteration>] | cancel <id> | approve <id> | answer <id> <text|file> [--wait] | prune [--older-than <n>d|h|m]";
+const USAGE: &str = "usage: farmy factory start <name> --task <file or text> [--profile <name>] [--from <id|branch>] [--wait] | list [<name>] | show <id> | log <id> [<iteration>] | cancel <id> | approve <id> | answer <id> <text|file> [--wait] | prune [--older-than <n>d|h|m] | login <name> <agent>";
+/// How long the per-run version container may take before farmy removes it.
+const VERSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a version command that failed gave no version: `exited <code>: <the last line on stderr>`
+/// (`exited 126: sh: 1: codex: Permission denied`); the line is left out when stderr was empty.
+fn failure_reason(failed: &docker::Failed) -> String {
+    let said = failed
+        .stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty());
+    let ended = match failed.code {
+        Some(code) => format!("exited {code}"),
+        None => "ended without an exit code".to_string(),
+    };
+    match said {
+        Some(line) => format!("{ended}: {line}"),
+        None => ended,
+    }
+}
 
 fn default_profile() -> String {
     "default".into()
@@ -103,9 +124,40 @@ pub(crate) struct State {
     pub head: Option<String>, // the exact commit gated, questioned, or approved
     #[serde(default)]
     pub profile_config: Option<FactoryProfile>,
+    pub agent_config: Option<serde_json::Value>, // the agent entry the run used, resolved, plus its name
+    pub agent_version: Option<String>,           // what its version line printed, trimmed
+    /// Why `agent_version` is "unknown" (its command gave no answer in time); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_reason: Option<String>,
     pub definition_config: Option<serde_yaml::Value>,
     #[serde(default)]
     pub context: String, // source gate evidence or the answered question, also used after detaching
+    /// Agent containers of this run's factory login that a dead controller left running, removed before a turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub orphans_stopped: Vec<Orphan>,
+    /// The orphaned agent container that could not be removed, so the run never started its agent
+    /// (result `login_blocked`); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_blocked: Option<LoginBlock>,
+}
+
+/// An orphaned agent container of the run's factory login that was still there after every removal
+/// try, with Docker's error from the last one.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct LoginBlock {
+    pub container: String,
+    pub run: String,
+    pub error: String,
+}
+
+/// An orphaned agent container a run removed before its login turn: its name, its run, and that run's
+/// egress gate removed with it (None when there was none).
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct Orphan {
+    pub container: String,
+    pub run: String,
+    #[serde(default)]
+    pub gate: Option<String>,
 }
 
 #[expect(
@@ -115,6 +167,7 @@ pub(crate) struct State {
 enum Model {
     Api(Route),
     Token(String),
+    Login(crate::agents::FactoryLogin), // the agent's factory login volume, mounted at its path
 }
 
 /// What a service's factory: says, checked.
@@ -165,6 +218,7 @@ pub(crate) fn main(args: &[String]) -> R {
         "answer" => answer(rest),
         "prune" => prune(rest),
         "run" => run_detached(rest),
+        "login" => login(rest),
         _ => usage(USAGE),
     }
 }
@@ -423,11 +477,19 @@ fn plan_with_definition(
             .cloned()
     });
     let model = match (f.mode.as_deref(), route, &agent.token_env) {
+        (Some("login"), _, _) => match &agent.factory_login {
+            Some(login) => Model::Login(login.clone()),
+            None => {
+                return refuse(format!(
+                    "{path}: factory.{profile}.mode is login, and agent '{agent_name}' has no factory_login — give it one in farmy.yml under agents.{agent_name}.factory_login: {{path, create}} (FORMATS.md, Factory logins)"
+                ));
+            }
+        },
         (None | Some("api-key"), Some(r), _) => Model::Api(r),
         (None | Some("subscription"), _, Some(t)) => Model::Token(t.clone()),
         (Some(other), _, _) if !["api-key", "subscription"].contains(&other) => {
             return refuse(format!(
-                "{path}: factory.{profile}.mode must be api-key or subscription, not '{other}'"
+                "{path}: factory.{profile}.mode must be api-key, subscription or login, not '{other}'"
             ));
         }
         (mode, _, _) => {
@@ -771,6 +833,11 @@ impl Run<'_> {
         }
     }
 
+    /// The agent container of iteration `i`.
+    fn agent_name(&self, i: u32) -> String {
+        format!("{}-run-{}-agent-{i}", self.p.name, self.id)
+    }
+
     fn filter_name(&self) -> String {
         format!("{}-run-{}-egress-gate", self.p.name, self.id)
     }
@@ -814,7 +881,7 @@ impl Run<'_> {
                 return refuse("the agent's egress gate could not start");
             }
         }
-        let client = format!("{}-run-{}-agent-{iteration}", self.p.name, self.id);
+        let client = self.agent_name(iteration);
         crate::filter::load(
             &self.filter_name(),
             &self.ctx.cfg,
@@ -825,15 +892,25 @@ impl Run<'_> {
         )
     }
 
-    /// The agent, headlessly: returns its exit code (124 when stopped at the limit) and its output.
-    fn agent(&self, i: u32, prompt: &str, model_env: &[(String, String)]) -> (i32, String) {
+    /// The agent, headlessly: its exit code (124 when stopped at the limit), what it printed on each
+    /// stream, and what it was run with, for the run record.
+    /// A variable whose value is a secret farmy resolved (`secrets`) goes on the command line as `-e NAME`
+    /// alone, its value only in the environment of that one `docker` process (FORMATS.md, "No secret on a
+    /// command line").
+    fn agent(
+        &self,
+        i: u32,
+        prompt: &str,
+        model_env: &[(String, String)],
+        secrets: &[(String, String)],
+    ) -> AgentRun {
         let p = self.p;
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
             "-i".into(),
             "--name".into(),
-            format!("{}-run-{}-agent-{i}", p.name, self.id),
+            self.agent_name(i),
         ];
         args.extend(self.labels("agent", Some(i)));
         args.extend(["-u".into(), "dev".into()]);
@@ -847,6 +924,19 @@ impl Run<'_> {
         for (m, at) in &p.def.mounts {
             args.extend(["-v".into(), format!("{}-{m}:{at}", p.name)]);
         }
+        // login mode: the agent's own factory login, writable (the CLI refreshes its tokens there)
+        if let Model::Login(login) = &p.model {
+            args.extend([
+                "--label".into(),
+                format!("farmy.factory-login={}", p.agent.name),
+                "-v".into(),
+                format!(
+                    "{}:{}",
+                    crate::agents::factory_login_volume(&p.agent.name),
+                    login.target()
+                ),
+            ]);
+        }
         let mut env: Vec<(String, String)> = model_env.to_vec();
         for (k, v) in &p.agent.env {
             env.push((k.clone(), v.clone()));
@@ -856,8 +946,14 @@ impl Run<'_> {
             "FARMY_LOGIN_DIR".into(),
             "/home/dev/.farmy-service/logins".into(),
         ));
-        for (k, v) in env {
-            args.extend(["-e".into(), format!("{k}={v}")]);
+        let mut hidden: Vec<(&str, &str)> = vec![];
+        for (k, v) in &env {
+            if is_secret(v, secrets) {
+                args.extend(["-e".into(), k.clone()]);
+                hidden.push((k, v));
+            } else {
+                args.extend(["-e".into(), format!("{k}={v}")]);
+            }
         }
         let by_stdin = p.headless.prompt == "stdin";
         let script = if by_stdin {
@@ -879,34 +975,84 @@ impl Run<'_> {
         if !by_stdin {
             args.extend(["farmy-agent".into(), prompt.to_string()]);
         }
+        let image_id = image_id(&self.image());
+        let started = now();
         let child = Command::new("docker")
             .args(&args)
+            .envs(hidden)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
-        let Ok(mut child) = child else {
-            return (125, "docker could not be run".into());
+        let (code, stdout, stderr) = match child {
+            Err(_) => (125, vec![], b"docker could not be run".to_vec()),
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take()
+                    && by_stdin
+                {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the agent's exit status and output say whether it got the prompt"
+                    )]
+                    let _ = stdin.write_all(prompt.as_bytes());
+                }
+                match child.wait_with_output() {
+                    Ok(o) => (o.status.code().unwrap_or(1), o.stdout, o.stderr),
+                    Err(e) => (1, vec![], e.to_string().into_bytes()),
+                }
+            }
         };
-        if let Some(mut stdin) = child.stdin.take()
-            && by_stdin
-        {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the agent's exit status and output say whether it got the prompt"
-            )]
-            let _ = stdin.write_all(prompt.as_bytes());
+        let mut command = vec!["docker".to_string()];
+        command.extend(args);
+        AgentRun {
+            code,
+            stdout,
+            stderr,
+            command,
+            env,
+            image: self.image(),
+            image_id,
+            started,
+            ended: now(),
         }
-        match child.wait_with_output() {
-            Ok(o) => (
-                o.status.code().unwrap_or(1),
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-            ),
-            Err(e) => (1, e.to_string()),
+    }
+
+    /// The CLI's version, asked once per run by the entry's `version` line in the service's image, with
+    /// no network and no volume: what it printed, trimmed; None when it printed nothing. One that fails
+    /// is "unknown", with its exit code and the last line it wrote to stderr as the reason (the second
+    /// value), so a CLI that is missing or that dev may not execute shows in the record. It gets
+    /// `VERSION_LIMIT`; past that its container is removed and the version is "unknown" too.
+    fn version(&self) -> (Option<String>, Option<String>) {
+        let Some(line) = self.p.agent.version.as_deref() else {
+            return (None, None);
+        };
+        let name = format!("{}-run-{}-version", self.p.name, self.id);
+        let mut args: Vec<String> =
+            vec!["run".into(), "--rm".into(), "--name".into(), name.clone()];
+        args.extend(self.labels("version", None));
+        args.extend([
+            "-u".into(),
+            "dev".into(),
+            "--network".into(),
+            "none".into(),
+            "--entrypoint".into(),
+            "sh".into(),
+            self.image(),
+            "-c".into(),
+            line.to_string(),
+        ]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match docker::out_within(&args, VERSION_LIMIT) {
+            Some(Ok(answer)) => (Some(answer).filter(|v| !v.is_empty()), None),
+            Some(Err(failed)) => (Some("unknown".into()), Some(failure_reason(&failed))),
+            None => {
+                // the killed client leaves its container running: remove it, so it is gone now
+                let _ = docker::quiet(&["rm", "-f", &name]);
+                (
+                    Some("unknown".into()),
+                    Some(format!("no answer within {} s", VERSION_LIMIT.as_secs())),
+                )
+            }
         }
     }
 
@@ -1082,6 +1228,113 @@ struct GateReport {
     failed_to_run: bool,
 }
 
+/// One agent container's run, as the run record keeps it.
+struct AgentRun {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    command: Vec<String>, // the docker run, starting "docker", "run"
+    env: Vec<(String, String)>,
+    image: String,
+    image_id: Option<String>,
+    started: String,
+    ended: String,
+}
+
+/// An image's id as `docker image inspect` gives it (`sha256:…`), when it can be inspected.
+fn image_id(image: &str) -> Option<String> {
+    docker::out(&["image", "inspect", "--format", "{{.Id}}", image])
+        .ok()
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            let json = docker::out(&["image", "inspect", image]).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+            let first = value.as_array().and_then(|a| a.first()).unwrap_or(&value);
+            first.get("Id")?.as_str().map(str::to_string)
+        })
+}
+
+/// Whether a value is one of the secrets farmy resolved (an empty value hides nothing).
+fn is_secret(value: &str, secrets: &[(String, String)]) -> bool {
+    !value.is_empty() && secrets.iter().any(|(_, v)| v == value)
+}
+
+/// Text with every secret's value replaced by its name in angle brackets.
+fn redact(text: &str, secrets: &[(String, String)]) -> String {
+    secrets
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .fold(text.to_string(), |t, (name, value)| {
+            t.replace(value.as_str(), &format!("<{name}>"))
+        })
+}
+
+/// Bytes with every secret's value replaced, otherwise unchanged (not decoded: an agent's output byte for byte).
+fn redact_bytes(bytes: &[u8], secrets: &[(String, String)]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for (name, value) in secrets.iter().filter(|(_, v)| !v.is_empty()) {
+        let needle = value.as_bytes();
+        let with = format!("<{name}>").into_bytes();
+        let mut next = Vec::with_capacity(out.len());
+        let mut at = 0;
+        while at < out.len() {
+            if out[at..].starts_with(needle) {
+                next.extend_from_slice(&with);
+                at += needle.len();
+            } else {
+                next.push(out[at]);
+                at += 1;
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+/// The iteration's run record beside its log (FORMATS.md, "The run record"): the prompt, each stream, and
+/// `iteration-<i>.agent.json` naming them. No secret's value reaches any of these files.
+fn write_record(dir: &Path, i: u32, prompt: &str, run: &AgentRun, secrets: &[(String, String)]) {
+    let prompt_file = format!("iteration-{i}.prompt.md");
+    let stdout_file = format!("iteration-{i}.agent.stdout");
+    let stderr_file = format!("iteration-{i}.agent.stderr");
+    let env: serde_json::Map<String, serde_json::Value> = run
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), redact(v, secrets).into()))
+        .collect();
+    let record = serde_json::json!({
+        "iteration": i,
+        "command": run.command.iter().map(|w| redact(w, secrets)).collect::<Vec<_>>(),
+        "env": env,
+        "image": run.image,
+        "image_id": run.image_id,
+        "exit": run.code,
+        "started": run.started,
+        "ended": run.ended,
+        "prompt": prompt_file,
+        "stdout": stdout_file,
+        "stderr": stderr_file,
+    });
+    let files: [(String, Vec<u8>); 4] = [
+        (prompt_file.clone(), redact(prompt, secrets).into_bytes()),
+        (stdout_file.clone(), redact_bytes(&run.stdout, secrets)),
+        (stderr_file.clone(), redact_bytes(&run.stderr, secrets)),
+        (
+            format!("iteration-{i}.agent.json"),
+            serde_json::to_string_pretty(&record)
+                .unwrap_or_default()
+                .into_bytes(),
+        ),
+    ];
+    for (name, bytes) in files {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the record is for later reading; the run itself does not depend on it"
+        )]
+        let _ = std::fs::write(dir.join(name), bytes);
+    }
+}
+
 fn prompt_for(task: &str, i: u32, max: u32, last: Option<(i32, &str)>) -> String {
     let template = std::fs::read_to_string("factory/prompt.md")
         .or_else(|_| std::fs::read_to_string(farmy_home().join("factory-prompt.md")))
@@ -1246,6 +1499,7 @@ fn launch(
             p.name, p.name
         ));
     }
+    check_login(p)?;
     let mut st = make_state(p, task, from, source, answering, context);
     let controller = crate::locking::Lock::take(&run_lock(&st))?;
     save(&st);
@@ -1287,6 +1541,7 @@ fn make_state(
         pid: std::process::id(),
         profile: p.profile.clone(),
         profile_config: Some(p.config.clone()),
+        agent_config: Some(p.agent.config()),
         definition_config: Some(p.definition_config.clone()),
         from,
         context,
@@ -1760,10 +2015,12 @@ fn control(
     let dir = run_dir(&p.name, &st.id);
     // the agent's way to its model: the run's own broker with the agent's route, or its token
     let mut model_env: Vec<(String, String)> = vec![];
+    let mut secret_values: Vec<(String, String)> = vec![]; // every secret resolved, kept out of the record
     match &p.model {
         Model::Api(route) => {
             let resolved = secrets::resolve(&ctx.cfg, &[route], unlock, &[]);
             run.start_broker(route, resolved.values.get(&route.secret));
+            secret_values.extend(resolved.values.iter().map(|(k, v)| (k.clone(), v.clone())));
             if let Some(api) = &p.agent.api {
                 model_env.push((
                     api.base_url.clone(),
@@ -1776,6 +2033,7 @@ fn control(
             let internal = run.network();
             run.make_network(&internal, true);
             let resolved = secrets::resolve(&ctx.cfg, &[], unlock, std::slice::from_ref(t));
+            secret_values.extend(resolved.values.iter().map(|(k, v)| (k.clone(), v.clone())));
             match resolved.values.get(t) {
                 Some(v) => model_env.push((t.clone(), v.clone())),
                 None => warn(format!(
@@ -1784,7 +2042,15 @@ fn control(
                 )),
             }
         }
+        // the agent's own login volume, mounted by `agent`: no token, no api variables, no broker
+        Model::Login(_) => {
+            let internal = run.network();
+            run.make_network(&internal, true);
+        }
     }
+
+    (st.agent_version, st.agent_version_reason) = run.version();
+    save(&st);
 
     let base = st.base.clone().unwrap_or_default();
     let mut last: Option<GateReport> = None;
@@ -1807,12 +2073,41 @@ fn control(
         if matches!(p.gate, Gate::RedFirst { .. }) {
             prompt.push_str("\nA test must fail if any check fails. Use set -e or equivalent shell error handling. Do not swallow assertions: an earlier failing command followed by a successful command must still make the test fail.\n");
         }
+        // login mode: the login's turn, held only while this agent container runs
+        let turn = match login_turn(p, &mut st) {
+            Ok(Turn::Granted(turn)) => turn,
+            Ok(Turn::Blocked(block)) => {
+                warn(format!(
+                    "[{}] factory: the orphaned agent container {} (run {}) could not be removed: {} — this run does not start its agent",
+                    p.name, block.container, block.run, block.error
+                ));
+                st.login_blocked = Some(block);
+                result = "login_blocked".into();
+                break;
+            }
+            Err(error) => {
+                warn(format!("[{}] factory login turn: {error}", p.name));
+                result = "agent_failed".into();
+                break;
+            }
+        };
         if let Err(error) = run.open_filter(i) {
             warn(format!("factory egress: {error}"));
             result = "agent_failed".into();
             break;
         }
-        let (agent_code, agent_out) = run.agent(i, &prompt, &model_env);
+        let agent_run = run.agent(i, &prompt, &model_env, &secret_values);
+        // the turn passes on only once the container holding it is gone
+        if turn.is_some() {
+            remove_leftover(&run.agent_name(i));
+        }
+        drop(turn);
+        let agent_code = agent_run.code;
+        let agent_out = redact_bytes(
+            &[agent_run.stdout.as_slice(), agent_run.stderr.as_slice()].concat(),
+            &secret_values,
+        );
+        write_record(&dir, i, &prompt, &agent_run, &secret_values);
         #[expect(
             clippy::let_underscore_must_use,
             reason = "an iteration's log for later reading; the run itself does not depend on it"
@@ -2139,6 +2434,23 @@ fn show(args: &[String]) -> R {
     }
     if let Some(question) = &st.question {
         println!("question   {question}");
+    }
+    for orphan in &st.orphans_stopped {
+        let gate = orphan
+            .gate
+            .as_ref()
+            .map(|gate| format!(" and its egress gate {gate}"))
+            .unwrap_or_default();
+        println!(
+            "stopped orphaned agent container {} (run {}){gate}",
+            orphan.container, orphan.run
+        );
+    }
+    if let Some(block) = &st.login_blocked {
+        println!(
+            "could not remove orphaned agent container {} (run {}): {}",
+            block.container, block.run, block.error
+        );
     }
     println!("task       {}", st.task.lines().next().unwrap_or(""));
     println!(
@@ -2503,6 +2815,26 @@ pub(crate) fn status_json(service: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_failed_version_command_is_given_by_its_exit_code_and_last_stderr_line() {
+        let failed = |code, stderr: &str| docker::Failed {
+            code,
+            stderr: stderr.to_string(),
+        };
+        assert_eq!(
+            failure_reason(&failed(Some(126), "sh: 1: codex: Permission denied")),
+            "exited 126: sh: 1: codex: Permission denied"
+        );
+        assert_eq!(
+            failure_reason(&failed(
+                Some(127),
+                "warning: a\n\nsh: 1: agent: not found\n"
+            )),
+            "exited 127: sh: 1: agent: not found"
+        );
+        assert_eq!(failure_reason(&failed(Some(3), "")), "exited 3");
+    }
+
     struct Repo(PathBuf);
     impl Repo {
         fn new() -> Self {
@@ -2696,6 +3028,28 @@ mod tests {
             approve().status.success(),
             "a workbench can approve the unchanged gated commit"
         );
+    }
+
+    #[test]
+    fn a_secret_s_value_becomes_its_name_and_other_bytes_stay_as_they_were() {
+        let secrets = vec![("TOKEN".to_string(), "s3cr3t".to_string())];
+        assert_eq!(
+            redact_bytes(b"a s3cr3t b\xff s3cr3ts3cr3t", &secrets),
+            b"a <TOKEN> b\xff <TOKEN><TOKEN>".to_vec()
+        );
+        assert_eq!(redact("T=s3cr3t", &secrets), "T=<TOKEN>");
+        assert_eq!(redact("nothing", &[("E".into(), String::new())]), "nothing");
+    }
+
+    #[test]
+    fn only_a_resolved_nonempty_value_counts_as_a_secret() {
+        let secrets = vec![
+            ("TOKEN".to_string(), "s3cr3t".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ];
+        assert!(is_secret("s3cr3t", &secrets));
+        assert!(!is_secret("s3cr3", &secrets));
+        assert!(!is_secret("", &secrets));
     }
 
     #[test]

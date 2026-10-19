@@ -452,6 +452,11 @@ agents:
     process: mytool               # optional: the process `docker top` shows while it runs. Default: the name
     headless: {command: mytool run --yes, prompt: argument}   # optional: an unattended one-shot run, for the factory: the command
                                   # without the prompt, and the prompt on stdin or as the last argument. null: none
+    version: mytool --version     # optional: a shell line that prints the CLI's version; a factory run asks it once and keeps
+                                  # what it printed (Factory, "The run record"). null: none. Every catalogue entry states it
+    factory_login: {path: .mytool, create: mytool login --device}   # optional: a subscription login of its own for factory runs
+                                  # (Factory, "Factory logins"): the folder under $HOME where the CLI keeps its login (relative,
+                                  # no ..), and the shell line that makes it without a browser. Absent: the agent has none
 ```
 
 An unknown field is refused by name, as is a `claude:` key at the top of `farmy.yml` (the message
@@ -462,7 +467,11 @@ service. The modes, per agent and per service:
   login serves every container; when `token_env` is set and the provider has a secret of that
   name, it is put into the app container's environment under that name. This is the one
   documented exception to the rule that no secret is in a container's configuration; the agent
-  can read it. The agent's `api` variables (`key`, `base_url`) reach the container from no route.
+  can read it. The value is in no file farmy writes (record 2026-10-19-1035): `.work/<name>/compose.yml`
+  names the variable only (`environment: [NAME]` or `NAME: ${NAME}`), and farmy gives the value in the
+  environment of the `docker compose` process at every compose up that makes or recreates the app container
+  (from the provider, or the held unlocking values), so it survives `farmy restart` without values given again
+  and a `farmy start` that reuses the existing compose file. The agent's `api` variables (`key`, `base_url`) reach the container from no route.
 - **`api-key`**: no token; the route whose `upstream` is the agent's `api.upstream` gives the
   container `<api.base_url>=http://keys:9181/<route>` and `<api.key>=via-farmy-keys`, which the
   broker swaps for the real key. An agent in this mode without such a route is refused at
@@ -473,9 +482,18 @@ service. The modes, per agent and per service:
 one line per agent that is on for the service (whatever its mode but `off`), the columns `name`,
 `install_apt`, `install_apk` (the one line in both when `install` is a string), `login` (paths
 joined by `:`, a folder with a trailing `/`, a file without), `state` (joined by `,`), `mcp_add`, `hooks_file`, `hooks_events` (`Event=state,…`),
-`process`, separated by tabs, an empty column for null; the build argument `AGENTS` lists the same
+`process`, `version` (the version line), separated by tabs, an empty column for null; the build argument `AGENTS` lists the same
 names, space-separated. The image keeps the file, the toolbox runs the install line of its base as
-root (an agent whose line for that base is empty is skipped, with a note in the build output). The app container gets `FARMY_AGENTS` (the same names) and
+root (an agent whose line for that base is empty is skipped, with a note in the build output). Once the agents
+are installed, farmy's toolbox runs each agent's `version` line as dev (record 2026-10-19-1430), each given 30 s
+(`timeout 30`, record 2026-10-19-1540); one that fails or does not answer in time fails the build, naming the
+agent and what the command said (or the 30 s limit), so an install dev cannot run (a CLI under
+`/root`) fails the build instead of the run. The catalogue installs every CLI outside any home directory
+(`/root`, `/home/…`), as root, owned by root and executable by all: no catalogue install line runs as dev or
+names a home directory, and none lives under a path a login volume is mounted on. No catalogue install line pipes a
+download into a shell (`curl … | sh`): it downloads to a file and runs that (`curl -fsSL -o <file> <url> && sh
+<file>`), so a failed download fails the install step with curl's own message (Debian's `sh`, dash, has no
+`pipefail`). The install lines `docs/factory.md` shows (pinning Claude Code or Codex) keep the same rules. The app container gets `FARMY_AGENTS` (the same names) and
 the entrypoint, for each: links every login path to `$FARMY_LOGIN_DIR/<name>/<basename>`
 (`FARMY_LOGIN_DIR` is `/home/dev/.farmy-shared`; `/home/dev/.farmy-service/logins` for a service with
 `shared_logins: false`, which does not mount `farmy-shared` at all: its logins are its own),
@@ -625,9 +643,9 @@ factory:
 ```
 
 Each profile accepts `base`, `agent`, `mode`, `writes`, `protects`, `hidden`, `test`, `check`, `gate`,
-`review`, `max_iterations`, `iteration_timeout`. `mode` is `api-key` or `subscription`: it selects the
+`review`, `max_iterations`, `iteration_timeout`. `mode` is `api-key`, `subscription` or `login`: it selects the
 existing catalogue agent's authentication (the subscription token/login or API route), never a different
-agent's credentials. Omitted mode retains the existing API-route-else-token selection. The catalogue
+agent's credentials. `login` uses the agent's factory login ("Factory logins"). Omitted mode retains the existing API-route-else-token selection; it never picks `login`. The catalogue
 supplies the login details; runs keep their existing credential isolation. Every profile's agent is
 installed in the service image, while authentication is validated for the selected run.
 
@@ -681,10 +699,48 @@ whole output in `.work/<name>/runs/<id>/git.log` (that folder holds no state: it
 |---|---|
 | run volume | `<name>-run-<id>` (kept after the run) |
 | run networks, and the run's broker (alias `keys`) | `<name>-run-<id>` (internal in every mode), `<name>-run-<id>-keys`; filtering proxy topology is described in "Enforced egress". Only what a run made is removed at its end, without a word about anything absent |
-| containers (`docker run --rm`, entrypoint `sh` or the command's own) | `<name>-run-<id>-git-<n>`, `<name>-run-<id>-agent-<i>`, `<name>-run-<id>-test-<i>` |
-| labels on each | `farmy.run=<id>`, `farmy.service=<name>`, `farmy.role=git\|agent\|test`, `farmy.iteration=<i>` |
+| containers (`docker run --rm`, entrypoint `sh` or the command's own) | `<name>-run-<id>-git-<n>`, `<name>-run-<id>-agent-<i>`, `<name>-run-<id>-test-<i>`, `<name>-run-<id>-version` |
+| labels on each | `farmy.run=<id>`, `farmy.service=<name>`, `farmy.role=git\|agent\|test\|version`, `farmy.iteration=<i>`; a login-mode agent also `farmy.factory-login=<agent>` |
 | branch | `farmy/<name>/<id>` |
-| folder | `.work/<name>/runs/<id>/`: `state.json`, `iteration-<i>.agent.log`, `iteration-<i>.test.log` |
+| folder | `.work/<name>/runs/<id>/`: `state.json`, `iteration-<i>.agent.log`, `iteration-<i>.test.log`, and the run record: `iteration-<i>.agent.json`, `iteration-<i>.prompt.md`, `iteration-<i>.agent.stdout`, `iteration-<i>.agent.stderr` |
+
+**The run record.** Per iteration, beside `iteration-<i>.agent.log` (stdout and stderr joined, for
+`factory log`):
+
+- `iteration-<i>.agent.json`, a JSON object: `iteration` (number); `command`, the `docker run` farmy ran for
+  the agent as a list of words starting `"docker", "run"`; `env`, the agent container's environment as given
+  (name → value); `image`, `farmy/<name>:dev`; `image_id`, that image's id when the agent ran, as `docker image
+  inspect` gives it (`sha256:…`); `exit`, the agent's exit code (124 when stopped at `iteration_timeout`);
+  `started` and `ended`, RFC 3339 in UTC (`2026-10-18T20:16:05Z`); `prompt`, `stdout`, `stderr`, the names of the
+  three files below. `command` is word for word what farmy gave Docker, which holds no secret's value (see
+  "No secret on a command line" below); in `env` the value of every secret farmy resolved is replaced by its
+  name in angle brackets (`"CLAUDE_CODE_OAUTH_TOKEN": "<CLAUDE_CODE_OAUTH_TOKEN>"`); no secret's value is in
+  any file of the run.
+- `iteration-<i>.prompt.md`: the prompt the agent was given, byte for byte.
+- `iteration-<i>.agent.stdout` and `iteration-<i>.agent.stderr`: what the agent printed on each, byte for
+  byte. farmy does not parse them; stdout is where an agent's usage report lands (Claude's `--output-format
+  json` result, Codex's JSON events).
+
+Per run, in `state.json`, next to `profile_config`: `agent_config`, the agent entry the run used, resolved
+(the catalogue's entry with the `farmy.yml` overrides applied, or the entry of your own), as a map of its
+fields plus `name`; and `agent_version`, what the entry's `version` command printed with surrounding
+whitespace removed, or null when the entry has no `version` or the command printed nothing. The version is asked
+once per run, before the first iteration: `docker run --rm --name <name>-run-<id>-version`, the run's labels
+with `farmy.role=version`, `-u dev`, `--network none`, no volume, the image `farmy/<name>:dev`, the line run as
+`sh -c <version>`. A version command that exits 0 and prints nothing leaves `agent_version` null. One that
+fails (record 2026-10-19-1430) keeps `agent_version: "unknown"` and `agent_version_reason`: its exit code and
+the last line it wrote to stderr (`exited 126: sh: 1: codex: Permission denied`), so a CLI that is missing or
+that dev may not execute shows in the record. Either way the run goes on. The version container gets 30 s (record 2026-10-19-0940): when it has not ended by then farmy stops
+it (it is gone afterwards), keeps `agent_version: "unknown"` and `agent_version_reason`, a sentence saying the
+command gave no answer within 30 s (`no answer within 30 s`), and the run goes on to its first iteration.
+`agent_version_reason` is absent when the version was given or there is none.
+
+**No secret on a command line** (record 2026-10-19-0840). While a run goes, no secret value farmy resolved
+(a `token_env` value, a route's key, the mesh auth key) is in the argv of any process farmy starts: every
+`docker` call (`run`, `create`, `exec`, `compose`) and the commands its containers run. A container that
+needs a value gets it as `-e NAME` without a value (Docker takes it from the environment farmy gives the
+`docker` process) or from `--env-file <file>`: a file farmy writes with mode 0600 and deletes as soon as the
+container has started, before the container's command ends.
 
 Factory-scoped container observations require a nonempty `farmy.run` label. A shared
 Git helper for service clone, build-file fetch or dotfiles may also have `farmy.role=git`
@@ -709,7 +765,8 @@ without belonging to a factory run.
   service's network), with its broker in api-key mode and HTTP proxy variables pointing at a
   filtering gate limited to this agent's `api_hosts` ("Enforced egress");
   the environment: in api-key mode `<api.base_url>=http://keys:9181/<route>`
-  and `<api.key>=via-farmy-keys`, in token mode `<token_env>=<the secret>`, the agent's `env:`,
+  and `<api.key>=via-farmy-keys`, in token mode `<token_env>=<the secret>`, in login mode none of these and the
+  agent's factory login volume at `/home/dev/<path>` ("Factory logins"), the agent's `env:`,
   `FARMY_LOGIN_DIR=/home/dev/.farmy-service/logins`; nothing else of farmy's (no `SSH_AUTH_SOCK`, no
   `DEV_GIT_ROUTES`, no `FARMY_MCP_URL`, no `farmy-shared`, no `<name>-keys-agent`). The command is
   `timeout <iteration_timeout in seconds> <headless.command>`, the prompt on stdin (`headless.prompt: stdin`)
@@ -764,10 +821,10 @@ source gate evidence or answered question, are supplied even when a custom promp
 
 **States.** `state.json`: `{"id", "service", "task", "base", "branch", "phase", "iteration",
 "max_iterations", "result", "started", "ended", "profile", "from", "question", "commits": [{"iteration", "sha"}], "verdicts":
-[{"iteration", "exit"}], "pid"}`; times RFC 3339 UTC; `phase` `cloning` | `agent` | `commit` | `gate` |
+[{"iteration", "exit"}], "pid"}`; times RFC 3339 UTC; `phase` `cloning` | `login_wait` | `agent` | `commit` | `gate` |
 `pushing` | `done`; `result` null until the end, then `green` | `max_iterations` | `timeout` |
 `agent_failed` | `test_failed_to_run` | `cancelled` | `interrupted` | `awaiting_review` | `question` |
-`stalled`. `profile` is the selected name (`default` for old runs/definitions); `from` is the source run ID
+`stalled` | `login_blocked`. `profile` is the selected name (`default` for old runs/definitions); `from` is the source run ID
 or branch, or null; `question` is the captured text or null. Awaiting review and question both have phase
 `done`; they do not become interrupted when the controller exits.
 A command that reads runs marks a run whose phase is not `done` and whose controller (`pid`, a process
@@ -792,7 +849,55 @@ farmy factory answer <id> <text|file> [--wait]   continue a question on a new ru
 farmy factory prune [--older-than <n>d|h|m]   remove the run volumes of finished runs (all, or those ended longer
                                 ago); prints each; the runs' folders stay. awaiting_review and question volumes stay
 farmy factory run <id>          the controller itself (started detached, in a session of its own, by start)
+farmy factory login <name> <agent>   make <agent>'s factory login with <name>'s image ("Factory logins")
 ```
+
+**Factory logins.** An agent entry's `factory_login: {path, create}` lets its factory runs use a subscription
+login of their own, never the interactive login in `farmy-shared`. `farmy factory login <name> <agent>`:
+
+- refuses an agent without `factory_login` (naming `factory_login`), a `path` that is absolute or holds `..`
+  (naming `factory_login`), a service whose image `farmy/<name>:dev` is not built (naming `farmy start <name>`),
+  and an agent that service's image does not carry (naming the agent); it starts no container then;
+- creates the volume `farmy-factory-login-<agent>` when missing (one per agent, on this Docker, whatever the
+  service) and makes it the dev user's with a root container whose only command is `chown 1001:1001
+  /home/dev/<path>`;
+- runs `create` like the factory's git containers: `docker create --rm -i` (and `-t` on a terminal),
+  name `<name>-factory-login-<agent>`, labels `farmy.role=login`, `farmy.service=<name>`, `farmy.agent=<agent>`,
+  `-u dev`, the service's network `<name>_default` with the git containers' proxy variables, the volume at
+  `/home/dev/<path>`, `--entrypoint sh farmy/<name>:dev -c <create>`; joined to `farmy` with `docker network
+  connect`; run with `docker start -a -i`, its output passed through;
+- on success exits 0; when `create` fails, says so naming the line and `exit <code>`, exits 1, and removes the
+  volume if this call created it (so an existing volume means a login was made).
+
+A second `farmy factory login` logs in again into the same volume. `farmy destroy` never removes a
+`farmy-factory-login-*` volume.
+
+In `mode: login` the agent container ("Agent containers" below) also mounts `farmy-factory-login-<agent>` at
+`/home/dev/<path>`, writable, and gets neither `token_env` nor the `api` variables nor a broker. `factory
+start` refuses login mode for an agent without `factory_login` (naming the agent and `factory_login`) and when
+`farmy-factory-login-<agent>` does not exist (naming `farmy factory login <name> <agent>`), before any run
+container starts.
+
+One agent iteration at a time per factory login: before starting an agent container in login mode, a run
+waits until no other agent container of the same factory login runs (from this containers folder); meanwhile
+its phase is `login_wait` (`factory list`, `show`, `status --json`). Only the agent's turn waits: other
+runs' clones, commits and gates go on, and the wait does not count against `iteration_timeout`. With
+`concurrency` above 1, runs are admitted and share slots as before; agent iterations on one login run one
+after another.
+
+A login turn ends only when the agent container holding it is gone (record 2026-10-19-0907): if the
+controller's `docker run` returns or fails while that container still exists, it removes the container
+before the turn passes on. Login-mode agent containers carry the label `farmy.factory-login=<agent>`. Before
+granting a turn the controller stops orphans: running containers labelled `farmy.role=agent` and
+`farmy.factory-login=<agent>` whose run is one of this containers folder's (`.work/<service>/runs/<id>/`
+exists) and whose controller is gone (its `controller.lock` not held). It removes each with `docker rm -f
+<container>` before its own agent starts, together with that run's egress gate `<service>-run-<id>-egress-gate`
+when it is there (record 2026-10-19-1210), keeps `orphans_stopped` in its own `state.json` (a list of
+`{"container": <name>, "run": <id>, "gate": <the gate's name, or null>}`, empty or absent when none), and
+`factory show` prints `stopped orphaned agent container <name> (run <id>)` naming the gate on that line. Containers of another factory login, of a live run, or
+of another containers folder are left alone. A removal that fails is tried again, at least 3 tries over about 10 s (record 2026-10-19-1145); when
+the orphan is still there the run does not start its agent and ends with the result `login_blocked`, and
+`factory show` names the container and Docker's error.
 
 `farmy status --json`: every service has `runs`, a list (oldest first) of `{"id", "phase", "iteration",
 "max_iterations", "result", "branch", "started", "ended", "profile", "from", "question"}`.
@@ -1045,15 +1150,31 @@ The fake understands the Docker CLI as it is commonly used, and the tests observ
   at that limit with exit 124; Docker's own exit code is the command's. A `docker run` labelled `agent` plays
   what the test said (`agent_plays`, one per agent run of the service, in order): it writes the files given
   under `/workspace` (none under a `--tmpfs` target, none into a read-only mount), prints the words, idles,
-  and exits with the code given (124 when the idle time passes a `timeout <s>` in its command). `fail_role`
+  and exits with the code given (124 when the idle time passes a `timeout <s>` in its command); `says` goes to
+  stdout, `stderr` to stderr. A `docker run` labelled `version` prints what the test said the service's CLI
+  version is (`agent_version_prints`; `1.0.0` when it said nothing) and exits 0, or, when the test said the
+  version command fails (`agent_version_fails`), prints `sh: 1: <first word>: not found` on stderr and exits 127, or, when dev may not execute it
+  (`agent_version_denied`), prints `sh: 1: <first word>: Permission denied` and exits 126.
+  When it never answers (`agent_version_hangs`), it is listed as running and prints nothing until its own
+  `timeout N` ends it (exit 124), until it is stopped or removed (exit 137), or for 120 s (exit 0).
+  A `docker run` labelled `login` writes `auth.json` into a mounted `farmy-factory-login-*` volume, prints
+  `Successfully logged in` and exits 0, or, when the test said the login fails (`login_fails`), prints
+  `Error: the device code expired before it was confirmed` on stderr and exits 1. `fail_role`
   makes Docker refuse a role's containers with exit 125. Volumes have an owner (see the factory-ownership record):
   root for one made by `docker volume create` or a `docker run`, the dev user (1001) for an app container's checkout,
   the uid of a root `chown <uid> <target>`; a `git` container whose user is not a mounted volume's owner fails as git
   does (`detected dubious ownership …` with a repository there, `could not create work tree dir … Permission denied`
   without), exit 128. Compose warns about an existing volume without its project's label that is not `external`. Any other role (`measure`) runs for real like git and
-  test. `docker network connect` and `disconnect` change a container's networks, and every join is kept with
+  test. A factory agent container is listed as running (`docker ps`) while it plays; when its client is killed
+  it stays running, as with Docker; `docker stop`, `kill` or `rm -f` ends its play (exit 137); when it ends,
+  `--rm` removes it. A test can make `docker rm` of a container fail a number of times, or always
+  (`rm_fails`), with `Error response from daemon: cannot remove container "/<name>": could not kill:
+  permission denied`. `docker network connect` and `disconnect` change a container's networks, and every join is kept with
   its `--alias` names (`network_joins`); every network made is kept with whether it is `--internal`. Every `docker run` is kept with its name, labels,
-  mounts (`ro`), tmpfs, environment, user, networks, process and what it got on stdin (`-i`). An app
+  mounts (`ro`), tmpfs, environment, user, networks, process and what it got on stdin (`-i`). The environment
+  is made as Docker makes it when the container is made (`docker run`, or `docker create` for a later `start`):
+  each `--env-file` (`NAME=value` lines; a bare `NAME`, like `-e NAME` without a value, takes the `docker`
+  process's own value), then `-e`; every env file read is kept with its path and mode (`env_files`). An app
   container whose `REPO` is a `file://` URL gets a real clone in its checkout volume's folder when it is made.
 - `docker context inspect` names `FAKE_DOCKER_CONTEXT_HOST` as the current endpoint (default
   `unix:///var/run/docker.sock`); `--format '{{.Endpoints.docker.Host}}'` prints it alone.
@@ -1094,7 +1215,7 @@ configuration, which the tests point at a file of their own with `GIT_CONFIG_GLO
 ## Enforced egress
 
 This contract supersedes advisory proxy and factory `-out` rules **for restricted containers**.
-Factory agents are always restricted, in either login mode. Apps are restricted when workspace
+Factory agents are always restricted, in every mode. Apps are restricted when workspace
 `egress.restrict` OR definition `restrict` is true; false in a definition cannot undo global true.
 Unrestricted apps, control, credential brokers and the mesh node retain their earlier behavior.
 The factory test gate remains isolated from all proxies, with only its allowed sidecars.
@@ -1250,8 +1371,11 @@ archive. It skips only when real Docker or a builder supporting both targets is 
 The control image contains the standalone executable POSIX shim at
 `/usr/local/lib/farmy/farmy`, retrievable with Docker create/cp/remove without executing
 a platform-specific binary. `bin/install [--to VERSION] [--dir DIR]` defaults to
-`$HOME/.local/bin`; it requires Docker and installs only `DIR/farmy`. No version means
-pull control `:latest` and read its `farmy.version`, then use the exact tag. Installation
+`$HOME/.local/bin`; it requires Docker and installs only `DIR/farmy`. No version means, for the
+checkout's `bin/install`, pull control `:latest` and read its `farmy.version`, then use the exact tag; the installer a
+release attaches (rendered by `bin/render-release`) carries its own version and installs that release, even when a
+newer one is `latest`. `--to` wins in both. It ends with `installed farmy <version> at <DIR>/farmy` on stdout and, when
+`DIR` is not on `PATH`, a line holding `export PATH="<DIR>:$PATH"` with `DIR` written out; nothing about `PATH` when it is. Installation
 retains FARMY_REGISTRY and optional FARMY_SOURCE defaults in the shim; environment overrides
 win. It must not replace an existing shim until pull/extraction succeed. POSIX utilities
 are available, but host Git, curl, jq, Python, Ruby, Rust and a checkout are not required.
@@ -1691,7 +1815,9 @@ Preserve executable modes and safe internal symlinks; refuse dangling/escaping s
 link whose resolved target is excluded. A public checkout must build from its documented context.
 
 The exported README and CONTRIBUTING render configured issues_url, contributions_url and
-contribution_text. Public `work/releases/<version>.md` holds maintained release notes and
+contribution_text. In the exported README, versioned installer and checksum links of the configured repository
+(`<github_url>/releases/download/v<x.y.z>/{install,SHA256SUMS}`) name the published version; links to the
+latest release (`<github_url>/releases/latest/download/…`) stay exactly as written (record 2026-10-19-1006). Public `work/releases/<version>.md` holds maintained release notes and
 explicit contributor credit. Export those notes; publication does not copy private commit
 messages to infer credits, and the release workflow uses the public notes file.
 

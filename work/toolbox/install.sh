@@ -3,7 +3,9 @@
 # the basics, the dev user (uid 1001, so the shared volumes have one owner), the agents.
 # apt (Debian, Ubuntu) is the supported path; apk (Alpine) is best effort. The agents come from
 # /etc/farmy/agents.tsv (name, install on apt, install on apk, login, state, mcp_add, hooks file,
-# hooks events, process; tab-separated): each agent named in $1 is installed with its line for this base.
+# hooks events, process, version; tab-separated): each agent named in $1 is installed with its line for this
+# base, as root, and one that fails stops the build here, naming the agent; the Dockerfile then runs each
+# version line as dev (agents-as-dev.sh).
 set -eu
 AGENTS=${1:-}
 if command -v apt-get >/dev/null 2>&1; then
@@ -48,12 +50,19 @@ d=/home/dev/.farmy-service/${1:-}
 printf '%s\t%s\n' "${2:-idle}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/agent.status.tmp" && mv -f "$d/agent.status.tmp" "$d/agent.status"
 EOS
 chmod 755 /usr/local/bin/farmy-agent-status
-# the agents: the install line of this base, run as root (a per-user installer says `su dev -c …` itself)
+# the agents: the install line of this base, run as root; a catalogue line installs its CLI outside any home
+# directory, owned by root and executable by all (FORMATS.md → Agents)
 for agent in $AGENTS; do
   line=$(grep "^$agent	" /etc/farmy/agents.tsv 2>/dev/null | head -1 || true)
   if [ -z "$line" ]; then echo "farmy toolbox: no line for '$agent' in agents.tsv — skipped" >&2; continue; fi
   if [ "$BASE" = apt ]; then cmd=$(printf '%s\n' "$line" | cut -f2); else cmd=$(printf '%s\n' "$line" | cut -f3); fi
   if [ -z "$cmd" ]; then echo "farmy toolbox: $agent has no install line for an $BASE base — not installed (FORMATS.md → Agents)" >&2; continue; fi
   echo "farmy toolbox: installing $agent: $cmd"
-  sh -c "$cmd"
+  # a failing install line stops the build here, before the as-dev check, naming the agent (its own error,
+  # curl's for a failed download, is just above: catalogue lines download to a file before they run it)
+  sh -c "$cmd" || {
+    code=$?
+    echo "farmy toolbox: installing $agent failed: its install line exited $code" >&2
+    exit "$code"
+  }
 done

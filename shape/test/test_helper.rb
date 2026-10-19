@@ -13,10 +13,11 @@ Dir[File.join(TEST_ROOT, "support", "*.rb")].sort.each { |file| require file }
 
 class AcceptanceTest < Minitest::Test
   # Pipeline contracts supersede the older factory pause/review helpers.
-  include FactoryPipelines, Fixtures, ExactText, Workspace, Commands, Farmy, Broker, Knowledge, Unlock, Agents, Egress, EgressControl, Private, Stranger, Factory, FactoryProfiles, Distribution, AuditEgress, Notifications, EgressModes, ToolboxAndDotfiles, MiniRegressions, MiniPipelines, Publishing, PublishingWorkflows, GitContainers, ReleaseIdentity, HolderSocket, EntrypointExec, DotfilesMounts, FarmyEntrypoint
+  include FactoryPipelines, Fixtures, ExactText, Workspace, Commands, Farmy, Broker, Knowledge, Unlock, Agents, Egress, EgressControl, Private, Stranger, Factory, FactoryProfiles, Distribution, AuditEgress, Notifications, EgressModes, ToolboxAndDotfiles, MiniRegressions, MiniPipelines, Publishing, PublishingWorkflows, GitContainers, ReleaseIdentity, HolderSocket, EntrypointExec, DotfilesMounts, FarmyEntrypoint, FactoryLogins, CommandLines, FactoryLoginOrphans, Kit
 
   def before_setup
     Processes.become_subreaper
+    Processes.mark
     super
   end
 

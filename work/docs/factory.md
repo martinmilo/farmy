@@ -56,8 +56,9 @@ each gate; `hidden` also covers its folders in the agent's container. Every prof
 in the service image; run `farmy restart <name>` after adding an agent.
 
 `mode: api-key` uses the selected agent's API route through a broker of the run's own.
-`mode: subscription` uses that agent's `token_env` from the provider, even when an API route exists. Omitted mode
-prefers the API route, then the agent's token. A profile never borrows another agent's credentials.
+`mode: subscription` uses that agent's `token_env` from the provider, even when an API route exists.
+`mode: login` uses the agent's factory login (below). Omitted mode prefers the API route, then the
+agent's token; it never picks `login`. A profile never borrows another agent's credentials.
 The selected profile's authentication is checked when the factory run starts.
 
 The gate choices are:
@@ -83,6 +84,135 @@ prompt goes on stdin or as an argument (Claude Code `claude -p --dangerously-ski
 --allow-all-tools --no-ask-user -p`; Gemini CLI documents none). The flags that let them act without
 asking are the vendors' own for runs inside a container, which is where the agent runs. An agent of your
 own gives `headless` in `farmy.yml`.
+
+## Factory logins
+
+A factory login is a subscription login of the agent's own, made for its unattended factory runs. It is
+never the interactive login in `farmy-shared` that you use in the app container: a run cannot touch that
+one, and logging out there does not stop the factory. It lives on the volume `farmy-factory-login-<agent>`,
+one per agent on this Docker, whatever the service.
+
+An agent declares one with `factory_login: {path, create}`: the folder under `$HOME` where its CLI keeps
+the login, and the line that makes it without a browser. In the catalogue only Codex has one
+(`{path: .codex, create: codex login --device-auth}`; enable device-code login in ChatGPT's security
+settings first). An agent of your own can give it in `farmy.yml`.
+
+```sh
+farmy start shop                    # the service's image must be built and carry the agent
+farmy factory login shop codex      # prints a code and a link; confirm it in a browser anywhere
+```
+
+The command runs `create` in the service's image as the dev user, with the volume at `/home/dev/<path>`
+and the same way out as the factory's git containers. A failed login on a new volume removes the volume
+again, so an existing volume means a login was made. Running it again logs in again into the same
+volume. Then select it in a profile:
+
+```yaml
+factory:
+  work:
+    agent: codex
+    mode: login
+    # …
+```
+
+In `mode: login` the agent's container mounts the volume, writable (the CLI refreshes its tokens there),
+and gets no token, no API variables and no broker. `farmy factory start` refuses login mode for an agent
+without `factory_login`, and before the login has been made.
+
+One agent iteration at a time per factory login: two runs whose agent uses the same login take turns for
+the agent's step, and the waiting run shows the phase `login_wait`. Only that step waits; other runs'
+clones, commits and gates go on, and the wait does not count against `iteration_timeout`. With
+`concurrency` above 1 runs are still admitted and share their slots as before, but their agent iterations
+on one login run one after another, so a second run on the same login mostly waits. The turn is a lock
+held by the run's controller while its agent container runs; a controller that dies lets go of it.
+
+A turn passes on only once the agent container holding it is gone: if `docker run` returns while the
+container still exists, the controller removes it first. Login-mode agent containers carry the label
+`farmy.factory-login=<agent>`. A controller that was killed mid-turn leaves its agent container running,
+so before taking its turn the next run on that login removes such orphans (`docker rm -f`): running agent
+containers of the same login whose run belongs to this containers folder and whose controller is gone.
+Each goes together with its run's egress gate (`<service>-run-<id>-egress-gate`) when that is still there.
+`farmy factory show` lists each as `stopped orphaned agent container <name> (run <id>)`, followed by
+`and its egress gate <gate>` when the gate was removed with it; in `state.json` each entry of
+`orphans_stopped` is `{"container", "run", "gate"}`, with `gate` null when there was none. A gate that
+cannot be removed is only warned about: the agent container alone decides the turn. Containers of
+another login, of a live run or of another containers folder are left alone.
+
+A removal that fails is tried again: four tries in all, 2, 3 and 5 seconds apart (10 seconds). One that
+works on a later try is listed like the others and the run goes on. When the orphan is still there after
+the last try, the run does not start its agent, since two agents would then share one login: it lets go
+of the turn, ends with the result `login_blocked`, and `farmy factory show` prints
+`could not remove orphaned agent container <name> (run <id>): <Docker's error>`. Remove that container
+yourself (or restart Docker) and start the run again.
+
+`farmy destroy` keeps factory logins. To remove one: `docker volume rm farmy-factory-login-<agent>`.
+
+## Pinning the agent: model, effort and CLI version
+
+Left alone, a factory run gets whatever model, reasoning effort and CLI version the agent defaults to
+when the image is built, and those defaults change. To pin them, put the agent's entry in `farmy.yml`.
+An entry named after a catalogue agent overrides the catalogue entry field by field and keeps the rest
+(FORMATS, "Agents"). A profile has no fields for this, by design: they belong to the agent, so every
+profile and every service that uses it runs the same pinned agent.
+
+**Codex** (0.163.0) takes the model as `-m`/`--model`. Reasoning effort has no flag. It is the config
+key `model_reasoning_effort`, set with Codex's global config flag `-c key=value`, which may stand after
+`exec`. The known values are `none`, `minimal`, `low`, `medium` (the default), `high`, `xhigh`, `max`
+and `ultra`, and the model decides which of them it accepts. The official installer installs an exact
+release with `CODEX_RELEASE=<x.y.z>` (or `--release <x.y.z>`). It verifies the download's checksum and
+checks that the installed binary reports that version. It puts the package under `CODEX_HOME` (by default
+`.codex` in the home of the user who runs it, root's in an image build, where dev cannot reach it), so the
+line sets `CODEX_HOME=/usr/local/lib/codex` for the install alone, as the catalogue does, and makes that
+folder root's and readable by all; `CODEX_INSTALL_DIR` puts the `codex` link in `/usr/local/bin`. Like every
+install line, it downloads the installer to a file and then runs it, so a failed download fails the build
+with curl's own message instead of running an empty script.
+
+```yaml
+agents:
+  codex:
+    install: curl -fsSL -o /tmp/codex-install.sh https://chatgpt.com/codex/install.sh && CODEX_HOME=/usr/local/lib/codex CODEX_INSTALL_DIR=/usr/local/bin CODEX_RELEASE=0.163.0 CODEX_NON_INTERACTIVE=1 sh /tmp/codex-install.sh && rm -f /tmp/codex-install.sh && chown -R root:root /usr/local/lib/codex && chmod -R a+rX /usr/local/lib/codex
+    headless: {command: codex exec -m gpt-6-astra -c model_reasoning_effort=high --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --json -, prompt: stdin}
+```
+
+With `--json`, `codex exec` writes JSON events to stdout. Its `turn.completed` event carries `usage`
+(`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`), so each
+iteration's `iteration-<i>.agent.stdout` is that iteration's usage report.
+
+**Claude Code** takes the model as `--model`. An alias such as `opus` moves to the latest model, so a
+full model name is the pin. Effort is the variable `CLAUDE_CODE_EFFORT_LEVEL` (`low`, `medium`,
+`high`, `xhigh`, `max`, `auto`), which wins over the command-line effort setting. Put it in the entry's
+`env:`, which the agent's container gets. For an exact version, use the native installer, which takes
+the version as its argument. It installs per user: the CLI goes to `.local/share/claude/versions/<version>`
+in the home of the user who runs it, with a launcher link in `.local/bin` there. The line below therefore
+runs it as root (as every install line runs) with a home of its own, `HOME=/usr/local/lib/claude-code`,
+makes that folder root's and readable by all (`chown -R root:root`, `chmod -R a+rX`) and links
+`/usr/local/bin/claude` to the installed binary, so dev can run it and no login volume is mounted over it.
+It downloads the installer to a file and then runs it, so a failed download fails the build. The apt
+repository that the catalogue uses documents no version pin.
+`DISABLE_UPDATES=1` stops the installed version from updating itself. `--output-format json` puts the
+result, with `usage` and `total_cost_usd`, on stdout.
+
+```yaml
+agents:
+  claude:
+    install: curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh && HOME=/usr/local/lib/claude-code bash /tmp/claude-install.sh 2.1.211 && rm -f /tmp/claude-install.sh && chown -R root:root /usr/local/lib/claude-code && chmod -R a+rX /usr/local/lib/claude-code && ln -sf "$(readlink -f /usr/local/lib/claude-code/.local/bin/claude)" /usr/local/bin/claude   # choose your own exact version
+    headless: {command: claude -p --dangerously-skip-permissions --model claude-opus-5-5 --output-format json, prompt: argument}
+    env: {CLAUDE_CODE_EFFORT_LEVEL: high, DISABLE_UPDATES: '1'}
+```
+
+Points to watch:
+
+- Overriding `headless`, `env` or `install` replaces the whole field. Repeat what you want to keep, such
+  as the flags that let the agent act without asking and the prompt mode (`stdin` for Codex, `argument`
+  for Claude Code).
+- A changed `install` takes effect only once the image is built again: `farmy rebuild <service>`.
+- Factory runs never read the interactive login's user configuration, because `farmy-shared` is not in
+  the agent's container. In `mode: login`, though, the factory login volume *is* the CLI's home folder
+  (`~/.codex` for Codex), so a `config.toml` there would apply to every run on that login. Keep pins on
+  the command line, which wins over the file.
+- The run record shows what each run actually used (see [A run](#a-run)). `agent_config` in the run's
+  `state.json` is the entry with your overrides applied, and `agent_version` is what its `version`
+  command printed.
 
 ## A run
 
@@ -134,9 +264,25 @@ What happens:
    An unsuccessful gate supplies its output to the next iteration.
 
 A run ends `green`, `awaiting_review`, `question`, `stalled`, `max_iterations`, `timeout` (the agent ran past `iteration_timeout` and the gate was
-red), `agent_failed` (the agent exited non-zero having changed nothing), `test_failed_to_run` (Docker
+red), `agent_failed` (the agent exited non-zero having changed nothing), `login_blocked` (an orphaned agent
+container of its factory login could not be removed, so its agent never started), `test_failed_to_run` (Docker
 could not start the test container), `cancelled`, or `interrupted` (the control container restarted, or
 the controller died, while it ran). Everything about a run is in `.work/shop/runs/<id>/`.
+
+That folder holds the run record. For each iteration it has `iteration-<i>.agent.json`, which records
+the `docker run` farmy ran, word for word, the agent's environment (every secret replaced by its name), the
+image id, the exit code and the times. No secret is on that command line: the token in token mode goes
+as `-e NAME` alone, its value only in the environment of that one `docker` process. Next to it are
+`iteration-<i>.prompt.md` and the agent's own output, byte for byte, in `iteration-<i>.agent.stdout` and
+`iteration-<i>.agent.stderr`. stdout is where an agent's usage report lands. For the whole run,
+`state.json` holds `agent_config`, the agent entry as resolved (the catalogue with the `farmy.yml`
+overrides applied), and `agent_version`. That is what the entry's `version` command printed, asked once
+before the first iteration, or null when the entry has none or the command printed nothing. A command
+that fails keeps `agent_version: "unknown"` with `agent_version_reason`, its exit code and the last line
+it wrote to stderr (`exited 126: sh: 1: codex: Permission denied`), so a CLI that is missing or that dev
+may not execute shows in the record; the run goes on. The version container gets 30 s. When it has not ended by then, farmy removes it, keeps
+`agent_version: "unknown"` with `agent_version_reason: "no answer within 30 s"`, and the run goes on to
+its first iteration. `agent_version_reason` is absent when the version was given or there is none.
 
 ## Review, chaining and questions
 

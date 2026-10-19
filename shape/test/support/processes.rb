@@ -2,11 +2,31 @@
 # subreaper (Linux prctl), so whatever its children start, even detached with setsid or double
 # forks, is reparented to it rather than to PID 1. After teardown it finds those descendants,
 # kills them, reaps them, and the test fails naming what was left behind.
+#
+# Only what the test started counts. Processes already below this one when the test began (mark), and
+# everything below them, are never killed or reported: with JOBS=1 the runner may have taken over the
+# shell that started a Docker daemon before it (docker:dind, `sh -c '… & bin/verify'`), and that
+# daemon's shims and containers are Docker's; a real-Docker test removes its containers through Docker.
 module Processes
   PR_SET_CHILD_SUBREAPER = 36
   GRACE = 3 # seconds
 
   def self.available? = File.readable?("/proc/self/stat")
+
+  # What is below this process now: left alone from here on. Called before each test.
+  def self.mark
+    @before = available? ? descendants(boundary: false).filter_map { |pid, *| identity(pid) } : []
+  end
+
+  # pid and start time, so that a reused pid is not mistaken for a process from before.
+  def self.identity(pid)
+    stat = File.read("/proc/#{pid}/stat")
+    [pid, stat[(stat.rindex(")") + 2)..].split[19]]
+  rescue SystemCallError
+    nil
+  end
+
+  def self.from_before?(pid) = (@before || []).include?(identity(pid))
 
   def self.become_subreaper
     return if @subreaper == Process.pid || !available?
@@ -15,8 +35,9 @@ module Processes
     @subreaper = Process.pid if prctl.call(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0).zero?
   end
 
-  # [pid, state, command line] of every process below this one, zombies included.
-  def self.descendants(root = Process.pid)
+  # [pid, state, command line] of every process below this one that the test started, zombies included:
+  # processes from before the test (mark) and their descendants are not followed.
+  def self.descendants(root = Process.pid, boundary: true)
     rows = Dir.glob("/proc/[0-9]*/stat").filter_map do |path|
       stat = File.read(path) rescue next
       fields = stat[(stat.rindex(")") + 2)..].split
@@ -27,6 +48,7 @@ module Processes
     found, queue = [], [root]
     while (pid = queue.shift)
       (children[pid] || []).each do |child, _, state, comm|
+        next if boundary && from_before?(child)
         line = (File.read("/proc/#{child}/cmdline").tr("\0", " ").strip rescue "")
         found << [child, state, line.empty? ? comm : line]
         queue << child

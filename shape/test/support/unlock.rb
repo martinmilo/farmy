@@ -85,6 +85,21 @@ module Unlock
     assert missing.empty?, "Expected the guide #{path} to say each of these, and it does not: #{missing.map(&:inspect).join(", ")}."
   end
 
+  def refute_guide_says(path, *phrases)
+    text = work_file(path)
+    present = phrases.select { |p| text.include?(p) }
+    assert present.empty?, "Expected the guide #{path} not to say #{present.map(&:inspect).join(", ")}: that flag does not exist in the pinned version."
+  end
+
+  # The first ```yaml block of a guide that holds the text, as a reader would copy it.
+  def guide_yaml_block(path, holding:)
+    blocks = work_file(path).scan(/^```ya?ml\n(.*?)^```/m).flatten
+    block = blocks.find { |b| b.include?(holding) }
+    assert block, "Expected the guide #{path} to have a ```yaml block holding #{holding.inspect}; its yaml blocks hold none."
+    note_situation "farmy.yml is the guide's yaml block holding #{holding.inspect}:\n#{block}"
+    block
+  end
+
   # A file in the work folder: a guide, a shipped example.
   def work_file(name)
     File.read(File.join(Target.root, name))

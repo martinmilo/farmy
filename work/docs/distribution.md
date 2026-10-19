@@ -6,24 +6,40 @@ control image contains the tools used inside containers.
 
 ## Install a published release
 
-Download the GitHub release's `install` and `SHA256SUMS` assets linked by the root README.
-Verify them with `sha256sum --check SHA256SUMS` (or `shasum -a 256 --check SHA256SUMS` on macOS),
-then run `sh install`. The default registry is `ghcr.io/<owner>/farmy`, derived from the one
-`release.yml` configuration. Environment overrides select another publisher when needed:
+The root README gives the two ways in. The one-liner pipes the latest GitHub release's
+`install` asset to the shell:
 
 ```sh
-FARMY_REGISTRY=ghcr.io/acme sh bin/install
-# Or a Forgejo registry:
-FARMY_REGISTRY=forgejo.example.com/acme sh bin/install
+curl -fsSL https://github.com/<owner>/farmy/releases/latest/download/install | sh
 ```
 
-The installer pulls `farmy-control:latest`, reads its `farmy.version` label, then pulls that
-exact version. Docker create/cp/remove extracts `/usr/local/lib/farmy/farmy` without running
-a container binary. Only `$HOME/.local/bin/farmy` is installed. Add that directory to PATH.
-Choose an exact version or another destination with:
+To verify first, download `install` and `SHA256SUMS` from one release
+(`…/releases/download/v<version>/install` and `…/SHA256SUMS`), check them with
+`shasum -a 256 --check SHA256SUMS` on macOS or `sha256sum --check SHA256SUMS` on Linux, then
+run `sh ./install`.
+
+A release's installer carries its own version and installs that release, even when a newer
+one is `latest`. The checkout's `bin/install` instead pulls `farmy-control:latest`, reads its
+`farmy.version` label, then pulls that exact version. `--to VERSION` wins in both. Docker
+create/cp/remove extracts `/usr/local/lib/farmy/farmy` without running a container binary.
+Only `DIR/farmy` is installed, `$HOME/.local/bin` unless `--dir` says otherwise. The installer
+ends with `installed farmy <version> at <DIR>/farmy` and, when DIR is not on `PATH`, a line to
+add it:
+
+```
+installed farmy 0.1.0 at /home/ops/.local/bin/farmy
+add it to your PATH: export PATH="/home/ops/.local/bin:$PATH"
+```
+
+The default registry is `ghcr.io/<owner>/farmy`, derived from the one `release.yml`
+configuration. Environment overrides select another publisher, an exact version or another
+destination when needed:
 
 ```sh
-FARMY_REGISTRY=ghcr.io/acme sh bin/install --to 0.1.0 --dir "$HOME/bin"
+FARMY_REGISTRY=ghcr.io/acme sh ./install
+# Or a Forgejo registry:
+FARMY_REGISTRY=forgejo.example.com/acme sh ./install
+FARMY_REGISTRY=ghcr.io/acme sh ./install --to 0.1.0 --dir "$HOME/bin"
 farmy --version
 ```
 
@@ -181,6 +197,11 @@ public acceptance tests and spec records. It excludes private configuration, gen
 build products and internal notes. Both privacy scanners check the isolated public candidate,
 including filenames, binary bytes, symlink targets, deleted historical content and tag metadata.
 Any hit or scanner error prevents the push.
+
+The exported README and CONTRIBUTING render the configured issue and contribution URLs and
+contribution text. In the README, versioned installer and checksum links
+(`<github_url>/releases/download/v<x.y.z>/…`) name the version being published; links to the
+latest release (`<github_url>/releases/latest/download/…`) stay as written.
 
 The scanner permits the exact configured identity in release configuration scalars, Git
 author/committer/tagger headers and the root LICENSE copyright attribution. Root README and

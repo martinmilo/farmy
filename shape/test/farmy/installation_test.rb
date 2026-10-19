@@ -4,11 +4,11 @@ class InstallationTest < AcceptanceTest
   test "installation into a temporary bin directory needs only Docker and POSIX tools and leaves one executable shim" do
     published_release
 
-    install_distribution version: "0.1.0"
+    install_distribution version: SHIPPED
 
     assert_success
     assert_installed_only_shim
-    assert_pulled "registry.example.com/acme/farmy-control:0.1.0"
+    assert_pulled "registry.example.com/acme/farmy-control:#{SHIPPED}"
   end
 
   test "installation without a version resolves the stable latest control label" do
@@ -34,18 +34,18 @@ class InstallationTest < AcceptanceTest
 
   test "a standalone pull failure builds using a configured Docker source URL without a host clone" do
     installed_distribution
-    fail_pull "control", "0.1.0"
+    fail_pull "control", SHIPPED
 
-    distribution_shim "init", env: { "FARMY_SOURCE" => "https://code.example.com/acme/farmy.git#v0.1.0:work" }
+    distribution_shim "init", env: { "FARMY_SOURCE" => "https://code.example.com/acme/farmy.git#v#{SHIPPED}:work" }
 
     assert_success
-    assert_local_control_built source: "https://code.example.com/acme/farmy.git#v0.1.0:work"
+    assert_local_control_built source: "https://code.example.com/acme/farmy.git#v#{SHIPPED}:work"
     assert_stderr(/build/i)
   end
 
   test "a standalone failed pull without a source override builds the matching GitHub mirror tag work context" do
     installed_distribution
-    fail_pull "control", "0.1.0"
+    fail_pull "control", SHIPPED
 
     distribution_shim "init"
 

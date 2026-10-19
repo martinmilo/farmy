@@ -104,6 +104,20 @@ module Publishing
     saved&.each { |key, value| ENV[key] = value }
   end
 
+  # The README links to the installer and checksums of the latest release and of an older one (v0.0.9),
+  # committed; public_readme is the README publication exported.
+  def readme_with_release_links
+    write_file "README.md", "# farmy\n\n" \
+      "curl -fsSL https://github.com/acme/farmy/releases/latest/download/install | sh\n" \
+      "[checksums](https://github.com/acme/farmy/releases/latest/download/SHA256SUMS)\n\n" \
+      "curl -fsSLO https://github.com/acme/farmy/releases/download/v0.0.9/install\n" \
+      "curl -fsSLO https://github.com/acme/farmy/releases/download/v0.0.9/SHA256SUMS\n"
+    commit "README with release links"
+    note_situation "README.md links to releases/latest/download/{install,SHA256SUMS} and releases/download/v0.0.9/{install,SHA256SUMS} of https://github.com/acme/farmy."
+  end
+  
+  def public_readme = public_git("show", "refs/heads/main:README.md")
+  
   def published_once
     publish
     assert_success

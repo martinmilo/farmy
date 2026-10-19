@@ -148,4 +148,12 @@ class AgentsTest < AcceptanceTest
   test "every catalogue agent states how it runs headless, as a command and how the prompt is passed" do
     assert_catalogue_headless "claude", "codex", "gemini", "opencode", "cursor", "copilot"
   end
+
+  test "every catalogue agent states its version command, a shell line that prints the CLI's version" do
+    assert_catalogue_version "claude", "codex", "gemini", "opencode", "cursor", "copilot"
+  end
+
+  test "codex's catalogue entry declares its factory login: .codex, created by codex login --device-auth" do
+    assert_catalogue_factory_login "codex", path: ".codex", create: "codex login --device-auth"
+  end
 end

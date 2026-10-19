@@ -57,6 +57,7 @@ COMMANDS
   keys --why            Run the provider once and print how it ended and its stderr, secret values [redacted]; loads nothing.
   factory               The factory loop: start <name> --task <file or text> [--profile <name>] [--from <id|branch>] [--wait],
                         list, show <id>, log <id> [<i>], cancel <id>, approve <id>, answer/revise <id> <text|file> [--wait], prune.
+  factory login <svc> <agent>  Make the agent's own subscription login for factory runs in mode: login (farmy-factory-login-<agent>).
   factory pipeline      start <service> <pipeline> --task <text|file> [--wait], list, show, cancel, resume.
   toolbox list --json   Available vendor tools with resolved versions and verified artifact pins.
   toolbox bump [tool…]  Resolve stable releases and atomically update tools.lock.
@@ -471,8 +472,34 @@ pub(crate) fn agent_modes(ctx: &Ctx, name: &str) -> Vec<(Agent, String)> {
     out
 }
 
+/// The agents a service's image carries: those on for it (`on`), then every factory profile's agent,
+/// which can be off for interactive work in the app.
+pub(crate) fn installed_agents(ctx: &Ctx, def: &Definition, on: &[Agent]) -> Vec<Agent> {
+    let mut installed = on.to_vec();
+    for agent in def
+        .factory
+        .iter()
+        .flat_map(|f| f.profiles.values())
+        .filter_map(|f| f.agent.as_ref())
+    {
+        if installed.iter().any(|a| &a.name == agent) {
+            continue;
+        }
+        if let Some(entry) = ctx.cfg.agent(agent).cloned().or_else(|| {
+            ctx.cfg
+                .catalogue
+                .iter()
+                .find(|(n, _)| n == agent)
+                .and_then(|(_, e)| Agent::from_entry(agent, e.clone(), "agents.yml").ok())
+        }) {
+            installed.push(entry);
+        }
+    }
+    installed
+}
+
 /// The agents on for a service (every mode but off), in farmy.yml's order.
-fn agents_on(ctx: &Ctx, name: &str) -> Vec<Agent> {
+pub(crate) fn agents_on(ctx: &Ctx, name: &str) -> Vec<Agent> {
     agent_modes(ctx, name)
         .into_iter()
         .filter(|(_, m)| m != "off")
@@ -484,13 +511,12 @@ fn agents_on(ctx: &Ctx, name: &str) -> Vec<Agent> {
 type AgentEnvironment = (Vec<(String, String)>, Vec<String>);
 
 /// What the agents put into a service's environment, and which variables no route may set there:
-/// subscription — the token (when the provider had it) and the agent's own env:, its api variables
-/// blocked; api-key — the base URL and the placeholder from the route with the agent's upstream.
+/// subscription — the agent's own env:, its api variables blocked (its token: `agent_tokens`);
+/// api-key — the base URL and the placeholder from the route with the agent's upstream.
 fn agent_environment(
     name: &str,
     modes: &[(Agent, String)],
     routes: &[&Route],
-    resolved: &secrets::Resolved,
 ) -> R<AgentEnvironment> {
     let mut env = vec![];
     let mut blocked = vec![];
@@ -503,11 +529,6 @@ fn agent_environment(
         }
         match mode.as_str() {
             "subscription" => {
-                if let Some(t) = &a.token_env
-                    && let Some(v) = resolved.values.get(t)
-                {
-                    env.push((t.clone(), v.clone()));
-                }
                 if let Some(api) = &a.api {
                     blocked.push(api.key.clone());
                     blocked.push(api.base_url.clone());
@@ -537,6 +558,25 @@ fn agent_environment(
         }
     }
     Ok((env, blocked))
+}
+
+/// The agents' tokens for a service, name and value: each subscription agent's `token_env` the
+/// provider (or the held unlocking values) answered. The compose file names them; the values go
+/// only into the environment of `docker compose` (FORMATS.md, Agents). None answered: no variable.
+fn agent_tokens(modes: &[(Agent, String)], resolved: &secrets::Resolved) -> Vec<(String, String)> {
+    let mut tokens: Vec<(String, String)> = vec![];
+    for (a, mode) in modes {
+        if mode != "subscription" {
+            continue;
+        }
+        if let Some(t) = &a.token_env
+            && let Some(v) = resolved.values.get(t)
+            && !tokens.iter().any(|(k, _)| k == t)
+        {
+            tokens.push((t.clone(), v.clone()));
+        }
+    }
+    tokens
 }
 
 /// The tsv the toolbox and the entrypoint read: one line per agent on (FORMATS.md, Agents).
@@ -1073,6 +1113,15 @@ fn compose_file(name: &str) -> PathBuf {
     work_dir(name).join("compose.yml")
 }
 
+/// The tokens the service's compose file names, each with an empty value: for a compose command
+/// that makes no container (stop, down, logs), so that compose does not warn of a variable unset.
+fn blank_tokens(name: &str) -> Vec<(String, String)> {
+    compose::named_variables(&std::fs::read_to_string(compose_file(name)).unwrap_or_default())
+        .into_iter()
+        .map(|k| (k, String::new()))
+        .collect()
+}
+
 /// What to say when the definition (or farmy.yml) changed since the containers were made.
 fn drift(name: &str) -> Option<String> {
     let built = std::fs::read_to_string(work_dir(name).join("definition.yml")).ok()?;
@@ -1456,27 +1505,7 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
             .filter(|(_, m)| m != "off")
             .map(|(a, _)| a.clone())
             .collect();
-        let mut installed = on.clone();
-        // A factory profile can use an agent that is off for interactive work in the app.
-        for agent in def
-            .factory
-            .iter()
-            .flat_map(|f| f.profiles.values())
-            .filter_map(|f| f.agent.as_ref())
-        {
-            if installed.iter().any(|a| &a.name == agent) {
-                continue;
-            }
-            if let Some(entry) = ctx.cfg.agent(agent).cloned().or_else(|| {
-                ctx.cfg
-                    .catalogue
-                    .iter()
-                    .find(|(n, _)| n == agent)
-                    .and_then(|(_, e)| Agent::from_entry(agent, e.clone(), "agents.yml").ok())
-            }) {
-                installed.push(entry);
-            }
-        }
+        let installed = installed_agents(&ctx, &def, &on);
         let toolbox = toolbox_hash(&installed);
         let restricted = crate::filter::restricted(&ctx.cfg, &def);
         if restricted {
@@ -1488,6 +1517,9 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
         let app_env = std::fs::read_to_string(format!("services/{name}.env")).unwrap_or_default();
         std::fs::write(wd.join("app.env"), app_env)?;
         let cid_any = docker::app_cid_any(name);
+        // the agents' tokens: named in the compose file, their values given to docker compose at
+        // every up that may make or recreate the app container
+        let tokens = agent_tokens(&modes, &resolved);
         if !force {
             if let Some(cid) = docker::app_cid(name) {
                 if docker::container_label(&cid, "farmy.toolbox.hash") != toolbox {
@@ -1503,28 +1535,42 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
                 );
                 continue;
             }
+            // the existing compose file is reused when it names exactly the tokens there are now; a
+            // token gone or new makes the containers anew, so that none is left blank or missing
+            let same_tokens = || {
+                let mut named = compose::named_variables(
+                    &std::fs::read_to_string(compose_file(name)).unwrap_or_default(),
+                );
+                let mut now: Vec<String> = tokens.iter().map(|(k, _)| k.clone()).collect();
+                named.sort();
+                now.sort();
+                named == now
+            };
             if let Some(cid) = &cid_any
                 && compose_file(name).is_file()
                 && drift(name).is_none()
                 && docker::container_label(cid, "farmy.toolbox.hash") == toolbox
+                && same_tokens()
             {
                 println!("[{name}] starting its containers again");
                 if restricted {
-                    if !docker::compose(
+                    if !docker::compose_with(
                         name,
                         Some(&compose_file(name)),
                         &["up", "-d", "--no-deps", "egress-gate"],
                         true,
+                        &tokens,
                     ) {
                         return refuse(format!("[{name}] egress gate could not start"));
                     }
                     crate::filter::reload_app(&ctx, name, &def)?;
                 }
-                docker::compose(
+                docker::compose_with(
                     name,
                     Some(&compose_file(name)),
                     &["up", "-d", "--remove-orphans"],
                     true,
+                    &tokens,
                 );
                 if restricted {
                     crate::filter::reload_app(&ctx, name, &def)?;
@@ -1569,7 +1615,7 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
             serde_yaml::to_string(&saved_config).unwrap_or_default(),
         );
         let granted = secrets::granted(&ctx.routes, name);
-        let (agent_env, blocked) = agent_environment(name, &modes, &granted, &resolved)?;
+        let (agent_env, blocked) = agent_environment(name, &modes, &granted)?;
         let proxy_env = egress::proxy_env(&ctx.cfg, &{
             let mut names = vec![name.to_string(), "keys".to_string()];
             names.extend(
@@ -1595,6 +1641,7 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
             routes: &granted,
             agents: &agents_arg(&on),
             agent_env: &agent_env,
+            tokens: &tokens.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
             blocked: &blocked,
             proxy_env: &proxy_env,
             toolbox_hash: &toolbox,
@@ -1609,11 +1656,12 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
         if def.image.is_none() {
             // Dockerfile/build-file fetches happen before the app image exists. Compose can start
             // just its broker now; the usual container recreation below reloads it afterwards.
-            if !docker::compose(
+            if !docker::compose_with(
                 name,
                 Some(&compose_file(name)),
                 &["up", "-d", "--no-deps", "keys"],
                 true,
+                &tokens,
             ) {
                 return refuse(format!(
                     "[{name}] keys broker could not start for the Dockerfile fetch"
@@ -1650,41 +1698,45 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
             ),
         );
         if docker::has_containers(name) {
-            let _ = docker::compose(
+            let _ = docker::compose_with(
                 name,
                 Some(&compose_file(name)),
                 &["down", "--remove-orphans"],
                 false,
+                &tokens,
             );
         }
         if restricted {
-            if !docker::compose(
+            if !docker::compose_with(
                 name,
                 Some(&compose_file(name)),
                 &["up", "-d", "--no-deps", "egress-gate"],
                 true,
+                &tokens,
             ) {
                 return refuse(format!("[{name}] egress gate could not start"));
             }
             crate::filter::reload_app(&ctx, name, &def)?;
         }
         if ctx.cfg.dotfiles.is_some() {
-            if !docker::compose(
+            if !docker::compose_with(
                 name,
                 Some(&compose_file(name)),
                 &["up", "-d", "--no-deps", "keys"],
                 true,
+                &tokens,
             ) {
                 return refuse("dotfiles: keys broker could not start");
             }
             load_now(name);
             dotfiles_revisions.insert(name.clone(), crate::home::update(&ctx, name, false)?);
         }
-        if !docker::compose(
+        if !docker::compose_with(
             name,
             Some(&compose_file(name)),
             &["up", "-d", "--remove-orphans"],
             true,
+            &tokens,
         ) {
             return refuse(format!("[{name}] docker compose up failed — see above"));
         }
@@ -1791,7 +1843,7 @@ pub(crate) fn stop(args: &[String]) -> R {
     }
     for name in &names {
         if docker::any_running(name) {
-            docker::compose(
+            docker::compose_with(
                 name,
                 compose_file(name)
                     .is_file()
@@ -1799,6 +1851,7 @@ pub(crate) fn stop(args: &[String]) -> R {
                     .as_deref(),
                 &["stop"],
                 false,
+                &blank_tokens(name),
             );
             println!(
                 "{name} stopped — its containers and volumes are kept; farmy start {name} brings it back"
@@ -1870,7 +1923,7 @@ pub(crate) fn destroy(args: &[String]) -> R {
         )]
         let _ = stdin.lock().read_line(&mut answer);
         if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-            docker::compose(
+            docker::compose_with(
                 name,
                 compose_file(name)
                     .is_file()
@@ -1878,6 +1931,7 @@ pub(crate) fn destroy(args: &[String]) -> R {
                     .as_deref(),
                 &["down", "-v", "--remove-orphans"],
                 false,
+                &blank_tokens(name),
             );
             // compose removes only the volumes it made; farmy's own are removed whoever made them
             remove_own_volumes(name);
@@ -2061,7 +2115,7 @@ pub(crate) fn logs(args: &[String]) -> R {
             return refuse(format!("{name} has no containers — farmy start {name}"));
         }
     }
-    docker::compose(
+    docker::compose_with(
         &args[0],
         compose_file(&args[0])
             .is_file()
@@ -2069,6 +2123,7 @@ pub(crate) fn logs(args: &[String]) -> R {
             .as_deref(),
         &["logs", "-f", "--tail", "100"],
         true,
+        &blank_tokens(&args[0]),
     );
     Ok(())
 }

@@ -127,9 +127,12 @@ class Publication
         text += "\n\n#{policy}\n"
       end
       if name == "README.md"
+        # Versioned installer/checksum links name the published version; latest-release
+        # links stay as written. The placeholder base maps to the configured one.
         [github, "https://github.com/your-owner/farmy"].uniq.each do |base|
-          text = text.gsub(%r{#{Regexp.escape(base)}/releases/(?:latest/download|download/v[0-9.]+)/install}, replacements['install_url'])
-          text = text.gsub(%r{#{Regexp.escape(base)}/releases/(?:latest/download|download/v[0-9.]+)/SHA256SUMS}, replacements['checksums_url'])
+          text = text.gsub(%r{#{Regexp.escape(base)}/releases/download/v[0-9.]+/install}, replacements['install_url'])
+          text = text.gsub(%r{#{Regexp.escape(base)}/releases/download/v[0-9.]+/SHA256SUMS}, replacements['checksums_url'])
+          text = text.gsub(%r{#{Regexp.escape(base)}/releases/latest/download/(install|SHA256SUMS)}) { "#{github}/releases/latest/download/#{$1}" }
         end
       end
       File.binwrite(path, text)

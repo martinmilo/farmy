@@ -24,6 +24,12 @@ You may *run* the program through the suite (`ruby test/run.rb`, which builds it
 when the worker has left a `bin/build`). That is how you find out whether a new test
 fails for the right reason. Running it is not reading it.
 
+**Code questions go to a helper.** When the person asks how the program works today ("answer
+from the code"), or a decision needs a fact about the implementation, do not look yourself.
+Hand the question to a read-only helper that works in `../work` (it never looks into this
+folder and changes nothing) and use only its answer, which describes behaviour. Say in the spec
+record when a helper's answer shaped a decision.
+
 **Test names and failure messages are the worker's whole specification.** It never
 reads a spec record or a test body. Whatever it needs to know has to be visible in the name
 of a test and in what the test prints when it fails.

@@ -19,9 +19,10 @@ run the service's own commands, from any terminal that can reach the machine.
 
 ## The premise
 
-The host needs Docker and POSIX utilities. Download the GitHub release's `install` and
-`SHA256SUMS` assets, run `sha256sum --check SHA256SUMS`, then `sh install` to install
-`~/.local/bin/farmy`. Public defaults come from `release.yml`; `FARMY_REGISTRY` and `FARMY_SOURCE`
+The host needs Docker and POSIX utilities. Pipe the latest GitHub release's `install` asset to
+`sh`, or download it with `SHA256SUMS`, run `sha256sum --check SHA256SUMS`, then `sh ./install`;
+either installs that release's `~/.local/bin/farmy` and prints the `PATH` line when the folder is
+not on `PATH`. Public defaults come from `release.yml`; `FARMY_REGISTRY` and `FARMY_SOURCE`
 override the registry and the matching mirror-tag source context. See the
 [root README](../README.md#install) for asset links.
 
@@ -261,6 +262,7 @@ farmy dotfiles pull           fast-forward the shared clone and apply it to ever
 farmy factory pipeline start <service> <pipeline> --task <text|file> [--wait]
                               run profiles in order with pinned approvals and question handoffs
 farmy factory show <id>       the run or pipeline result, gate evidence and comparison link
+farmy factory login <name> <agent>   make the agent's own subscription login for factory runs (mode: login)
 farmy agents                 the agent catalogue, enabled modes and login instructions
 farmy lock                   forget held unlocking values
 farmy logs <name>             follow the containers' logs
@@ -321,7 +323,10 @@ for the service, default `claude`) and `agents.tsv` in its context, one line per
 install line for each base and what the entrypoint needs. Its `install.sh` uses the image's own
 package manager, apt (the supported path) or apk (best effort): git, curl, bash, zsh, socat, a build
 toolchain, the `dev` user (uid 1001, so the shared volumes have one owner), and each agent through
-its `install` line. The `entrypoint.sh` prepares the app and waits; farmy's shared Git helper
+its `install` line, run as root. Once the agents are installed, the build runs each agent's `version`
+line as dev, the user who runs them: a CLI dev cannot run (one under `/root`, say) fails the build,
+naming the agent and what the command said. The catalogue installs every CLI outside any home
+directory, owned by root and executable by all. The `entrypoint.sh` prepares the app and waits; farmy's shared Git helper
 clones the repository, then farmy runs `setup` once every sidecar with a `healthcheck:` is
 healthy (the app container depends on them with `condition: service_healthy`; the rest only have to
 be started). Setup runs under `setup_timeout` from `farmy.yml`, thirty minutes by default: a setup

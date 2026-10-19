@@ -88,11 +88,12 @@ One compose project per service, named after it, in `.work/<name>/compose.yml`:
 The app container's environment: `REPO` and `BRANCH` (repository metadata; absent for a workbench), `GIT_USER_NAME` and
 `GIT_USER_EMAIL` from `.env`, `DEV_GIT_ROUTES` (`<upstream>=<route URL>` pairs) for the granted http(s) routes with `git: true`,
 `FARMY_AGENTS` and `FARMY_MCP_URL` when an agent is on for the service, an agent's `token_env` in
-subscription mode (the one secret in a container's environment, see credentials.md), `SSH_AUTH_SOCK` with an
+subscription mode (the one secret in a container's environment, see credentials.md; the file names it only,
+`NAME: ${NAME}`, and farmy gives the value in the environment of `docker compose` at every up), `SSH_AUTH_SOCK` with an
 `auth: ssh` route, the variables and placeholders every granted route exposes, loaded or not (the broker
 answers 503 until `farmy keys reload` loads it; except an agent's `api` variables in subscription mode), `DEV_MOUNTS` with the mounts' paths, the definition's `env:` with `${url:x}` and `${port:x}` resolved, `DEV_FORWARD_PORTS`
 for the host ports those references point at, `DEV_WORKDIR` when there is a `workdir:`. A later
-line wins; `$` is escaped so compose leaves the values alone. `services/<name>.env` is added through
+line wins; `$` is escaped so compose leaves the values alone (all but the token's `${NAME}`). `services/<name>.env` is added through
 `env_file`, so it reaches that container only.
 
 `${FARMY_PORT_<n>}` anywhere in the fragment becomes the n-th port of the service's block (the

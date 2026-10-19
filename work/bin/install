@@ -4,6 +4,9 @@ set -eu
 FARMY_DEFAULT_REGISTRY=''
 FARMY_DEFAULT_SOURCE=''
 FARMY_DEFAULT_GITHUB=''
+# Set in the release's rendered installer, which installs its own release; empty in a checkout,
+# which resolves latest.
+FARMY_RELEASE_VERSION=''
 installer_root=$(cd "$(dirname "$0")/.." && pwd)
 release_scalar() {
   awk -v key="$1" '$0 ~ ("^" key ":[[:space:]]*") {
@@ -28,6 +31,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -z "$version" ] || valid_version "$version" || fail 'version must be exact MAJOR.MINOR.PATCH'
+if [ -z "$version" ] && [ -n "$FARMY_RELEASE_VERSION" ]; then
+  valid_version "$FARMY_RELEASE_VERSION" || fail 'the installer carries an invalid release version'
+  version=$FARMY_RELEASE_VERSION
+fi
 FARMY_REGISTRY=${FARMY_REGISTRY:-$FARMY_DEFAULT_REGISTRY}
 [ -n "$FARMY_REGISTRY" ] || fail 'release configuration is missing; obtain the installer release asset'
 registry=${FARMY_REGISTRY%/}
@@ -64,3 +71,15 @@ sh -n "$stage/source" || fail 'the extracted shim is not valid POSIX shell'
 chmod 755 "$stage/farmy"
 mv -f "$stage/farmy" "$destination/farmy"
 echo "installed farmy $version at $destination/farmy"
+strip_slash() { if [ "$1" != / ]; then printf '%s' "${1%/}"; else printf '/'; fi; }
+wanted=$(strip_slash "$destination")
+on_path=0
+saved_ifs=$IFS
+IFS=:
+set -f
+for entry in ${PATH:-}; do
+  [ "$(strip_slash "$entry")" != "$wanted" ] || on_path=1
+done
+set +f
+IFS=$saved_ifs
+[ "$on_path" = 1 ] || printf 'add it to your PATH: export PATH="%s:$PATH"\n' "$wanted"

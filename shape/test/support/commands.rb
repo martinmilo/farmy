@@ -9,7 +9,7 @@
 require "open3"
 
 module Commands
-  COMMAND_TIMEOUT = 60 # suite watchdog, not a product response-time contract
+  COMMAND_TIMEOUT = Integer(ENV.fetch("TEST_COMMAND_TIMEOUT", "60")) # suite watchdog, not a product response-time contract; real-Docker runs raise it (cold image builds)
 
   Finished = Struct.new(:line, :stdout, :stderr, :exit, :situation) do
     def to_s

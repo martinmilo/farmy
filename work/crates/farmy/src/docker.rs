@@ -18,6 +18,86 @@ pub(crate) fn out(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// How a docker command that did not succeed ended: its exit code (None when it could not be started
+/// or a signal ended it) and what it wrote to stderr, trimmed (or why it could not be started).
+pub(crate) struct Failed {
+    pub code: Option<i32>,
+    pub stderr: String,
+}
+
+/// stdout of a docker command (trimmed) when it ends within `limit` and succeeds, how it failed when
+/// it ends otherwise; None when it has not ended by then, and then the docker client is killed. A
+/// container the command started outlives its client: the caller removes it.
+pub(crate) fn out_within(
+    args: &[&str],
+    limit: std::time::Duration,
+) -> Option<Result<String, Failed>> {
+    let mut child = match Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return Some(Err(Failed {
+                code: None,
+                stderr: e.to_string(),
+            }));
+        }
+    };
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the client is given up on; the caller removes what it started"
+                )]
+                let _ = child.kill();
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "reaping the killed client; its status says nothing more"
+                )]
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Some(if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    } else {
+        Err(Failed {
+            code: status.code(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+        })
+    })
+}
+
+/// A pipe read to its end on a thread of its own, so a full pipe never holds up the waiting.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a failed read leaves what arrived, judged like any answer"
+            )]
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
 /// Whether what farmy prints reaches a terminal: its stdout is one, or the shim said its own stdout is
 /// one (FARMY_TTY=1; with unlocking values on stdin `docker exec` cannot have `-t`).
 pub(crate) fn tty_out() -> bool {
@@ -287,14 +367,33 @@ pub(crate) fn ensure_network(name: &str) {
 
 /// `docker compose -p <project> [-f <file>] <args…>`, output shown.
 pub(crate) fn compose(project: &str, file: Option<&Path>, args: &[&str], visible: bool) -> bool {
+    compose_with(project, file, args, visible, &[])
+}
+
+/// Like `compose`, with `env` added to the environment of that `docker compose` process only: the
+/// values a compose file names by variable (`NAME: ${NAME}`) and must not hold. Never on a command
+/// line, never in farmy's own environment.
+pub(crate) fn compose_with(
+    project: &str,
+    file: Option<&Path>,
+    args: &[&str],
+    visible: bool,
+    env: &[(String, String)],
+) -> bool {
     let mut full: Vec<String> = vec!["compose".into(), "-p".into(), project.into()];
     if let Some(f) = file {
         full.push("-f".into());
         full.push(f.display().to_string());
     }
     full.extend(args.iter().map(|a| a.to_string()));
-    let refs: Vec<&str> = full.iter().map(String::as_str).collect();
-    if visible { show(&refs) } else { quiet(&refs) }
+    let mut cmd = Command::new("docker");
+    cmd.args(&full)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null());
+    if !visible {
+        cmd.stdout(Stdio::null());
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// `docker exec [-u user] [-w dir] <container> <cmd…>`, output shown; true when it exited 0.

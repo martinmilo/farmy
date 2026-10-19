@@ -13,20 +13,31 @@ Docker and a POSIX shell. Farmy itself runs in a container; the host installs on
 
 ## Install
 
-Download the [install script](https://github.com/martinmilo/farmy/releases/download/v0.1.0/install)
-and [SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.1.0/SHA256SUMS)
-from the same GitHub release. Verify the exact downloaded bytes before installing:
-
 ```sh
-sha256sum --check SHA256SUMS
-sh ./install
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://github.com/martinmilo/farmy/releases/latest/download/install | sh
 ```
 
-On macOS, use `shasum -a 256 --check SHA256SUMS`. The default registry is
+This installs the latest release's farmy into `~/.local/bin` and, if that folder isn't on your
+`PATH`, ends by printing the `export PATH=…` line to add.
+
+To verify the installer first, download the
+[install script](https://github.com/martinmilo/farmy/releases/download/v0.1.1/install) and
+[SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.1.1/SHA256SUMS) from the
+same GitHub release, check the exact downloaded bytes, then run it:
+
+```sh
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.1.1/install
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.1.1/SHA256SUMS
+shasum -a 256 --check SHA256SUMS   # macOS
+sha256sum --check SHA256SUMS       # Linux
+sh ./install
+```
+
+A release's installer installs the release it came from. Choose `--to 0.1.0` for another exact
+release or `--dir` for another bin directory (`sh ./install --dir "$HOME/bin"`, or
+`sh -s -- --dir "$HOME/bin"` after the pipe). The default registry is
 `ghcr.io/<owner>/farmy`, with the owner configured once in [work/release.yml](work/release.yml).
-`FARMY_REGISTRY` can override it. Choose `--to 0.1.0` for an exact release or `--dir` for
-another bin directory. The installer retrieves the standalone shim through Docker; it does
+`FARMY_REGISTRY` can override it. The installer retrieves the standalone shim through Docker; it does
 not need a host clone or compiler. A failed pull can build the matching GitHub mirror tag's
 `work/` context; `FARMY_SOURCE` overrides that source. See
 [distribution](work/docs/distribution.md) for installation, release publishing and source builds.

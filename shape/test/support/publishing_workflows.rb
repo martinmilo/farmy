@@ -20,7 +20,7 @@ module PublishingWorkflows
 
   def default_public_registry = "ghcr.io/#{shipped_release_config.fetch('owner')}/farmy"
 
-  def assert_default_images_pulled(*roles, version: "0.1.0")
+  def assert_default_images_pulled(*roles, version: Distribution::SHIPPED)
     assert_pulled(*roles.map { |role| "#{default_public_registry}/farmy-#{role}:#{version}" })
   end
 
@@ -28,7 +28,7 @@ module PublishingWorkflows
     assert_release_builds version, registry: default_public_registry
   end
 
-  def assert_default_local_control_built(version: "0.1.0")
+  def assert_default_local_control_built(version: Distribution::SHIPPED)
     assert_local_control_built source: "#{shipped_release_config.fetch('github_url')}.git#v#{version}:work"
   end
 
@@ -46,14 +46,44 @@ module PublishingWorkflows
     end
   end
 
-  def default_published_distribution(version = "0.1.0")
+  def default_published_distribution(version = Distribution::SHIPPED)
     published_release version, registry: default_public_registry
   end
 
   def install_default_distribution
     default_published_distribution
-    install_distribution version: "0.1.0", env: { "FARMY_REGISTRY" => "" }
+    install_distribution version: Distribution::SHIPPED, env: { "FARMY_REGISTRY" => "" }
     assert_success
+  end
+
+  def release_url = "#{shipped_release_config.fetch("github_url").delete_suffix(".git")}/releases"
+
+  def assert_readme_orders(*phrases)
+    text = public_artifact("README.md")
+    missing = phrases.reject { |p| text.include?(p) }
+    assert missing.empty?, "Expected the README to say each of #{phrases.map(&:inspect).join(", ")}; it does not say: #{missing.map(&:inspect).join(", ")}."
+    order = phrases.sort_by { |p| text.index(p) }
+    assert order == phrases, "Expected the README to bring these up in this order, by first mention: #{phrases.map(&:inspect).join(" before ")}; it brings them up as #{order.map(&:inspect).join(", ")}."
+  end
+
+  # The files the release workflow uploads to the GitHub release (gh release upload … dist/<file> …).
+  def attached_release_assets
+    upload = asset_jobs.values.map { |job| job_text(job) }.join("\n")[/gh release upload[^\n]*/].to_s
+    assets = upload.scan(%r{dist/([^\s"']+)}).flatten
+    refute_empty assets, "Expected the release workflow to upload files from dist/ with gh release upload."
+    assets
+  end
+
+  def assert_readme_release_urls_name_attached_assets
+    base = release_url
+    urls = public_artifact("README.md").scan(%r{#{Regexp.escape(base)}/[^\s)"'`]*}).uniq
+    refute_empty urls, "Expected the README to link the release's downloads under #{base}/."
+    assets = attached_release_assets
+    bad = urls.reject do |u|
+      m = u.match(%r{\A#{Regexp.escape(base)}/(?:latest/download|download/v\d+\.\d+\.\d+)/([^/]+)\z})
+      m && assets.include?(m[1])
+    end
+    assert bad.empty?, "Expected every release URL in the README to be #{base}/latest/download/<asset> or #{base}/download/v<x.y.z>/<asset>, with <asset> one the release workflow attaches (#{assets.join(", ")}); these are not: #{bad.join(", ")}."
   end
 
   def assert_installer_documentation

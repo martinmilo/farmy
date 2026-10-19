@@ -480,12 +480,35 @@ module Farmy
     false
   end
 
+  # A test that needs a real Docker calls this first. Where none answers it is skipped, or fails with
+  # REQUIRE_DOCKER=1 (a machine there to run these tests). Every container it starts is removed through
+  # Docker after it (docker rm -f), so their shims and init processes end through Docker, never by the
+  # leak check's kill.
+  def require_real_docker(what = "a real Docker")
+    unless real_docker?
+      flunk "REQUIRE_DOCKER=1, and this test needs #{what}, but no real Docker answers here (docker info fails or is the fake's)." if ENV["REQUIRE_DOCKER"] == "1"
+      skip "needs #{what} (docker info answers 'fake' here, or no daemon answers); REQUIRE_DOCKER=1 makes this a failure"
+    end
+    @real_containers_before ||= real_container_ids
+  end
+
+  def real_docker_test? = !@real_containers_before.nil?
+
+  def real_container_ids = real_docker("ps", "-aq", "--no-trunc").split
+
+  def remove_real_containers_started
+    return unless real_docker_test?
+    started = real_container_ids - @real_containers_before
+    real_docker("rm", "-f", *started) unless started.empty?
+  end
+
   def real_docker(*args)
     out, = Open3.capture2e({ "PATH" => ENV.fetch("PATH").split(":").reject { |p| p == FAKES }.join(":") }, "docker", *args)
     out
   end
 
   def after_teardown
+    remove_real_containers_started
     super
     if @scratch
       # A killed fake container cannot restore chmod-based read-only mounts in ensure.

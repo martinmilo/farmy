@@ -25,4 +25,22 @@ class DocsTest < AcceptanceTest
     assert_guide_says "docs/worked-example.md", "Keychain", "--client-id-from", "Headscale", "login_server", ":2222", "encoding: base64", "example.com"
     refute_work_file "docs/first-run.md"
   end
+
+  test "the factory guide shows how to pin the model, the effort and the CLI version through the agent entry, with Codex's flags and Claude's effort variable, and points at the run record" do
+    assert_guide_says "docs/factory.md", "codex exec -m ", "-c model_reasoning_effort=", "CODEX_RELEASE=0.163.0",
+                      "CLAUDE_CODE_EFFORT_LEVEL", "agent_version", "farmy rebuild"
+  end
+
+  test "the factory guide names no Codex reasoning-effort flag, since Codex 0.163.0 has none" do
+    refute_guide_says "docs/factory.md", "--reasoning-effort", "--model-reasoning-effort"
+  end
+
+  test "the factory guide's Codex pin is a farmy.yml agent entry that farmy accepts as written" do
+    write_file "farmy.yml", guide_yaml_block("docs/factory.md", holding: "CODEX_RELEASE=0.163.0")
+
+    farmy "agents"
+
+    assert_success
+    assert_stdout(/^codex\s+on\s/)
+  end
 end

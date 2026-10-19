@@ -25,7 +25,8 @@ FileUtils.mkdir_p(destination)
 {"farmy" => "farmy", "install" => "bin/install"}.each do |name, template|
   text = File.read(File.join(root, template))
   {"FARMY_SHIM_VERSION" => version, "FARMY_DEFAULT_REGISTRY" => registry,
-   "FARMY_DEFAULT_SOURCE" => source, "FARMY_DEFAULT_GITHUB" => github}.each do |key, value|
+   "FARMY_DEFAULT_SOURCE" => source, "FARMY_DEFAULT_GITHUB" => github,
+   "FARMY_RELEASE_VERSION" => version}.each do |key, value|
     text = text.gsub(/^#{key}=.*$/, "#{key}='#{value}'")
   end
   File.write(File.join(destination, name), text)

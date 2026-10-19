@@ -10,6 +10,7 @@
 #   refute_sidecar_joins · assert_run_git_config "git", "core.sshCommand", /nc -X 5/
 #   checkout_owned_by 0 · assert_run_user "git", 1001 · assert_volume_owner "shop-run-<id>", 1001 · run_git_log
 #   factory_service model: :token, egress: true   Claude through its token (no anthropic route), with mesh egress
+#   factory_service model: :token, token: "sk-ant-oat01-…"   the values given to start: token, api_key, authkey (defaults fixed)
 #   run_networks "agent"                the networks the role's containers were on
 #   agent_plays {writes: {"src/app.txt" => "fixed\n"}}, {says: "done", exit: 1}, {idle: 5}   what the agent does, iteration by iteration
 #   factory_start task: "…", wait: true   farmy factory start shop --task … [--wait]
@@ -23,10 +24,24 @@
 #   agent_prompts                       what each agent was given as its prompt (stdin, else its last word)
 #   fail_role "test"                    Docker refuses to start that role's containers
 #   wait_for_agent · kill_controller id the detached controller: wait until an agent runs; kill it and its children
+#   agent_record 1                      iteration 1's iteration-1.agent.json of the last run, parsed
+#   run_record_text "iteration-1.prompt.md"   a file of the last run's folder, as written
+#   run_state                           the last run's state.json, parsed
+#   run_agent_config                    its agent_config: the agent entry the run used, resolved
+#   assert_run_keeps_no_version         its state.json has agent_version, and it is null
+#   image_id_of "farmy/shop:dev"        the id docker image inspect gives that image (sha256:…)
+#   assert_utc_timestamp value, "started"   RFC 3339 in UTC, 2026-10-18T20:16:05Z
+#   refute_in_run_folder value          no file of the last run's folder holds the value
+#   agent_version_prints "2.1.40 (Claude Code)" · agent_version_fails · agent_version_denied · agent_version_hangs   what the run's version container answers
+#   assert_version_unknown_because "126", "Permission denied"   agent_version unknown, the reason giving the exit code and the last stderr line
+#   assert_recorded_command_is_exactly_the_agents_docker_call 1   the record's command is, word for word, the docker run of that agent (docker's call log)
+#   assert_version_asked_once_with "claude --version"   one version container: farmy/shop:dev, user dev, --network none, that line
+#   mytool_agent(version: "mytool --version", factory_login: "{path: .mytool, create: …}")   farmy.yml lines for an agent of your own, mytool: headless on stdin, Claude's token as its token_env
 module Factory
   def factory_service(protects: ["test/"], hidden: nil, writes: nil, max_iterations: 3, iteration_timeout: "30m", agent: "claude", test: "test",
                       check: "grep -q fixed src/app.txt\n", files: {}, gate: nil, sidecar: false, model: :api, egress: false,
-                      profiles: nil, commands: {}, extra_config: "")
+                      profiles: nil, commands: {}, extra_config: "",
+                      token: "sk-ant-oat01-9f2c", api_key: "sk-ant-api03-4f9e", authkey: "tskey-auth-k9f2c1e5d7b")
     settings
     remote_repository "acme/shop", **{ "src/app.txt" => "broken\n", "test/check.sh" => check, "README.md" => "# shop\n" }.merge(files)
     block = { "base" => "main", "agent" => agent, "writes" => writes, "protects" => protects, "hidden" => hidden,
@@ -45,8 +60,8 @@ module Factory
     yml << "egress:\n  authkey: TS_AUTHKEY\n" if egress
     yml << extra_config
     write_file "farmy.yml", yml
-    values = { "ANTHROPIC_API_KEY" => (api_mode ? "sk-ant-api03-4f9e" : nil), "CLAUDE_CODE_OAUTH_TOKEN" => (token_mode ? "sk-ant-oat01-9f2c" : nil),
-               "TS_AUTHKEY" => (egress ? "tskey-auth-k9f2c1e5d7b" : nil) }.compact
+    values = { "ANTHROPIC_API_KEY" => (api_mode ? api_key : nil), "CLAUDE_CODE_OAUTH_TOKEN" => (token_mode ? token : nil),
+               "TS_AUTHKEY" => (egress ? authkey : nil) }.compact
     note_situation "The service definition uses named factory profiles:\n#{read_file("services/shop.yml")}" if profiles
     farmy "start", "shop", stdin: values.map { |k, v| "#{k}=#{v}\n" }.join
     assert finished.exit.zero?, "Expected farmy start shop to succeed with factory: in its definition (the run clones its checkout), and it did not.#{transcript}"
@@ -224,11 +239,114 @@ module Factory
     note_situation "The controller of #{id} was killed."
   end
 
+  def agent_record(iteration)
+    JSON.parse(run_record_text("iteration-#{iteration}.agent.json"))
+  rescue JSON::ParserError => e
+    flunk "Expected iteration-#{iteration}.agent.json in the run's folder to be a JSON object; it does not parse (#{e.message}).#{transcript}"
+  end
+
+  def run_record_text(name)
+    folder = File.join(dir, ".work", "shop", "runs", run_id.to_s)
+    file = File.join(folder, name)
+    have = Dir.exist?(folder) ? Dir.children(folder).sort.join(", ") : "no folder .work/shop/runs/#{run_id}"
+    assert File.file?(file), "Expected #{name} in the run's folder .work/shop/runs/#{run_id}/; it has: #{have}.#{transcript}"
+    File.read(file)
+  end
+
+  def run_state = JSON.parse(run_record_text("state.json"))
+
+  def run_agent_config
+    config = run_state["agent_config"]
+    assert config.is_a?(Hash), "Expected state.json to keep agent_config, the agent entry the run used (catalogue entry with farmy.yml's overrides, plus its name), next to profile_config; it has: #{run_state.keys.sort.join(", ")}.#{transcript}"
+    config
+  end
+
+  def assert_run_keeps_no_version
+    assert run_state.key?("agent_version"), "Expected state.json to have agent_version (null when the agent has no version command, or the command succeeded and printed nothing); it has: #{run_state.keys.sort.join(", ")}.#{transcript}"
+    assert_nil run_state["agent_version"], "Expected agent_version null in state.json."
+  end
+
+  def image_id_of(tag) = "sha256:#{Digest::SHA256.hexdigest(tag)}"
+
+  def assert_utc_timestamp(value, what)
+    assert value.to_s.match?(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/), "Expected #{what} as RFC 3339 in UTC (2026-10-18T20:16:05Z); it is #{value.inspect}.#{transcript}"
+  end
+
+  def refute_in_run_folder(value)
+    folder = File.join(dir, ".work", "shop", "runs", run_id.to_s)
+    holding = Dir.glob(File.join(folder, "**", "*"), File::FNM_DOTMATCH).select { |f| File.file?(f) && File.read(f).include?(value) }
+    assert holding.empty?, "Expected #{value.inspect} in no file of the run's folder; it is in #{holding.map { |f| File.basename(f) }.join(", ")}.#{transcript}"
+  end
+
+  def agent_version_prints(text)
+    change_docker_state { |s| (s["agent_version_prints"] ||= {})["shop"] = text }
+    note_situation "The CLI in shop's image prints #{text.inspect} when asked its version."
+  end
+
+  def agent_version_hangs
+    change_docker_state { |s| (s["agent_version_hangs"] ||= []) << "shop" }
+    note_situation "The version command in shop's image never answers: it runs silent until stopped (or 120 s)."
+  end
+
+  def agent_version_fails
+    change_docker_state { |s| (s["agent_version_fails"] ||= []) << "shop" }
+    note_situation "The version command fails in shop's image: sh says the command is not found, exit 127."
+  end
+
+  def agent_version_denied
+    change_docker_state { |s| (s["agent_version_denied"] ||= []) << "shop" }
+    note_situation "The CLI in shop's image cannot be executed by dev: sh says Permission denied, exit 126."
+  end
+
+  def assert_version_unknown_because(*words)
+    assert_equal "unknown", run_state["agent_version"], "Expected agent_version \"unknown\" in state.json when the version command failed.#{transcript}"
+    reason = run_state["agent_version_reason"].to_s
+    words.each { |w| assert_includes reason, w, "Expected agent_version_reason in state.json to give the version command's exit code and the last line it wrote to stderr (here #{words.join(", ")}); it is #{run_state["agent_version_reason"].inspect}.#{transcript}" }
+  end
+
+  def assert_recorded_command_is_exactly_the_agents_docker_call(iteration)
+    run = run_containers("agent").find { |r| r["name"].to_s.end_with?("-agent-#{iteration}") } or flunk("Expected an agent container for iteration #{iteration}.#{transcript}")
+    calls = docker_call_words
+    call = calls.find { |w| w.first == "run" && w.each_cons(2).include?(["--name", run["name"]]) } or flunk("Expected a docker run naming #{run["name"]} in docker's call log.#{transcript}")
+    command = agent_record(iteration)["command"]
+    assert_equal ["docker"] + call, command, "Expected iteration-#{iteration}.agent.json's command to be, word for word, the docker run farmy made for #{run["name"]}, starting \"docker\", \"run\" (no secret's value is on it to replace)."
+  end
+  
+  def assert_version_asked_once_with(line)
+    runs = run_containers("version")
+    assert runs.size == 1, "Expected one container labelled farmy.role=version in the run, asking the CLI's version; there are #{runs.size}.\n\n#{docker_situation}#{transcript}"
+    r = runs.first
+    assert_equal "farmy/shop:dev", r["image"], "Expected the version container to run the service image."
+    assert_equal ["none"], Array(r["networks"]), "Expected the version container without a network (--network none)."
+    assert_equal "dev", r["user"].to_s.split(":").first, "Expected the version container to run as dev (-u dev)."
+    assert Array(r["process"]).include?(line), "Expected the version container to run #{line.inspect} (sh -c #{line}); its process is #{Array(r["process"]).inspect}.#{transcript}"
+  end
+
+  def mytool_agent(version: nil, factory_login: nil)
+    "agents:\n  mytool:\n    install: null\n    login: null\n    headless_login: null\n" \
+      "    headless: {command: mytool run --yes, prompt: stdin}\n    token_env: CLAUDE_CODE_OAUTH_TOKEN\n" \
+      "    api_hosts: ['api.mytool.example:443']\n#{version ? "    version: #{version}\n" : ""}#{factory_login ? "    factory_login: #{factory_login}\n" : ""}"
+  end
+
   def after_teardown
     Array(@run_ids).compact.each { |id| `pgrep -f "factory run #{id}"`.split.each { |pid| (Process.kill("KILL", -Process.getpgid(pid.to_i)) rescue nil) } }
     super
   end
 
+  # Every docker call in the call log, as its words (a call whose words hold a newline spans several lines).
+  def docker_call_words
+    buffer = nil
+    File.readlines(File.join(docker_journal, "calls.log"), chomp: true).each_with_object([]) do |line, calls|
+      buffer = buffer ? "#{buffer}\n#{line}" : line
+      begin
+        calls << Shellwords.split(buffer)
+        buffer = nil
+      rescue ArgumentError
+        next
+      end
+    end
+  end
+  
   private
 
   def volume_folder(name) = File.join(docker_journal, "volumes", name)

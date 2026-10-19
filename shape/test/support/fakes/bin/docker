@@ -65,6 +65,9 @@ def finish_fake_run(record, status)
   acquire_fake_state unless $state_locked
   current = $state["runs"].find { |r| r["seq"] == record["seq"] }
   current["exit"] = status if current
+  if record["registered"] && (c = containers[record["name"]]) && c["started_seq"]
+    c["rm"] ? containers.delete(record["name"]) : c["state"] = "exited"
+  end
   status
 end
 
@@ -308,6 +311,12 @@ def set_state(argv, state, verb)
   opts, names = parse(argv, valued: %w[t time s signal])
   names.each do |name|
     c = find_container(name) or fail_with("Error response from daemon: No such container: #{name}")
+    # rm_fails: {name => times}: docker rm of that container fails that many times more (-1: always)
+    left = ($state["rm_fails"] || {})[container_name(name)]
+    if verb == "rm" && left && left != 0
+      $state["rm_fails"][container_name(name)] = left - 1 if left > 0
+      fail_with("Error response from daemon: cannot remove container \"/#{name}\": could not kill: permission denied")
+    end
     if verb == "rm" && c["state"] == "running" && !flag?(opts, "f", "force")
       fail_with("Error response from daemon: cannot remove container \"#{name}\": container is running: stop the container before removing or force remove")
     end
@@ -326,7 +335,7 @@ def cmd_exec(argv)
   c = find_container(name.to_s) or fail_with("Error response from daemon: No such container: #{name}")
   fail_with("Error response from daemon: container #{name} is not running") unless c["state"] == "running"
   stdin = flag?(opts, "i", "interactive") && !$stdin.tty? ? $stdin.read(65_536).to_s : nil
-  $state["execs"] << { "container" => container_name(name), "command" => command, "user" => value(opts, "u", "user"), "env" => values(opts, "e", "env").to_h { |e| e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s] },
+  $state["execs"] << { "container" => container_name(name), "command" => command, "user" => value(opts, "u", "user"), "env" => run_env(opts).first,
                        "workdir" => value(opts, "w", "workdir"), "stdin" => stdin, "seq" => next_seq }
   unlock_names(value(opts, "w", "workdir")) if command == %w[farmy unlock-names]
   unlock_names(value(opts, "w", "workdir"), missing: held_names(container_name(name))) if command == %w[farmy unlock-names --missing]
@@ -618,7 +627,55 @@ def factory_play(role, opts, process, record)
     record["exit"] = 128
     exit 128
   end
+  return play_version(opts, words, record, limit) if role == "version"
+  return play_login(record) if role == "login"
   role == "agent" ? play_agent(opts, mounts, tmpfs, limit, record) : run_for_real(opts, words, mounts, tmpfs, limit, record)
+end
+
+# A factory login: the agent's command logs in (a file in the login volume) and says so, or fails as the test said
+# (login_fails): an expired device code, exit 1.
+def play_login(record)
+  if $state["login_fails"]
+    $stderr.puts "Error: the device code expired before it was confirmed"
+    save_fake_state
+    exit finish_fake_run(record, 1)
+  end
+  Array(record["mounts"]).each do |m|
+    next unless m["name"].to_s.start_with?("farmy-factory-login-")
+    File.write(File.join(volume_dir(m["name"]), "auth.json"), "{\"logged_in\": true}\n")
+  end
+  puts "Successfully logged in"
+  save_fake_state
+  exit finish_fake_run(record, 0)
+end
+
+# The CLI's version, as the test said (agent_version_prints; 1.0.0 when it said nothing), or a command that is
+# not there (agent_version_fails): sh's own words for that, exit 127; or one dev may not execute
+# (agent_version_denied): sh's words, exit 126; or a command that never answers
+# (agent_version_hangs): running, silent, until its time limit (timeout N inside: exit 124), until it is
+# stopped or removed (exit 137), or for 120 s.
+def play_version(opts, words, record, limit = nil)
+  service = values(opts, "label", "l").to_h { |l| l.split("=", 2) }["farmy.service"]
+  if Array($state["agent_version_hangs"]).include?(service)
+    register_running(record, opts)
+    release_fake_state
+    exit finish_fake_run(record, sleep_while_running(record["name"], limit || 120) ? (limit ? 124 : 0) : 137)
+  end
+  if Array($state["agent_version_fails"]).include?(service)
+    line = words.last.to_s.split.first.to_s
+    $stderr.puts "sh: 1: #{line}: not found"
+    save_fake_state
+    exit finish_fake_run(record, 127)
+  end
+  if Array($state["agent_version_denied"]).include?(service)
+    line = words.last.to_s.split.first.to_s
+    $stderr.puts "sh: 1: #{line}: Permission denied"
+    save_fake_state
+    exit finish_fake_run(record, 126)
+  end
+  puts(($state["agent_version_prints"] || {})[service] || "1.0.0")
+  save_fake_state
+  exit finish_fake_run(record, 0)
 end
 
 # A way out: a network made without --internal (or Docker's own bridge); none and internal networks have none.
@@ -673,15 +730,42 @@ def play_agent(opts, mounts, tmpfs, limit, record)
     (play["deletes"] || []).each { |path| FileUtils.rm_f(File.join(dir, path)) }
   end
   print play["says"].to_s
+  $stderr.print play["stderr"].to_s
+  register_running(record, opts)
   release_fake_state
   pipeline_agent_barrier(play, record) if respond_to?(:pipeline_agent_barrier, true)
   idle = play["idle"].to_f
   if limit && idle > limit
-    sleep limit
-    exit finish_fake_run(record, 124)
+    exit finish_fake_run(record, sleep_while_running(record["name"], limit) ? 124 : 137)
   end
-  sleep idle if idle > 0
+  exit finish_fake_run(record, 137) if idle > 0 && !sleep_while_running(record["name"], idle)
   exit finish_fake_run(record, (play["exit"] || 0).to_i)
+end
+
+# A container that plays for a while (an agent, a version command) is listed as running while it plays, as
+# Docker lists it. When its client is killed (the controller dies) it stays running, as with Docker; when
+# it ends, --rm removes it, else it is exited.
+def register_running(record, opts)
+  name = record["name"] or return
+  containers[name] = { "project" => nil, "service" => nil, "image" => record["image"], "command" => record["command"],
+                       "state" => "running", "labels" => record["labels"], "ports" => [], "env" => record["env"], "init" => false,
+                       "volumes" => Array(record["mounts"]), "binds" => [], "networks" => Array(record["networks"]),
+                       "workdir" => nil, "started_seq" => next_seq, "compose_file" => nil, "process" => record["process"],
+                       "aliases" => [], "rm" => flag?(opts, "rm") }
+  record["registered"] = true
+end
+
+# Waits the seconds given, or until the container is stopped or removed (docker stop, kill, rm -f); true when
+# it was still running at the end.
+def sleep_while_running(name, seconds)
+  deadline = Time.now + seconds
+  while Time.now < deadline
+    sleep [0.1, deadline - Time.now].min.clamp(0, 0.1)
+    c = (JSON.parse(File.read(STATE_FILE))["containers"][name] rescue :unreadable)
+    next if c == :unreadable
+    return false unless c && c["state"] == "running"
+  end
+  true
 end
 
 # The names a container can resolve: the containers on the networks it is attached to, by container name,
@@ -739,7 +823,7 @@ def run_for_real(opts, words, mounts, tmpfs, limit, record)
   Array(record["binds"]).each { |m| table[m["target"]] = m["source"] }
   tmpfs.each { |t| table[t["target"]] = File.join(JOURNAL, "tmpfs", "#{next_seq}").tap { |d| FileUtils.mkdir_p(d) } }
   env = git_env.merge("PATH" => ENV["PATH"], "HOME" => File.join(JOURNAL, "home").tap { |d| FileUtils.mkdir_p(d) })
-  values(opts, "e", "env").each { |e| k, v = e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s]; env[k] = map_paths(v, table) }
+  record["env"].each { |k, v| env[k] = map_paths(v.to_s, table) }
   env.merge!(pipeline_real_env(record))
   workdir = value(opts, "w", "workdir")
   cwd = workdir ? map_paths(workdir, table) : JOURNAL
@@ -774,12 +858,33 @@ def run_for_real(opts, words, mounts, tmpfs, limit, record)
   exit finish_fake_run(record, status.to_i)
 end
 
-def cmd_run(argv, start: true, attached: nil)
+# A container's environment, as Docker makes it when the container is made: each --env-file (NAME=value
+# lines; a bare NAME, like -e NAME without a value, takes the value from the docker process's own
+# environment; # comments and blank lines skipped), then -e. Returns [env, files]: what was read, as
+# [{path, mode}], the mode in octal digits ("600") at the moment Docker read the file.
+def run_env(opts)
+  env = {}
+  files = values(opts, "env-file").map do |f|
+    full = File.expand_path(f)
+    fail_with("docker: open #{f}: no such file or directory.") unless File.file?(full)
+    File.readlines(full, chomp: true).each do |line|
+      next if line.strip.empty? || line.lstrip.start_with?("#")
+      k, v = line.include?("=") ? line.split("=", 2) : [line, ENV[line].to_s]
+      env[k] = v
+    end
+    { "path" => full, "mode" => format("%o", File.stat(full).mode & 0o777) }
+  end
+  values(opts, "e", "env").each { |e| k, v = e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s]; env[k] = v }
+  [env, files]
+end
+
+def cmd_run(argv, start: true, attached: nil, made: nil)
   opts, rest = parse(argv, valued: RUN_VALUED, stop_at_first_positional: true)
   image, *command = rest
   name = value(opts, "name")
   name ||= "created-#{next_seq}" unless start
-  env = values(opts, "e", "env").to_h { |e| e.include?("=") ? e.split("=", 2) : [e, ENV[e].to_s] }
+  # made: a container made earlier with docker create keeps the environment it was given then
+  env, env_files = made ? made.values_at("env", "env_files") : run_env(opts)
   volumes_named, binds = split_volumes(run_volume_specs(opts), nil, {})
   built = find_image(image) || {}
   entrypoint = value(opts, "entrypoint") ? [value(opts, "entrypoint")] : (built["entrypoint"] || [])
@@ -789,11 +894,12 @@ def cmd_run(argv, start: true, attached: nil)
   stdin = flag?(opts, "i", "interactive") && !$stdin.tty? ? $stdin.read : nil
   record = { "image" => image, "command" => command, "name" => name, "env" => env, "seq" => next_seq,
              "volumes" => volumes_named.map { |v| v["name"] }, "binds" => binds, "process" => process,
-             "labels" => labels, "networks" => attached || values(opts, "network", "net"), "user" => value(opts, "u", "user"), "stdin" => stdin }
+             "labels" => labels, "networks" => attached || values(opts, "network", "net"), "user" => value(opts, "u", "user"), "stdin" => stdin,
+             "env_files" => env_files }
   volumes_named.each { |v| volumes[v["name"]] ||= { "project" => nil, "labels" => {}, "owner" => "0" } }
   if !start && labels["farmy.role"] && name
     # created now, played when `docker start -a` runs it, on the networks it is attached to by then
-    ($state["created_runs"] ||= {})[name] = argv
+    ($state["created_runs"] ||= {})[name] = { "argv" => argv, "env" => env, "env_files" => env_files }
   else
     $state["runs"] << record
     check_git_container_transport(record, volumes_named)
@@ -1394,7 +1500,7 @@ when "start"
     nets = containers[cname]["networks"]
     containers.delete(cname)
     $state["created_runs"].delete(cname)
-    cmd_run(saved, start: true, attached: nets)
+    cmd_run(saved["argv"], start: true, attached: nets, made: saved)
   else
     set_state(argv, "running", command)
   end

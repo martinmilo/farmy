@@ -220,4 +220,27 @@ class PublishingTest < AcceptanceTest
     assert_public_commit_count 1
     assert_private_history_absent
   end
+
+  test "publication leaves the README's releases/latest/download links as they are" do
+    readme_with_release_links
+
+    publish
+
+    assert_success
+    %w[install SHA256SUMS].each do |asset|
+      assert_includes public_readme, "https://github.com/acme/farmy/releases/latest/download/#{asset}", "Expected the published README to keep the link to the latest release's #{asset} as written (bin/publish rewrites only versioned release links); it reads:\n#{public_readme}"
+    end
+  end
+
+  test "publication rewrites the README's versioned release links to the version it publishes" do
+    readme_with_release_links
+
+    publish
+
+    assert_success
+    %w[install SHA256SUMS].each do |asset|
+      assert_includes public_readme, "https://github.com/acme/farmy/releases/download/v0.1.0/#{asset}", "Expected the published README's versioned #{asset} link to name the published release, v0.1.0; it reads:\n#{public_readme}"
+    end
+    refute_includes public_readme, "v0.0.9", "Expected no link to v0.0.9 left in the published README."
+  end
 end

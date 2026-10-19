@@ -2,14 +2,14 @@ class DistributionTest < AcceptanceTest
   def setup = workspace("workshop")
 
   test "the distribution exposes its single version source as VERSION" do
-    assert_equal "0.1.0", work_file("VERSION").strip
+    assert_equal SHIPPED, work_file("VERSION").strip
   end
 
-  test "the repository starts at version 0.1.0 with a build hash" do
+  test "farmy --version names the shipped version with a build hash" do
     farmy "--version"
 
     assert_success
-    assert_stdout(/\Afarmy 0\.1\.0 \([0-9a-f]{8,}\)\s*\z/)
+    assert_stdout(/\Afarmy #{Regexp.escape(SHIPPED)} \([0-9a-f]{8,}\)\s*\z/)
   end
 
   test "farmy-built service and gate images carry version and hash labels" do
@@ -34,13 +34,13 @@ class DistributionTest < AcceptanceTest
     distribution_shim "init"
 
     assert_success
-    assert_pulled "registry.example.com/acme/farmy-control:0.1.0"
+    assert_pulled "registry.example.com/acme/farmy-control:#{SHIPPED}"
     refute_control_build
     assert_stderr(/pull/i)
   end
 
   test "a failed control pull reports its failure and builds from the available checkout" do
-    fail_pull "control", "0.1.0"
+    fail_pull "control", SHIPPED
 
     distribution_shim "init"
 
@@ -68,11 +68,11 @@ class DistributionTest < AcceptanceTest
     distribution_farmy "start", "shop"
 
     assert_success
-    assert_pulled "registry.example.com/acme/farmy-keys:0.1.0", "registry.example.com/acme/farmy-knowledge:0.1.0", "registry.example.com/acme/farmy-gate:0.1.0"
+    assert_pulled "registry.example.com/acme/farmy-keys:#{SHIPPED}", "registry.example.com/acme/farmy-knowledge:#{SHIPPED}", "registry.example.com/acme/farmy-gate:#{SHIPPED}"
   end
 
   test "an exact matching folder pin permits normal commands" do
-    write_file "farmy.yml", "farmy: 0.1.0\n"
+    write_file "farmy.yml", "farmy: #{SHIPPED}\n"
 
     farmy "status"
 
@@ -106,7 +106,7 @@ class DistributionTest < AcceptanceTest
     farmy "--version"
 
     assert_success
-    assert_stdout "farmy 0.1.0"
+    assert_stdout "farmy #{SHIPPED}"
   end
 
   test "a version range is refused with a reason rather than treated as an exact pin" do
@@ -125,7 +125,7 @@ class DistributionTest < AcceptanceTest
     farmy "status"
 
     assert_success
-    assert_stdout "built by 0.0.9, now 0.1.0: farmy rebuild shop"
+    assert_stdout "built by 0.0.9, now #{SHIPPED}: farmy rebuild shop"
   end
 
   test "JSON status exposes an older toolbox version and outdated flag for the TUI" do
@@ -136,8 +136,8 @@ class DistributionTest < AcceptanceTest
     assert_toolbox_metadata "0.0.9", outdated: true
   end
 
-  ["0.1.0", "0.2.0"].each do |version|
-    test "a toolbox built by #{version} is not marked older than 0.1.0" do
+  [SHIPPED, "0.2.0"].each do |version|
+    test "a toolbox built by #{version} is not marked older than the shipped #{SHIPPED}" do
       toolbox_built_by version
 
       farmy "status", "--json"
@@ -152,7 +152,7 @@ class DistributionTest < AcceptanceTest
 
     distribution_shim "status"
 
-    assert_stderr "0.1.0"
+    assert_stderr SHIPPED
     assert_stderr "0.2.0"
     assert_stderr "farmy update"
   end

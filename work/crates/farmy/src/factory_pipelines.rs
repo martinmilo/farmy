@@ -76,8 +76,8 @@ fn pipeline_main(args: &[String]) -> R {
             let ctx=commands::load_ctx()?;commands::check_services(&ctx,std::slice::from_ref(service),false)?;let def=Definition::load(service)?;
             let cfg=def.pipelines.get(name).cloned().ok_or_else(||format!("services/{service}.yml: unknown pipeline {name}"))?;
             if cfg.steps.is_empty(){return refuse(format!("pipeline {name}: steps must not be empty"));}
-            let mut profiles=BTreeMap::new();for profile in cfg.steps.iter().chain(cfg.on_question.iter()){let p=plan(&ctx,service,Some(profile),None)?;profiles.insert(profile.clone(),p.config);}
-            commands::need_docker()?;if docker::app_cid(service).is_none(){return refuse(format!("{service} is not running — farmy start {service}"));}
+            let mut plans=vec![];let mut profiles=BTreeMap::new();for profile in cfg.steps.iter().chain(cfg.on_question.iter()){let p=plan(&ctx,service,Some(profile),None)?;profiles.insert(profile.clone(),p.config.clone());plans.push(p);}
+            commands::need_docker()?;if docker::app_cid(service).is_none(){return refuse(format!("{service} is not running — farmy start {service}"));}for p in &plans{check_login(p)?;}
             let mut ps=PipelineState{id:format!("p-{}",new_id()),service:service.clone(),name:name.clone(),state:"queued".into(),step:1,steps:cfg.steps.len(),profile:cfg.steps[0].clone(),active_run:None,handoffs:0,handoff_limit:cfg.handoff_limit.unwrap_or(3),task,config:cfg,profiles,definition:Some(serde_yaml::from_str(&std::fs::read_to_string(definition_path(service))?).map_err(|e|e.to_string())?),pending:None,question_run:None,pid:0};save_pipeline(&ps);
             if wait{let controller=crate::locking::Lock::take(&pipeline_lock(&ps))?;let result=drive_pipeline(&ps.id,&controller)?;wait_result("pipeline",&ps.id,&result)}else{spawn_pipeline(&mut ps)?;println!("pipeline {} started",ps.id);Ok(())}
         }
@@ -188,6 +188,7 @@ fn drive_pipeline(id: &str, _controller: &crate::locking::Lock) -> R<String> {
                 | "agent_failed"
                 | "timeout"
                 | "stalled"
+                | "login_blocked"
         ) {
             p.pid = 0;
             save_pipeline(&p);

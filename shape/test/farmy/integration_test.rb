@@ -2,7 +2,7 @@
 # wherever `docker info` is the fake's, and run by hand on a machine with Docker: JOBS=1 bin/verify -n /Integration/
 class IntegrationTest < AcceptanceTest
   def setup
-    skip "needs a real Docker (docker info answers 'fake' here)" unless real_docker?
+    require_real_docker
     workspace "workshop"
   end
 

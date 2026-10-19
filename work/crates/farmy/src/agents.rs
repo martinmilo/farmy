@@ -3,12 +3,12 @@
 //! another; Claude is one catalogue entry.
 use crate::model::farmy_home;
 use crate::{R, refuse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub(crate) const MODES: [&str; 3] = ["subscription", "api-key", "off"];
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(untagged)]
 pub(crate) enum Install {
     One(String),
@@ -20,7 +20,7 @@ pub(crate) enum Install {
     },
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(untagged)]
 enum OneOrMany {
     One(String),
@@ -28,14 +28,14 @@ enum OneOrMany {
 }
 
 /// An unattended one-shot run (the factory): the command without the prompt, and how the prompt goes in.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Headless {
     pub command: String,
     pub prompt: String, // stdin | argument
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Api {
     pub key: String,
@@ -43,7 +43,54 @@ pub(crate) struct Api {
     pub upstream: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+/// A subscription login of the agent's own for its factory runs (FORMATS.md, "Factory logins"): the folder
+/// under $HOME where the CLI keeps it, and the shell line that makes it without a browser.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FactoryLogin {
+    pub path: String,
+    pub create: String,
+}
+
+impl FactoryLogin {
+    /// The folder in a container: `/home/dev/<path>`.
+    pub(crate) fn target(&self) -> String {
+        let p = self
+            .path
+            .trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/');
+        format!("/home/dev/{p}")
+    }
+
+    /// A folder under $HOME (relative, no `..`) and a line to run; refused naming `factory_login`.
+    pub(crate) fn check(&self, place: &str, name: &str) -> R {
+        let p = self.path.trim();
+        let tidy = p.trim_start_matches("./").trim_end_matches('/');
+        if p.starts_with('/')
+            || p.starts_with('~')
+            || tidy.is_empty()
+            || tidy.split('/').any(|part| part == "..")
+        {
+            return refuse(format!(
+                "{place}: agents.{name}.factory_login: path '{p}' must be a folder under $HOME, relative and without .. (FORMATS.md, Factory logins)"
+            ));
+        }
+        if self.create.trim().is_empty() {
+            return refuse(format!(
+                "{place}: agents.{name}.factory_login: create is empty — the shell line that makes the login without a browser"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The volume holding an agent's factory login: one per agent on this Docker, whatever the service.
+pub(crate) fn factory_login_volume(agent: &str) -> String {
+    format!("farmy-factory-login-{agent}")
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Hooks {
     pub file: String,
@@ -53,7 +100,7 @@ pub(crate) struct Hooks {
 
 /// One entry as written (in the catalogue or in farmy.yml): every field optional, so that an entry in
 /// farmy.yml can override a catalogue entry field by field.
-#[derive(Deserialize, Default, Clone, Debug)]
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Entry {
     #[serde(default)]
@@ -82,6 +129,10 @@ pub(crate) struct Entry {
     process: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    factory_login: Option<FactoryLogin>,
 }
 
 impl Entry {
@@ -100,6 +151,8 @@ impl Entry {
             status_hooks: self.status_hooks.or(base.status_hooks),
             process: self.process.or(base.process),
             mode: self.mode.or(base.mode),
+            version: self.version.or(base.version),
+            factory_login: self.factory_login.or(base.factory_login),
         }
     }
 }
@@ -122,6 +175,9 @@ pub(crate) struct Agent {
     pub status_hooks: Option<Hooks>,
     pub process: String,
     pub mode: String, // the default for every service: subscription | api-key | off
+    pub version: Option<String>, // a shell line that prints the CLI's version
+    pub factory_login: Option<FactoryLogin>, // a login of its own for factory runs in mode: login
+    entry: Entry,     // the entry as resolved, for a run's record
 }
 
 fn paths(v: Option<OneOrMany>) -> Vec<String> {
@@ -134,6 +190,7 @@ fn paths(v: Option<OneOrMany>) -> Vec<String> {
 
 impl Agent {
     pub(crate) fn from_entry(name: &str, e: Entry, place: &str) -> R<Agent> {
+        let entry = e.clone();
         let (install_apt, install_apk) = match e.install {
             None => (None, None),
             Some(Install::One(s)) => (Some(s.clone()), Some(s)),
@@ -144,6 +201,9 @@ impl Agent {
             return refuse(format!(
                 "{place}: agents.{name}.mode must be subscription, api-key or off, not '{mode}'"
             ));
+        }
+        if let Some(login) = &e.factory_login {
+            login.check(place, name)?;
         }
         Ok(Agent {
             name: name.to_string(),
@@ -160,12 +220,28 @@ impl Agent {
             mcp_add: e.mcp_add,
             status_hooks: e.status_hooks,
             process: e.process.unwrap_or_else(|| name.to_string()),
+            version: e.version,
+            factory_login: e.factory_login,
             mode,
+            entry,
         })
     }
 
+    /// The entry as resolved (the catalogue's with farmy.yml's overrides, or one of your own): every
+    /// field, null when unset, with the defaults of `mode` and `process` filled in, plus `name`.
+    pub(crate) fn config(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(&self.entry).unwrap_or_default();
+        if let Some(map) = value.as_object_mut() {
+            map.insert("mode".into(), self.mode.clone().into());
+            map.insert("process".into(), self.process.clone().into());
+            map.insert("name".into(), self.name.clone().into());
+        }
+        value
+    }
+
     /// The line for agents.tsv: name, install per base, login paths (:), state paths (,), mcp_add,
-    /// hooks file, hooks events (Event=state,…), process; an empty column for null.
+    /// hooks file, hooks events (Event=state,…), process, version (the line the toolbox runs as dev once
+    /// the agents are installed); an empty column for null.
     pub(crate) fn tsv_line(&self) -> String {
         let clean = |s: &str| s.replace(['\t', '\n'], " ");
         let hooks_file = self
@@ -197,7 +273,8 @@ impl Agent {
             clean(self.mcp_add.as_deref().unwrap_or("")),
             hooks_file,
             hooks_events,
-            self.process.clone(),
+            clean(&self.process),
+            clean(self.version.as_deref().unwrap_or("")),
         ]
         .join("\t")
     }
@@ -262,7 +339,7 @@ pub(crate) fn resolve(
                 let name = k.as_str().unwrap_or("?");
                 let own: Entry = match v {
                     serde_yaml::Value::Null => Entry::default(),
-                    other => serde_yaml::from_value(other.clone()).map_err(|e| format!("{place}: agents.{name}: {} — the fields are install, login, state, headless_login, token_env, env, api, mcp_add, status_hooks, process, mode (FORMATS.md, Agents)", tidy(e.to_string())))?,
+                    other => serde_yaml::from_value(other.clone()).map_err(|e| format!("{place}: agents.{name}: {} — the fields are install, login, state, headless_login, headless, token_env, env, api, api_hosts, mcp_add, status_hooks, process, mode, version, factory_login (FORMATS.md, Agents)", tidy(e.to_string())))?,
                 };
                 let e = match from_catalogue(name) {
                     Some(base) => own.over(base),
@@ -307,5 +384,41 @@ fn login_kind(path: &str) -> String {
         format!("{p}/")
     } else {
         p.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn login(path: &str) -> FactoryLogin {
+        FactoryLogin {
+            path: path.into(),
+            create: "mytool login --device".into(),
+        }
+    }
+
+    #[test]
+    fn a_factory_login_is_a_folder_under_home_and_nothing_outside_it() {
+        assert_eq!(login(".mytool").target(), "/home/dev/.mytool");
+        assert_eq!(
+            login("./.config/mytool/").target(),
+            "/home/dev/.config/mytool"
+        );
+        assert!(login(".config/mytool").check("farmy.yml", "mytool").is_ok());
+        for bad in [
+            "/etc/mytool",
+            "../../etc/mytool",
+            ".mytool/../..",
+            "~/.mytool",
+            "",
+            "./",
+        ] {
+            let refused = login(bad).check("farmy.yml", "mytool");
+            assert!(
+                matches!(&refused, Err(crate::Fail::Refuse(m)) if m.contains("factory_login")),
+                "{bad:?} must be refused naming factory_login"
+            );
+        }
     }
 }

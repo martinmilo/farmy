@@ -278,7 +278,14 @@ in once, inside any container, with the command `farmy agents` prints (`claude s
 instead: Claude Code's `CLAUDE_CODE_OAUTH_TOKEN` is the token `claude setup-token` prints, valid
 for a year, meant for scripts; stored where the provider finds it under that name, farmy puts it
 into the app container's environment under that name. (Such a token is asked from a provider only,
-never at the prompt, which would ask for it at every start.) Do not `/login` inside a container with
+never at the prompt, which would ask for it at every start.) The value is in no file farmy writes:
+`.work/<name>/compose.yml` names the variable only (`NAME: ${NAME}`), and farmy puts the value into
+the environment of the `docker compose` process, not its own, at every `up` that makes or recreates
+the app container: `start`, `restart`, `rebuild`, and a `start` that reuses the existing compose file
+(the value asked from the provider again, or from the held unlocking values). When the provider does
+not answer it, the file does not name it and the container has no such variable; a `start` whose
+compose file names a different set of tokens than the provider now answers makes the containers
+anew. Do not `/login` inside a container with
 a credential that expires: an unattended session that outlives it stops until someone signs in
 again.
 

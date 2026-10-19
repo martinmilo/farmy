@@ -532,7 +532,7 @@ module ToolboxAndDotfiles
   end
 
   def real_toolbox_workspace
-    skip "needs a real Docker daemon; Docker is unavailable or only the fake answers" unless real_docker?
+    require_real_docker "a real Docker daemon"
     toolbox_workspace
   end
 

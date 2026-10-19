@@ -3,24 +3,24 @@ class ReleaseTest < AcceptanceTest
     release_distribution
 
     assert_success
-    assert_release_builds "0.1.0"
+    assert_release_builds SHIPPED
   end
 
   test "release accepts a self-hosted registry with a port instead of a built-in registry" do
     release_distribution registry: "forgejo.example.com:3000/ops"
 
     assert_success
-    assert_release_builds "0.1.0", registry: "forgejo.example.com:3000/ops"
+    assert_release_builds SHIPPED, registry: "forgejo.example.com:3000/ops"
   end
 
   test "release without FARMY_REGISTRY publishes to the configured default GHCR namespace" do
     release_distribution registry: ""
 
     assert_success
-    assert_default_release_builds "0.1.0"
+    assert_default_release_builds SHIPPED
   end
 
-  ["0.x", "v0.1.0", "0.1.0;touch marker", "0.2.0"].each do |version|
+  ["0.x", "v#{SHIPPED}", "#{SHIPPED};touch marker", "0.2.0"].each do |version|
     test "release version #{version} is refused because it is invalid or differs from repository VERSION" do
       release_distribution version
 

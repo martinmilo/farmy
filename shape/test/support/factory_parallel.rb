@@ -152,8 +152,8 @@ module FactoryPipelines
     assert_equal ["developer"], JSON.parse(File.read(path))["values"], "Expected the developer's database rows never to be used or removed by a gate.#{transcript}"
   end
 
-  def wait_run(id, result:)
-    deadline = Time.now + 45
+  def wait_run(id, result:, within: 45)
+    deadline = Time.now + within
     loop do
       farmy "status", "--json"
       run = service_json("shop").fetch("runs", []).find { |item| item["id"] == id }

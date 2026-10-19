@@ -13,7 +13,8 @@ pub(crate) struct Inputs<'a> {
     pub cfg: &'a Config,
     pub routes: &'a [&'a Route],
     pub agents: &'a str, // the agents on for this service, space-separated (FARMY_AGENTS); empty: none
-    pub agent_env: &'a [(String, String)], // what the agents put into the environment (a token, api variables, their env:)
+    pub agent_env: &'a [(String, String)], // what the agents put into the environment (api variables, their env:)
+    pub tokens: &'a [String], // the agents' tokens, by name only: their values reach docker compose's environment
     pub blocked: &'a [String], // variables no route may set here (an agent's api variables in subscription mode)
     pub proxy_env: &'a [(String, String)], // the mesh egress proxy variables; empty without egress:
     pub toolbox_hash: &'a str,
@@ -43,6 +44,28 @@ fn map(pairs: Vec<(&str, Value)>) -> Value {
 
 fn list(items: &[String]) -> Value {
     Value::Sequence(items.iter().map(|i| s(i)).collect())
+}
+
+/// The variables the app's environment in a compose file names without a value (`NAME: ${NAME}`):
+/// the agents' tokens, whose values come from the environment of `docker compose`.
+pub(crate) fn named_variables(text: &str) -> Vec<String> {
+    let Ok(doc) = serde_yaml::from_str::<Value>(text) else {
+        return vec![];
+    };
+    let Some(env) = doc
+        .get("services")
+        .and_then(|v| v.get("app"))
+        .and_then(|v| v.get("environment"))
+        .and_then(Value::as_mapping)
+    else {
+        return vec![];
+    };
+    env.iter()
+        .filter_map(|(k, v)| {
+            let k = k.as_str()?;
+            (v.as_str()? == format!("${{{k}}}")).then(|| k.to_string())
+        })
+        .collect()
 }
 
 /// `$` → `$$`: compose would interpolate it otherwise.
@@ -173,7 +196,12 @@ pub(crate) fn generate(i: &Inputs<'_>, resolve: &dyn Fn(&str) -> (String, Vec<u3
             env.push(("FARMY_MCP_URL".into(), s("http://farmy-knowledge:9190/mcp")));
         }
         for (k, v) in i.agent_env {
-            env.push((k.clone(), lit(v))); // a token here is the one documented exception (FORMATS.md, Agents)
+            env.push((k.clone(), lit(v)));
+        }
+        // a token is the one documented exception (FORMATS.md, Agents): the file names it, and compose
+        // takes its value from its own environment, which farmy gives at every up
+        for t in i.tokens {
+            env.push((t.clone(), s(&format!("${{{t}}}"))));
         }
     }
     // An agent's api variables outrank its login: in subscription mode no route may set them.
@@ -566,6 +594,18 @@ fn on_network(service: &mut Value, net: &str) {
         _ => {
             m.insert(key, Value::Sequence(vec![s("default"), s(net)]));
         }
+    }
+}
+
+#[cfg(test)]
+mod named_variables_tests {
+    use super::named_variables;
+
+    #[test]
+    fn only_the_app_variables_named_by_themselves_count() {
+        let text = "services:\n  app:\n    environment:\n      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}\n      OTHER: ${ELSEWHERE}\n      PRICE: $$5\n      PLAIN: value\n  db:\n    environment:\n      DB_TOKEN: ${DB_TOKEN}\n";
+        assert_eq!(named_variables(text), vec!["CLAUDE_CODE_OAUTH_TOKEN"]);
+        assert!(named_variables("not: [yaml").is_empty());
     }
 }
 

@@ -2,7 +2,11 @@
 # page cited above the entry on 2026-10-14; a field the vendor does not document is null, never a guess.
 # farmy.yml agents: takes an entry as it is ({}), overrides it field by field, or adds one of your own.
 #
-#   install         a shell line run as root while the toolbox builds; one for both bases, or {apt:, apk:}
+#   install         a shell line run as root while the toolbox builds; one for both bases, or {apt:, apk:}. Every
+#                   catalogue line installs its CLI outside any home directory (/root, /home/…), owned by root and
+#                   executable by all, and none runs as dev; the toolbox then runs version as dev (checked 2026-10-19).
+#                   None pipes a download into a shell: it downloads to a file and runs that, so a failed download fails
+#                   the build at its install step (dash, Debian's sh, has no pipefail).
 #   login           the path(s) under $HOME holding the login, linked into farmy-shared/<name>/ (one login for every container)
 #   state           paths under the first login path that are per service (transcripts, sessions), on <service>-agents
 #   headless_login  how to log in without a browser (farmy agents prints it)
@@ -14,6 +18,14 @@
 #   mcp_add         registers the knowledge MCP, once per login ($FARMY_MCP_URL)
 #   status_hooks    the hooks file and event → state, for farmy status
 #   process         what `docker top` shows while it runs
+#   version         a shell line that prints the CLI's version; a factory run asks it once and keeps what it printed
+#                   (checked 2026-10-18)
+#   factory_login   {path, create}: the folder under $HOME holding a file login of the agent's own for factory runs
+#                   (mode: login), and the line that makes it without a browser; absent unless the vendor documents
+#                   both (checked 2026-10-18)
+#                   Only codex has one: for claude, gemini, opencode, cursor and copilot no vendor page documents a
+#                   browserless command that makes a file login an unattended run then uses (gemini: consumer logins
+#                   ended 2026-06-18)
 
 # Claude Code — https://code.claude.com/docs/en/setup (apt and apk repositories, Alpine 3.19+),
 # https://code.claude.com/docs/en/authentication#credential-management (~/.claude/.credentials.json),
@@ -22,6 +34,7 @@
 # https://code.claude.com/docs/en/authentication#authentication-precedence (CLAUDE_CODE_OAUTH_TOKEN),
 # https://code.claude.com/docs/en/llm-gateway-connect (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, api.anthropic.com),
 # https://code.claude.com/docs/en/mcp (claude mcp add --transport http), https://code.claude.com/docs/en/hooks
+# version: https://code.claude.com/docs/en/setup, https://code.claude.com/docs/en/cli-reference (claude --version)
 claude:
   # api_hosts verified 2026-10-15: https://code.claude.com/docs/en/network-config
   api_hosts: ['api.anthropic.com:443', 'claude.ai:443', 'platform.claude.com:443']
@@ -39,19 +52,27 @@ claude:
     file: .claude/settings.json
     events: {SessionStart: idle, UserPromptSubmit: working, Stop: idle, Notification: waiting}
   process: claude
+  version: claude --version
 
 # Codex CLI — https://learn.chatgpt.com/docs/codex/cli and https://github.com/openai/codex/blob/main/docs/install.md
-# (the installer: a static musl build, CODEX_INSTALL_DIR), https://learn.chatgpt.com/docs/auth (~/.codex/auth.json,
+# (the installer: a static musl build, CODEX_INSTALL_DIR), https://chatgpt.com/codex/install.sh (read 2026-10-19: the
+# package goes under ${CODEX_HOME:-$HOME/.codex}/packages/standalone, CODEX_INSTALL_DIR places only the codex link to it,
+# CODEX_RELEASE picks the release, default latest; so CODEX_HOME=/usr/local/lib/codex for the install alone, pinned to
+# 0.163.0, the release the version source below was read at), https://learn.chatgpt.com/docs/auth (~/.codex/auth.json,
 # codex login --device-auth), https://learn.chatgpt.com/docs/config-file/environment-variables (CODEX_HOME holds
 # sessions; CODEX_API_KEY for non-interactive runs only), https://learn.chatgpt.com/docs/config-file/config-advanced
 # (the base URL is openai_base_url in config.toml, no variable: api is null),
 # https://learn.chatgpt.com/docs/extend/mcp?surface=cli (codex mcp add --url), https://learn.chatgpt.com/docs/hooks
 # (~/.codex/hooks.json, SessionStart, UserPromptSubmit, Stop; no Notification event; hooks not managed by a
 # policy are trusted once in /hooks before they run)
+# version: https://raw.githubusercontent.com/openai/codex/rust-v0.163.0/codex-rs/cli/src/main.rs (clap's version attribute on the top-level command: codex --version)
+# factory_login: https://learn.chatgpt.com/docs/auth (auth.json under CODEX_HOME, default ~/.codex, kept in that file when
+# no OS credential store is used; codex login --device-auth, which the account first enables in ChatGPT's security settings;
+# tokens refreshed during use) and https://learn.chatgpt.com/docs/non-interactive-mode (codex exec reuses the saved login)
 codex:
   # api_hosts verified 2026-10-15: https://learn.chatgpt.com/docs/config-file/config-sample ; https://learn.chatgpt.com/docs/app-server ; https://developers.openai.com/api/docs/guides/ip-allowlist
   api_hosts: ['api.openai.com:443', 'chatgpt.com:443', 'auth.openai.com:443']
-  install: curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALL_DIR=/usr/local/bin CODEX_NON_INTERACTIVE=1 sh
+  install: curl -fsSL -o /tmp/codex-install.sh https://chatgpt.com/codex/install.sh && CODEX_HOME=/usr/local/lib/codex CODEX_INSTALL_DIR=/usr/local/bin CODEX_RELEASE=0.163.0 CODEX_NON_INTERACTIVE=1 sh /tmp/codex-install.sh && rm -f /tmp/codex-install.sh && chown -R root:root /usr/local/lib/codex && chmod -R a+rX /usr/local/lib/codex
   login: .codex
   state: [sessions]
   headless_login: codex login --device-auth
@@ -63,6 +84,8 @@ codex:
     file: .codex/hooks.json
     events: {SessionStart: idle, UserPromptSubmit: working, Stop: idle}
   process: codex
+  version: codex --version
+  factory_login: {path: .codex, create: codex login --device-auth}
 
 # Gemini CLI — https://geminicli.com/docs/get-started/installation/ (npm, Node.js 20+),
 # https://geminicli.com/docs/reference/configuration/ (~/.gemini, GEMINI_CLI_HOME, GOOGLE_GEMINI_BASE_URL),
@@ -72,11 +95,12 @@ codex:
 # https://geminicli.com/docs/tools/mcp-server/ (gemini mcp add --transport http), https://geminicli.com/docs/hooks/reference/
 # (SessionStart, BeforeAgent, AfterAgent, Notification). Google ended Gemini CLI for consumer tiers on 2026-06-18;
 # API keys and paid Code Assist go on: https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/
+# version: https://geminicli.com/docs/cli/cli-reference/ (--version, -v: show CLI version number and exit)
 gemini:
   # api_hosts verified 2026-10-15: https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/server.ts ; https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts ; https://developers.google.com/identity/protocols/oauth2/native-app ; https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta
   api_hosts: ['generativelanguage.googleapis.com:443', 'cloudcode-pa.googleapis.com:443', 'oauth2.googleapis.com:443', 'accounts.google.com:443', 'www.googleapis.com:443']
   install:
-    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; }; npm install -g @google/gemini-cli
+    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL -o /tmp/nodesource_setup.sh https://deb.nodesource.com/setup_22.x && bash /tmp/nodesource_setup.sh && rm -f /tmp/nodesource_setup.sh && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; } && npm install -g @google/gemini-cli
     apk: apk add --no-cache nodejs npm && npm install -g @google/gemini-cli
   login: .gemini
   state: ~
@@ -89,6 +113,7 @@ gemini:
     file: .gemini/settings.json
     events: {SessionStart: idle, BeforeAgent: working, AfterAgent: idle, Notification: waiting}
   process: gemini
+  version: gemini --version
 
 # OpenCode — https://opencode.ai/docs/ (npm opencode-ai, musl builds), https://opencode.ai/docs/troubleshooting/
 # (~/.local/share/opencode/auth.json, ~/.config/opencode), https://opencode.ai/docs/cli/ (opencode auth login),
@@ -96,11 +121,12 @@ gemini:
 # only: api is null), https://opencode.ai/docs/mcp-servers/ (the config file; v1's opencode mcp add is interactive),
 # https://opencode.ai/docs/plugins/ (plugins, not command hooks). OpenCode 2 (@opencode/cli) changes the config
 # keys and the credentials store: https://opencode.ai/v2/docs/
+# version: https://opencode.ai/docs/cli/ (global flag --version, -v: print version number)
 opencode:
   # api_hosts verified 2026-10-15: https://opencode.ai/v2/docs/console/models/ (hosted provider; override for others)
   api_hosts: ['opencode.ai:443']
   install:
-    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; }; npm install -g opencode-ai
+    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL -o /tmp/nodesource_setup.sh https://deb.nodesource.com/setup_22.x && bash /tmp/nodesource_setup.sh && rm -f /tmp/nodesource_setup.sh && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; } && npm install -g opencode-ai
     apk: apk add --no-cache nodejs npm && npm install -g opencode-ai
   login: [.local/share/opencode, .config/opencode]
   state: ~
@@ -111,18 +137,23 @@ opencode:
   mcp_add: ~
   status_hooks: ~
   process: opencode
+  version: opencode --version
 
-# Cursor CLI — https://cursor.com/docs/cli/installation (a per-user installer into ~/.local/bin, glibc only: no apk line),
+# Cursor CLI — https://cursor.com/docs/cli/installation (a per-user installer, glibc only: no apk line) and
+# https://cursor.com/install (read 2026-10-19: the CLI under $HOME/.local/share/cursor-agent/versions/<version>, linked
+# from ~/.local/bin/agent and cursor-agent; so it runs as root with HOME=/usr/local/lib/cursor-agent and both commands
+# are linked from /usr/local/bin to the CLI itself),
 # https://cursor.com/docs/cli/reference/configuration (~/.cursor, CURSOR_CONFIG_DIR) and https://cursor.com/docs/cli/changelog
 # (AGENT_CLI_CREDENTIAL_STORE=file keeps the login in a file instead of the OS keychain),
 # https://cursor.com/docs/cli/reference/authentication (NO_OPEN_BROWSER=1 agent login, CURSOR_API_KEY; no API base
 # URL variable: api is null), https://cursor.com/docs/cli/mcp (~/.cursor/mcp.json, no add command),
 # https://cursor.com/docs/hooks (hooks.json in another shape: status by process)
+# version: https://cursor.com/docs/cli/reference/parameters (--version, -v: output the version number)
 cursor:
   # api_hosts verified 2026-10-15: https://cursor.com/docs/enterprise/network-configuration
   api_hosts: ['api2.cursor.sh:443', 'api5.cursor.sh:443', '*.api5.cursor.sh:443', 'authenticate.cursor.sh:443', 'authenticator.cursor.sh:443', 'prod.authentication.cursor.sh:443', 'authentication.cursor.sh:443']
   install:
-    apt: su dev -c 'curl https://cursor.com/install -fsS | bash'
+    apt: curl -fsS -o /tmp/cursor-install.sh https://cursor.com/install && HOME=/usr/local/lib/cursor-agent bash /tmp/cursor-install.sh && rm -f /tmp/cursor-install.sh && chown -R root:root /usr/local/lib/cursor-agent && chmod -R a+rX /usr/local/lib/cursor-agent && ln -sf "$(readlink -f /usr/local/lib/cursor-agent/.local/bin/agent)" /usr/local/bin/agent && ln -sf "$(readlink -f /usr/local/lib/cursor-agent/.local/bin/agent)" /usr/local/bin/cursor-agent
     apk: ~
   login: [.cursor, .config/cursor]
   state: ~
@@ -134,6 +165,7 @@ cursor:
   mcp_add: ~
   status_hooks: ~
   process: cursor-agent
+  version: agent --version
 
 # GitHub Copilot CLI — https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli (npm @github/copilot, Node.js 22+,
 # a musl package), https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference (~/.copilot, COPILOT_HOME),
@@ -141,12 +173,13 @@ cursor:
 # COPILOT_GITHUB_TOKEN), https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models (BYOK variables,
 # no default upstream: api is null), https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers
 # (copilot mcp add --transport http), https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-hooks-reference
-# (hooks in another shape: status by process)
+# (hooks in another shape: status by process), https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference
+# (version: --version, -v: show version information; `copilot version` also checks for updates)
 copilot:
   # api_hosts verified 2026-10-15: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
   api_hosts: ['github.com:443', 'api.github.com:443', '*.githubcopilot.com:443', 'copilot-proxy.githubusercontent.com:443', 'origin-tracker.githubusercontent.com:443']
   install:
-    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; }; npm install -g @github/copilot
+    apt: command -v npm >/dev/null 2>&1 || { curl -fsSL -o /tmp/nodesource_setup.sh https://deb.nodesource.com/setup_22.x && bash /tmp/nodesource_setup.sh && rm -f /tmp/nodesource_setup.sh && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*; } && npm install -g @github/copilot
     apk: apk add --no-cache nodejs npm && npm install -g @github/copilot
   login: .copilot
   state: ~
@@ -157,3 +190,4 @@ copilot:
   mcp_add: copilot mcp add --transport http farmy "$FARMY_MCP_URL"
   status_hooks: ~
   process: copilot
+  version: copilot --version

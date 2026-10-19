@@ -12,7 +12,7 @@ class PublishingDefaultsTest < AcceptanceTest
   test "the installer without a registry override pulls the configured default GHCR control image" do
     default_published_distribution
 
-    install_distribution version: "0.1.0", env: { "FARMY_REGISTRY" => "" }
+    install_distribution version: SHIPPED, env: { "FARMY_REGISTRY" => "" }
 
     assert_success
     assert_default_images_pulled "control"
