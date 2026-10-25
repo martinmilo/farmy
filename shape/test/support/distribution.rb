@@ -4,7 +4,7 @@ module Distribution
   REGISTRY = "registry.example.com/acme"
   RELEASE_HASH = "1234567890abcdef1234567890abcdef12345678"
   # The version this checkout ships (work/VERSION), set by the owner for each release.
-  SHIPPED = "0.1.1"
+  SHIPPED = "0.2.0"
 
   def published_release(version = SHIPPED, latest: true, format: 1, registry: REGISTRY)
     artifact = version == SHIPPED ? work_file("farmy") : "#!/bin/sh\ncase \"$1\" in --version) echo 'farmy #{version} (#{RELEASE_HASH})';; *) echo 'release #{version}';; esac\n"
@@ -157,7 +157,7 @@ module Distribution
   def newer_running_control
     shim "init"
     assert_success
-    change_docker_state { |s| s["images"].fetch(s["containers"].fetch("farmy").fetch("image"))["labels"]["farmy.version"] = "0.2.0" }
+    change_docker_state { |s| s["images"].fetch(s["containers"].fetch("farmy").fetch("image"))["labels"]["farmy.version"] = "0.3.0" }
   end
 
   def formatted_file(kind, format)

@@ -21,13 +21,13 @@ This installs the latest release's farmy into `~/.local/bin` and, if that folder
 `PATH`, ends by printing the `export PATH=…` line to add.
 
 To verify the installer first, download the
-[install script](https://github.com/martinmilo/farmy/releases/download/v0.1.1/install) and
-[SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.1.1/SHA256SUMS) from the
+[install script](https://github.com/martinmilo/farmy/releases/download/v0.2.0/install) and
+[SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.2.0/SHA256SUMS) from the
 same GitHub release, check the exact downloaded bytes, then run it:
 
 ```sh
-curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.1.1/install
-curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.1.1/SHA256SUMS
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.2.0/install
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.2.0/SHA256SUMS
 shasum -a 256 --check SHA256SUMS   # macOS
 sha256sum --check SHA256SUMS       # Linux
 sh ./install

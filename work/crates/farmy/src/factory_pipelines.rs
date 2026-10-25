@@ -554,7 +554,7 @@ fn retry_publish(id: &str) -> R {
         ctx: &ctx,
         p: &p,
         id: st.id.clone(),
-        git_n: 2000000,
+        git_n: 2000000.into(),
         made: vec![],
         broker: false,
         egress_gate: false,

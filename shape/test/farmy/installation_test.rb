@@ -12,14 +12,14 @@ class InstallationTest < AcceptanceTest
   end
 
   test "installation without a version resolves the stable latest control label" do
-    published_release "0.2.0"
+    published_release "0.3.0"
 
     install_distribution
 
     assert_success
     assert_installed_only_shim
     distribution_shim "--version"
-    assert_stdout "farmy 0.2.0"
+    assert_stdout "farmy 0.3.0"
   end
 
   test "an installed shim runs outside the checkout using its remembered registry" do
@@ -56,43 +56,43 @@ class InstallationTest < AcceptanceTest
 
   test "an unpinned update pulls every newest release image and replaces the installed shim" do
     installed_distribution
-    published_release "0.2.0"
+    published_release "0.3.0"
 
     distribution_shim "update"
 
     assert_success
-    assert_release_pulled "0.2.0"
+    assert_release_pulled "0.3.0"
     distribution_shim "--version"
-    assert_stdout "farmy 0.2.0"
+    assert_stdout "farmy 0.3.0"
   end
 
   test "an explicit update target overrides latest and fixes an existing folder mismatch" do
     installed_distribution
-    published_release "0.2.0", latest: false
-    published_release "0.3.0"
-    write_file "farmy.yml", "farmy: 0.2.0\n"
+    published_release "0.3.0", latest: false
+    published_release "0.4.0"
+    write_file "farmy.yml", "farmy: 0.3.0\n"
 
-    distribution_shim "update", "--to", "0.2.0"
+    distribution_shim "update", "--to", "0.3.0"
 
     assert_success
-    assert_release_pulled "0.2.0"
+    assert_release_pulled "0.3.0"
     assert_unchanged "farmy.yml"
     distribution_shim "--version"
-    assert_stdout "farmy 0.2.0"
+    assert_stdout "farmy 0.3.0"
   end
 
   test "update without a target respects an exact folder pin instead of latest" do
     installed_distribution
-    published_release "0.2.0", latest: false
-    published_release "0.3.0"
-    write_file "farmy.yml", "farmy: 0.2.0\n"
+    published_release "0.3.0", latest: false
+    published_release "0.4.0"
+    write_file "farmy.yml", "farmy: 0.3.0\n"
 
     distribution_shim "update"
 
     assert_success
-    assert_release_pulled "0.2.0"
+    assert_release_pulled "0.3.0"
     distribution_shim "--version"
-    assert_stdout "farmy 0.2.0"
+    assert_stdout "farmy 0.3.0"
   end
 
   test "a failed helper-image update preserves the installed shim and all running containers" do
@@ -100,13 +100,13 @@ class InstallationTest < AcceptanceTest
     distribution_shim "init"
     remember_container_starts
     remember_installed_shim
-    published_release "0.2.0"
-    fail_pull "gate", "0.2.0"
+    published_release "0.3.0"
+    fail_pull "gate", "0.3.0"
 
     distribution_shim "update"
 
     assert_failure
-    assert_stderr "farmy-gate:0.2.0"
+    assert_stderr "farmy-gate:0.3.0"
     assert_installed_shim_unchanged
     assert_no_container_restarted
   end
@@ -114,8 +114,8 @@ class InstallationTest < AcceptanceTest
   test "a failed shim extraction preserves the installed executable" do
     installed_distribution
     remember_installed_shim
-    published_release "0.2.0"
-    missing_shim_artifact "0.2.0"
+    published_release "0.3.0"
+    missing_shim_artifact "0.3.0"
 
     distribution_shim "update"
 

@@ -11,7 +11,7 @@ run the service's own commands, from any terminal that can reach the machine.
 > [docs/architecture.md](docs/architecture.md) for images, containers and volumes,
 > [docs/credentials.md](docs/credentials.md) for keys and secrets,
 > [docs/farmy-mcp.md](docs/farmy-mcp.md) for what an agent knows inside a container,
-> [docs/factory.md](docs/factory.md) for factory profiles, gates, reviews and questions,
+> [docs/factory.md](docs/factory.md) for factory profiles, gates, on-demand verify, reviews and questions,
 > [docs/mesh-egress.md](docs/mesh-egress.md) for enforced egress and a private mesh,
 > [docs/distribution.md](docs/distribution.md) for installation, releases and compatibility,
 > [docs/editor-integration.md](docs/editor-integration.md) for editors, and

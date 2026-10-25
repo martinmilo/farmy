@@ -19,6 +19,7 @@ require_relative "../distribution"
 require_relative "../pipelines"
 require_relative "../toolbox"
 require_relative "../git_transport"
+require_relative "../agent_steps"
 
 # Files are read as UTF-8 whatever locale the machine has, as the kit reads the program's output.
 Encoding.default_external = Encoding::UTF_8
@@ -64,7 +65,10 @@ end
 def finish_fake_run(record, status)
   acquire_fake_state unless $state_locked
   current = $state["runs"].find { |r| r["seq"] == record["seq"] }
-  current["exit"] = status if current
+  if current
+    current["exit"] = status
+    current["ended_at"] = Time.now.to_f
+  end
   if record["registered"] && (c = containers[record["name"]]) && c["started_seq"]
     c["rm"] ? containers.delete(record["name"]) : c["state"] = "exited"
   end
@@ -309,6 +313,7 @@ end
 
 def set_state(argv, state, verb)
   opts, names = parse(argv, valued: %w[t time s signal])
+  verify_ending = []
   names.each do |name|
     c = find_container(name) or fail_with("Error response from daemon: No such container: #{name}")
     # rm_fails: {name => times}: docker rm of that container fails that many times more (-1: always)
@@ -320,12 +325,27 @@ def set_state(argv, state, verb)
     if verb == "rm" && c["state"] == "running" && !flag?(opts, "f", "force")
       fail_with("Error response from daemon: cannot remove container \"#{name}\": container is running: stop the container before removing or force remove")
     end
+    ending = c["state"] == "running" && state != "running" && (c["labels"] || {})["farmy.role"] == "verify"
+    verify_ending << container_name(name) if ending
     if verb == "rm" then containers.delete(container_name(name))
     else
       c["state"] = state
       c["started_seq"] = next_seq if state == "running"
     end
     puts name
+  end
+  wait_until_runs_ended(verify_ending) unless verify_ending.empty?
+end
+
+# As Docker's stop, kill and rm -f return once the container has ended: waits (10 s at most) until the docker run
+# playing each named verify container has ended.
+def wait_until_runs_ended(names)
+  release_fake_state
+  deadline = Time.now + 10
+  until Time.now > deadline
+    runs = (JSON.parse(File.read(STATE_FILE))["runs"] rescue nil)
+    break if runs && names.all? { |n| runs.select { |r| r["name"] == n }.all? { |r| r.key?("ended_at") } }
+    sleep 0.05
   end
 end
 
@@ -731,8 +751,13 @@ def play_agent(opts, mounts, tmpfs, limit, record)
   end
   print play["says"].to_s
   $stderr.print play["stderr"].to_s
+  $stdout.flush
   register_running(record, opts)
   release_fake_state
+  began = Time.now
+  ended = play_agent_steps(play, opts, record, mounts, tmpfs, limit && began + limit)
+  exit finish_fake_run(record, ended) if ended
+  limit &&= [limit - (Time.now - began), 0].max unless Array(play["steps"]).empty?
   pipeline_agent_barrier(play, record) if respond_to?(:pipeline_agent_barrier, true)
   idle = play["idle"].to_f
   if limit && idle > limit
@@ -833,22 +858,17 @@ def run_for_real(opts, words, mounts, tmpfs, limit, record)
   end
   readonly = mounts.select { |m| m["ro"] }.map { |m| table[m["target"]] }
   readonly.each { |d| system("chmod", "-R", "a-w", d) }
+  # a verify container is listed as running while its command runs; docker stop, kill or rm -f ends it (137)
+  stoppable = record["labels"]["farmy.role"] == "verify" && record["name"]
+  register_running(record, opts) if stoppable
+  first = stoppable ? $state["verify_print_first"].to_i : 0
   release_fake_state
   status = nil
   begin
-    pid = Process.spawn(env, *argv, chdir: cwd, unsetenv_others: false)
-    if limit
-      deadline = Time.now + limit
-      until (done = Process.wait(pid, Process::WNOHANG)) || Time.now > deadline
-        sleep 0.05
-      end
-      if done then status = $?.exitstatus || (128 + $?.termsig.to_i)
-      else Process.kill("KILL", pid) rescue nil; Process.wait(pid) rescue nil; status = 124
-      end
-    else
-      Process.wait(pid)
-      status = $?.exitstatus || (128 + $?.termsig.to_i)
-    end
+    # verify_print_first: the container prints that much before its command runs, as output before a verify's
+    # command starts would come; stopped meanwhile, or no longer read, it ends there (137) and its command never runs
+    status = 137 if first.positive? && !print_before_the_command(first, record["name"])
+    status ||= run_command_for_real(env, argv, cwd, limit, stoppable, record)
   rescue Errno::ENOENT => e
     $stderr.puts "docker: Error response from daemon: #{e.message}"
     status = 127
@@ -856,6 +876,51 @@ def run_for_real(opts, words, mounts, tmpfs, limit, record)
     readonly.each { |d| system("chmod", "-R", "u+w", d) }
   end
   exit finish_fake_run(record, status.to_i)
+end
+
+# Runs a container's process to its end, its limit (124) or, for a stoppable one, until it is stopped (137).
+def run_command_for_real(env, argv, cwd, limit, stoppable, record)
+  pid = Process.spawn(env, *argv, chdir: cwd, unsetenv_others: false, **(stoppable ? { pgroup: true } : {}))
+  unless limit || stoppable
+    Process.wait(pid)
+    return $?.exitstatus || (128 + $?.termsig.to_i)
+  end
+  deadline = limit && Time.now + limit
+  stopped = false
+  until (done = Process.wait(pid, Process::WNOHANG)) || (deadline && Time.now > deadline) ||
+        (stopped = stoppable && !agent_container_running?(record["name"]))
+    sleep 0.05
+  end
+  return $?.exitstatus || (128 + $?.termsig.to_i) if done
+  Process.kill("KILL", stoppable ? -pid : pid) rescue nil
+  Process.wait(pid) rescue nil
+  stopped ? 137 : 124
+end
+
+# Prints this many bytes of `printed before the command` lines, in 4 KiB pieces alternately on stdout and stderr,
+# without blocking: true once all are out, false when the container was stopped or nobody reads any more.
+def print_before_the_command(bytes, name)
+  line = "printed before the command\n"
+  piece = (line * (4096 / line.bytesize + 1)).byteslice(0, 4096)
+  $stdout.flush
+  left = bytes
+  [$stdout, $stderr].cycle do |io|
+    break if left <= 0
+    text = piece.byteslice(0, [left, piece.bytesize].min)
+    until text.empty?
+      return false unless agent_container_running?(name)
+      begin
+        written = io.write_nonblock(text)
+        text = text.byteslice(written..)
+        left -= written
+      rescue IO::WaitWritable
+        IO.select(nil, [io], nil, 0.1)
+      rescue Errno::EPIPE, IOError
+        return false
+      end
+    end
+  end
+  true
 end
 
 # A container's environment, as Docker makes it when the container is made: each --env-file (NAME=value
@@ -892,7 +957,7 @@ def cmd_run(argv, start: true, attached: nil, made: nil)
   rm_on_volumes(process, volumes_named)
   labels = values(opts, "label", "l").to_h { |l| l.split("=", 2) }
   stdin = flag?(opts, "i", "interactive") && !$stdin.tty? ? $stdin.read : nil
-  record = { "image" => image, "command" => command, "name" => name, "env" => env, "seq" => next_seq,
+  record = { "image" => image, "command" => command, "name" => name, "env" => env, "seq" => next_seq, "started_at" => Time.now.to_f,
              "volumes" => volumes_named.map { |v| v["name"] }, "binds" => binds, "process" => process,
              "labels" => labels, "networks" => attached || values(opts, "network", "net"), "user" => value(opts, "u", "user"), "stdin" => stdin,
              "env_files" => env_files }

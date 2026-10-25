@@ -4,6 +4,7 @@
 #   factory_service protects: ["test/"], max_iterations: 3   shop on the test's git host (src/app.txt "broken",
 #                                       test/check.sh passes when src/app.txt says fixed), commands.test: sh test/check.sh,
 #                                       factory: in its definition, claude in api-key mode; started, its key held
+#   factory_service verify: "test", sidecar: :health_checked   factory.verify names that command; the postgres sidecar has a healthcheck
 #   with_ssh_git_route                  an SSH git route for github.com too, its key given, shop made anew
 #   with_mesh_egress                    mesh egress in farmy.yml too, joined with an auth key, shop made anew
 #   assert_gate_reaches "shop-pg", as: "postgres"   the gate is on an internal network of the run, which the sidecar joined under that name
@@ -40,14 +41,17 @@
 module Factory
   def factory_service(protects: ["test/"], hidden: nil, writes: nil, max_iterations: 3, iteration_timeout: "30m", agent: "claude", test: "test",
                       check: "grep -q fixed src/app.txt\n", files: {}, gate: nil, sidecar: false, model: :api, egress: false,
-                      profiles: nil, commands: {}, extra_config: "",
+                      profiles: nil, commands: {}, extra_config: "", verify: nil,
                       token: "sk-ant-oat01-9f2c", api_key: "sk-ant-api03-4f9e", authkey: "tskey-auth-k9f2c1e5d7b")
     settings
     remote_repository "acme/shop", **{ "src/app.txt" => "broken\n", "test/check.sh" => check, "README.md" => "# shop\n" }.merge(files)
     block = { "base" => "main", "agent" => agent, "writes" => writes, "protects" => protects, "hidden" => hidden,
-              "test" => test, "max_iterations" => max_iterations, "iteration_timeout" => iteration_timeout, "gate" => gate }.compact
+              "test" => test, "verify" => verify, "max_iterations" => max_iterations, "iteration_timeout" => iteration_timeout, "gate" => gate }.compact
     block = profiles if profiles
-    fragment = sidecar ? { "compose" => { "postgres" => { "image" => "postgres:18", "container_name" => "shop-pg" } } } : {}
+    # sidecar: true, a postgres; :health_checked, the same with a healthcheck (pg_isready)
+    postgres = { "image" => "postgres:18", "container_name" => "shop-pg" }
+    postgres["healthcheck"] = { "test" => ["CMD", "pg_isready"], "interval" => "1s", "retries" => 1 } if sidecar == :health_checked
+    fragment = sidecar ? { "compose" => { "postgres" => postgres } } : {}
     write_file "services/shop.yml", YAML.dump({ "repo" => remote_url("acme/shop"), "image" => "debian:bookworm-slim",
                                               "commands" => { "test" => "sh test/check.sh" }.merge(commands),
                                               "factory" => block }.merge(fragment)).delete_prefix("---\n")

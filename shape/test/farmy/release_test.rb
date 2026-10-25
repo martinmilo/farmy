@@ -20,7 +20,7 @@ class ReleaseTest < AcceptanceTest
     assert_default_release_builds SHIPPED
   end
 
-  ["0.x", "v#{SHIPPED}", "#{SHIPPED};touch marker", "0.2.0"].each do |version|
+  ["0.x", "v#{SHIPPED}", "#{SHIPPED};touch marker", "0.3.0"].each do |version|
     test "release version #{version} is refused because it is invalid or differs from repository VERSION" do
       release_distribution version
 

@@ -47,9 +47,33 @@ impl Run<'_> {
         if self.p.gate_isolated {
             return Ok(());
         }
+        let project = self.gate_network();
+        // Even a gate without sidecars needs its isolated DNS/network namespace.
+        let Some(sidecars) = self.sidecar_project(&project, "gate-sidecar")? else {
+            if !self.make_network(&project, true) {
+                return refuse("gate network could not be created");
+            }
+            return Ok(());
+        };
+        std::fs::write(self.gate_file(), &sidecars.file)?;
+        if !docker::compose(&project, Some(&self.gate_file()), &["up", "-d"], false) {
+            return refuse("gate sidecars failed to start");
+        }
+        match wait_healthy(&project, &sidecars.checked, self.p.health_timeout, &|| false) {
+            Ok(()) | Err(Health::Aborted) => Ok(()),
+            Err(Health::Unhealthy(service)) => {
+                refuse(format!("gate sidecar {project}-{service} unhealthy"))
+            }
+            Err(Health::Timeout(_)) => refuse("gate sidecar health timeout"),
+        }
+    }
+    /// The definition's sidecars as fresh copies in the compose project `project` (the gate's, a verify's):
+    /// no published ports, an internal network of the project's own where each keeps its compose name as an
+    /// alias, fresh volumes for writable data (read-only binds kept), labelled with the run and `role`.
+    /// None when the definition has none.
+    fn sidecar_project(&self, project: &str, role: &str) -> R<Option<Sidecars>> {
         use serde_yaml::{Mapping, Value as V};
         let s = |x: &str| V::String(x.into());
-        let project = self.gate_network();
         let mut services = self.p.def.compose.clone().unwrap_or_default();
         let mut volumes = Mapping::new();
         for (name, svc) in &mut services {
@@ -70,7 +94,7 @@ impl Run<'_> {
             let mut labels = Mapping::new();
             labels.insert(s("farmy.run"), s(&self.id));
             labels.insert(s("farmy.service"), s(&self.p.name));
-            labels.insert(s("farmy.role"), s("gate-sidecar"));
+            labels.insert(s("farmy.role"), s(role));
             m.insert(s("labels"), V::Mapping(labels));
             if let Some(vs) = m.get_mut(s("volumes")).and_then(V::as_sequence_mut) {
                 for (index, v) in vs.iter_mut().enumerate() {
@@ -109,61 +133,28 @@ impl Run<'_> {
                 }
             }
         }
-        // Even a gate without sidecars needs its isolated DNS/network namespace.
         if services.is_empty() {
-            if !self.make_network(&project, true) {
-                return refuse("gate network could not be created");
-            }
-            return Ok(());
+            return Ok(None);
         }
         let mut network = Mapping::new();
-        network.insert(s("name"), s(&project));
+        network.insert(s("name"), s(project));
         network.insert(s("internal"), V::Bool(true));
         let mut networks = Mapping::new();
         networks.insert(s("default"), V::Mapping(network));
         let mut root = Mapping::new();
-        root.insert(s("name"), s(&project));
+        root.insert(s("name"), s(project));
         root.insert(s("services"), V::Mapping(services.clone()));
         root.insert(s("volumes"), V::Mapping(volumes));
         root.insert(s("networks"), V::Mapping(networks));
-        std::fs::write(
-            self.gate_file(),
-            serde_yaml::to_string(&root).map_err(|e| e.to_string())?,
-        )?;
-        if !docker::compose(&project, Some(&self.gate_file()), &["up", "-d"], false) {
-            return refuse("gate sidecars failed to start");
-        }
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(self.p.health_timeout);
-        loop {
-            let mut ready = true;
-            for (name, svc) in &services {
-                if svc.get("healthcheck").is_none() {
-                    continue;
-                }
-                let container = format!("{project}-{}", name.as_str().unwrap_or("sidecar"));
-                let health = docker::out(&[
-                    "inspect",
-                    "--format",
-                    "{{.State.Health.Status}}",
-                    &container,
-                ])
-                .unwrap_or_default();
-                if health.trim() == "unhealthy" {
-                    return refuse(format!("gate sidecar {container} unhealthy"));
-                }
-                if health.trim() != "healthy" {
-                    ready = false;
-                }
-            }
-            if ready {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return refuse("gate sidecar health timeout");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        let checked = services
+            .iter()
+            .filter(|(_, svc)| svc.get("healthcheck").is_some())
+            .map(|(name, _)| name.as_str().unwrap_or("sidecar").to_string())
+            .collect();
+        Ok(Some(Sidecars {
+            file: serde_yaml::to_string(&root).map_err(|e| e.to_string())?,
+            checked,
+        }))
     }
     fn close_gate(&self) {
         if self.gate_file().is_file() {
@@ -174,5 +165,59 @@ impl Run<'_> {
                 false,
             );
         }
+    }
+}
+
+/// A compose project of fresh sidecars: its file's text, and the compose services that have a health check.
+struct Sidecars {
+    file: String,
+    checked: Vec<String>,
+}
+
+/// Why sidecars are not ready: one is unhealthy, one was still not healthy at the limit (its compose
+/// service), or the caller gave up waiting.
+enum Health {
+    Unhealthy(String),
+    Timeout(String),
+    Aborted,
+}
+
+/// Waits up to `limit` seconds for every sidecar with a health check (`checked`, by compose service) of
+/// `project` to be healthy; an unhealthy one ends the wait at once, and so does `abort` saying so.
+fn wait_healthy(
+    project: &str,
+    checked: &[String],
+    limit: u64,
+    abort: &dyn Fn() -> bool,
+) -> Result<(), Health> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(limit);
+    loop {
+        let mut waiting = None;
+        for name in checked {
+            let container = format!("{project}-{name}");
+            let health = docker::out(&[
+                "inspect",
+                "--format",
+                "{{.State.Health.Status}}",
+                &container,
+            ])
+            .unwrap_or_default();
+            if health.trim() == "unhealthy" {
+                return Err(Health::Unhealthy(name.clone()));
+            }
+            if health.trim() != "healthy" && waiting.is_none() {
+                waiting = Some(name.clone());
+            }
+        }
+        let Some(waiting) = waiting else {
+            return Ok(());
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(Health::Timeout(waiting));
+        }
+        if abort() {
+            return Err(Health::Aborted);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

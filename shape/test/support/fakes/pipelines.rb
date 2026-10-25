@@ -22,6 +22,13 @@ def pipeline_checkout_volume_barrier(volume)
 end
 
 def pipeline_record_compose(doc, project)
+  # a verify's own sidecars (<service>-run-<id>-verify): kept, and unhealthy when the test said so
+  if project.include?("-run-") && project.end_with?("-verify")
+    members = containers.select { |_, container| container["project"] == project }
+    members.each_value { |container| container["health"] = "unhealthy" } if $state["verify_unhealthy"]
+    ($state["verify_projects"] ||= []) << JSON.parse(JSON.generate({ "project" => project, "document" => doc, "containers" => members }))
+    return
+  end
   return unless project.include?("-run-") && project.end_with?("-gate")
   members = containers.select { |_, container| container["project"] == project }
   members.each_value { |container| container["health"] = "unhealthy" } if $state["gate_unhealthy"]

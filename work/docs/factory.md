@@ -35,6 +35,7 @@ factory:
     writes: [implementation/]
     protects: [checks/]
     test: test
+    verify: test          # the agent may run it on demand: farmy-verify (below)
     gate: green
     max_iterations: 5
     iteration_timeout: 30m
@@ -283,6 +284,110 @@ it wrote to stderr (`exited 126: sh: 1: codex: Permission denied`), so a CLI tha
 may not execute shows in the record; the run goes on. The version container gets 30 s. When it has not ended by then, farmy removes it, keeps
 `agent_version: "unknown"` with `agent_version_reason: "no answer within 30 s"`, and the run goes on to
 its first iteration. `agent_version_reason` is absent when the version was given or there is none.
+
+## On-demand verify
+
+A profile's `verify` names a command under `commands:` that the agent may run itself, as often as it
+likes, while it works:
+
+```yaml
+factory:
+  work:
+    base: main
+    agent: claude
+    writes: [src/]
+    hidden: [test/]       # the agent cannot read test/ ...
+    test: test
+    verify: test          # ... yet it can run it: farmy-verify [args…]
+```
+
+In the agent's container, `farmy-verify [args…]` runs that command, with each of its arguments appended as
+one word (`farmy-verify --name 'only login'` runs `sh test/check.sh --name 'only login'`), on a snapshot of
+the agent's tree as the iteration commit would make it: its files under `writes` as they are now,
+additions and deletions included, `protects` and `hidden` as the run started them (so a hidden suite runs,
+though the agent cannot read it), everything else as on the run branch, never `.farmy/question.md` or
+`.farmy/answer.md`. The command's stdout and stderr reach
+the agent as they come, and `farmy-verify` exits with the command's exit code. For the exits that do not
+say whether the suite failed it adds a last line on stderr: 124 (`it timed out`), 125 (`it could not be
+run`), 126 (`a program it runs could not be executed`), 127 (`a program it runs was not found`). When the
+verify could not run the command at all (the snapshot failed, Docker refused a container, a sidecar was
+not healthy within `gate.health_timeout`, `gate_setup` failed) it says `farmy-verify: could not run:
+<reason>` and exits 125. The agent's prompt says all this, naming the command line, even when
+`factory/prompt.md` omits it.
+
+A verify decides nothing: the gate tests the iteration's commit as before, and a verify is never an
+iteration. `farmy factory start` refuses a `verify` that is not under `commands:` before any run container
+starts; without `verify` nothing of this exists in the run.
+
+How it works:
+
+- **The snapshot** is a commit made in a git container with an index of its own: the run branch, its
+  index and every file the agent sees stay as they were. It is on no branch and never pushed. Of what git
+  prints, only a full commit id (40 or 64 lowercase hex digits) is taken; anything else is a snapshot that
+  failed (`could not run: the snapshot failed: git printed no commit id`, the record's `commit: -`).
+- **The verify container** `shop-run-<id>-verify-<i>-<k>` (labels `farmy.role=verify`,
+  `farmy.iteration=<i>`, `farmy.verify=<k>`) is made as the gate's test container: a new one per call,
+  the run volume read-only, the snapshot exported into a scratch tmpfs, no proxy and no way out. It gets
+  fresh sidecars of its own in the compose project `shop-run-<id>-verify`, removed when it ends;
+  `gate: {network: none}` means no network and no sidecars. The profile's `gate_setup` runs first.
+- **The way in.** The agent's container has no farmy binary, no Docker socket, no broker and no network
+  for this, in every mode. `farmy-verify` is a small `sh` program farmy bind-mounts read-only at
+  `/usr/local/bin/farmy-verify`, with two folders of the run's own, from `.work/shop/runs/<id>/verify/`:
+  `requests/` (writable: the call, its words NUL-separated) and `responses/` (read-only there: the
+  command's output and exit code, written by the run's controller as they come). The controller serves
+  the calls while the agent runs and removes each answer once `farmy-verify` has read it.
+- **One at a time.** A call made while another verify of the run runs waits for it, then runs as a call
+  made at that moment. Calls are numbered `<k>` from 1 per iteration, in the order they run. At most four
+  calls wait (below).
+- **Limits.** Three constants of farmy, not settings, bound what an agent can make farmy hold. Each ends
+  the call as one that could not run, exit 125, with its own line on stderr, on a line of its own (a
+  newline comes first when what the agent got on stderr so far does not end with one):
+  - `VERIFY_OUTPUT_CAP`, 4 MiB: the command's stdout and stderr together. The first 4 MiB reach the agent
+    as they come; with the first byte beyond them farmy stops the verify (its container and sidecars
+    removed), passes on and keeps nothing more, and `farmy-verify` says `could not run: the output
+    exceeded 4 MiB, so the verify was stopped`. A command that prints exactly 4 MiB is not stopped. The
+    record keeps the same 4 MiB, exit 125 and that reason. The output goes straight through to the
+    answer and the record and is never held in farmy's memory, not even when the record is written.
+  - `VERIFY_QUEUE_LIMIT`, 4 calls: the calls waiting for their turn, the running one not counted. A call
+    that would be the fifth waiting fails at once, even while a verify runs: `could not run: the verify
+    queue is full (4 calls are waiting)`. It leaves nothing behind where the agent's container can write
+    and is not a verify: no number, no record, not counted. A waiting call costs farmy only its
+    directory entry: farmy moves the agent's call file, unread, into its own `verify/queue/` (never
+    mounted), counts the waiting calls by name, and reads a call's words when its turn comes.
+  - `VERIFY_PREPARE_OUTPUT_CAP`, 64 KiB: what arrives from the verify container before the command
+    starts (its preparation, `gate_setup`), stdout and stderr together. Up to that is held, and passed
+    on when the command starts; with the first byte beyond it the verify ends (container and sidecars
+    removed) before the command runs, and `farmy-verify` says `could not run: the verify container
+    printed more than 64 KiB before the command started`. The agent gets none of it then.
+
+  The gate has none of these limits: they apply to the on-demand verify only.
+- **Time.** A verify runs while the agent waits, so it counts toward `iteration_timeout`. When the agent's
+  container ends (it exited, it reached `iteration_timeout`, the run was cancelled), farmy stops the verify
+  and removes its container and sidecars before the iteration's commit; a call still waiting never runs.
+  Both are recorded as `stopped: the agent's container ended`. A `farmy-verify` that is interrupted (an
+  agent's tool timeout) has its verify stopped after a few seconds, `stopped: farmy-verify was
+  interrupted`, so the next call does not wait for an answer no one reads.
+
+Every call is kept in the run's folder as `iteration-<i>.verify-<k>.log`: header lines (`args` as a JSON
+array, `command` as a JSON string, `commit` or `-`, `started`, `ended`, `exit`, 137 for a stopped verify, and
+`reason`, a JSON string, when it could not run, was stopped, or exited 124 to 127), a blank line, then
+everything the command printed:
+
+```
+args: ["--name","only login"]
+command: "sh test/check.sh --name 'only login'"
+commit: 3f2c9a7d0e5b41c8a6f1d2e3b4c5a6978d0e1f23
+started: 2026-10-21T09:14:03Z
+ended: 2026-10-21T09:14:07Z
+exit: 3
+
+<everything the command printed, stdout and stderr, in the order it came>
+```
+
+No header value spans a line: a newline or control character in an argument is written as JSON writes it
+(`\n`, `\r`, `\u001b`), so it cannot start a header line of its own.
+`state.json` counts them per iteration (`verifies`), and `farmy factory show` appends the count to each
+iteration's line: `  1  commit 9834b253c96e  exit 1  verifies 2`.
 
 ## Review, chaining and questions
 

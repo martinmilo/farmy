@@ -643,7 +643,8 @@ factory:
 ```
 
 Each profile accepts `base`, `agent`, `mode`, `writes`, `protects`, `hidden`, `test`, `check`, `gate`,
-`review`, `max_iterations`, `iteration_timeout`. `mode` is `api-key`, `subscription` or `login`: it selects the
+`review`, `max_iterations`, `iteration_timeout`, and `verify` (a command the agent may run on demand: "On-demand
+verify", below). `mode` is `api-key`, `subscription` or `login`: it selects the
 existing catalogue agent's authentication (the subscription token/login or API route), never a different
 agent's credentials. `login` uses the agent's factory login ("Factory logins"). Omitted mode retains the existing API-route-else-token selection; it never picks `login`. The catalogue
 supplies the login details; runs keep their existing credential isolation. Every profile's agent is
@@ -664,6 +665,7 @@ factory:
   protects: [test/]       # paths whose changes by the agent are reverted before every gate. Default: none
   hidden: []              # folders covered in the agent's container (always protected too). Default: none
   test: test              # a name under commands:, run from the repository root (required)
+  verify: test            # optional: a name under commands: the agent may run whenever it likes with farmy-verify
   max_iterations: 5       # default 5
   iteration_timeout: 30m  # default 30m; s, m or h
   gate:
@@ -699,10 +701,10 @@ whole output in `.work/<name>/runs/<id>/git.log` (that folder holds no state: it
 |---|---|
 | run volume | `<name>-run-<id>` (kept after the run) |
 | run networks, and the run's broker (alias `keys`) | `<name>-run-<id>` (internal in every mode), `<name>-run-<id>-keys`; filtering proxy topology is described in "Enforced egress". Only what a run made is removed at its end, without a word about anything absent |
-| containers (`docker run --rm`, entrypoint `sh` or the command's own) | `<name>-run-<id>-git-<n>`, `<name>-run-<id>-agent-<i>`, `<name>-run-<id>-test-<i>`, `<name>-run-<id>-version` |
-| labels on each | `farmy.run=<id>`, `farmy.service=<name>`, `farmy.role=git\|agent\|test\|version`, `farmy.iteration=<i>`; a login-mode agent also `farmy.factory-login=<agent>` |
+| containers (`docker run --rm`, entrypoint `sh` or the command's own) | `<name>-run-<id>-git-<n>`, `<name>-run-<id>-agent-<i>`, `<name>-run-<id>-test-<i>`, `<name>-run-<id>-version`, `<name>-run-<id>-verify-<i>-<k>` |
+| labels on each | `farmy.run=<id>`, `farmy.service=<name>`, `farmy.role=git\|agent\|test\|version\|verify`, `farmy.iteration=<i>`; a login-mode agent also `farmy.factory-login=<agent>`; a verify also `farmy.verify=<k>` |
 | branch | `farmy/<name>/<id>` |
-| folder | `.work/<name>/runs/<id>/`: `state.json`, `iteration-<i>.agent.log`, `iteration-<i>.test.log`, and the run record: `iteration-<i>.agent.json`, `iteration-<i>.prompt.md`, `iteration-<i>.agent.stdout`, `iteration-<i>.agent.stderr` |
+| folder | `.work/<name>/runs/<id>/`: `state.json`, `iteration-<i>.agent.log`, `iteration-<i>.test.log`, and the run record: `iteration-<i>.agent.json`, `iteration-<i>.prompt.md`, `iteration-<i>.agent.stdout`, `iteration-<i>.agent.stderr`, `iteration-<i>.verify-<k>.log` |
 
 **The run record.** Per iteration, beside `iteration-<i>.agent.log` (stdout and stderr joined, for
 `factory log`):
@@ -1176,6 +1178,37 @@ The fake understands the Docker CLI as it is commonly used, and the tests observ
   each `--env-file` (`NAME=value` lines; a bare `NAME`, like `-e NAME` without a value, takes the `docker`
   process's own value), then `-e`; every env file read is kept with its path and mode (`env_files`). An app
   container whose `REPO` is a `file://` URL gets a real clone in its checkout volume's folder when it is made.
+  Every `docker run` also keeps when it started and ended.
+- **An agent's steps** (record 2026-10-21-1332). An agent play may have `steps`, done in order after its writes
+  and before its idle time: `run: <line>` runs the line for real on the host with `/bin/sh -c`, as the agent's
+  container would. Every mount target of that container that stands as a path in the line, or in a value of its
+  environment, is replaced by its folder: a volume's folder, a bind's source, and for each `--tmpfs` a fresh empty
+  folder that lasts as long as the container (so a covered path reads empty). The environment is the container's,
+  as Docker made it, mapped, and nothing else; HOME is a fresh folder unless it lies on a mount; PATH is the
+  container's `PATH` (Debian's default when it sets none), mapped, behind a folder that holds every file bound or
+  mounted into a folder on that PATH, so a program put there is found by its name. It runs in the container's
+  `-w` (else `/workspace`). The image adds no file: a program only the image carries is not there. A program the
+  line starts gets no other mapping (a path written inside its own files is the host's), resolves no container
+  name, and uses the test machine's own tools. So a program meant for the agent's container finds what it needs
+  through its arguments, its environment or its own location, on something mounted into the container.
+  `background: true` starts the line and goes on; the agent waits for every such line before it ends. `writes:`
+  writes files as the play's writes do; `find: <text>` notes every file the container can see that holds the text
+  (a file under a covered path is not seen); `list_writable: true` notes every entry (file, folder, link, FIFO) the
+  container can see under a mount it can write (a volume or bind not read-only, a tmpfs not `ro`; what lies under
+  a read-only mount is not seen), so a test can compare two moments; `sleep: <s>` waits. Each line's stdout and
+  stderr (apart, each chunk with the time it came), its exit code, start and end are kept; a line that printed
+  more than 256 KiB keeps its output in files instead. The agent's `timeout <s>` covers its steps: at
+  the limit every line still running is killed and the agent exits 124; `docker stop`, `kill` or `rm -f` of the
+  agent's container kills them too (137).
+- A `docker run` labelled `verify` runs for real like `test`. It is listed as running while its command runs;
+  `docker stop`, `kill` or `rm -f` of it ends its command (exit 137) and, as with Docker, returns once it has ended.
+  When the test said so (`verify_sidecars_unhealthy`), the containers of every compose project
+  `<service>-run-<id>-verify` are `unhealthy` (`docker inspect`'s `State.Health.Status`, and `compose up --wait`
+  fails with `dependency failed to start: container is unhealthy`); the gate's sidecars stay healthy. When the
+  test said so (`verify_containers_print_first <bytes>`, record 2026-10-21-1700), every verify container first
+  prints that many bytes of `printed before the command` lines, 4 KiB at a time alternately on stdout and stderr,
+  as output that comes before a verify's command starts would; only then does it run its process. Stopped (or no
+  longer read) meanwhile, it ends there (137) and its process never runs.
 - `docker context inspect` names `FAKE_DOCKER_CONTEXT_HOST` as the current endpoint (default
   `unix:///var/run/docker.sock`); `--format '{{.Endpoints.docker.Host}}'` prints it alone.
 - `farmy unlock-names --missing` in the control container prints the names `farmy unlock-names` would,
@@ -1965,3 +1998,128 @@ the modes of that installed entrypoint. A custom toolbox's own startup logic goe
 farmy's layer installs it with the image, and farmy's entrypoint runs it as dev at every container start,
 after farmy's own startup, from the dev user's home; its failure is reported with its exit status and does
 not stop the container. A custom `toolbox/entrypoint.sh` has no effect.
+
+## On-demand verify (record 2026-10-21-1332)
+
+```yaml
+factory:
+  work:
+    base: main
+    agent: claude
+    writes: [src/]
+    hidden: [test/]       # the agent cannot read test/ ...
+    test: test
+    verify: test          # ... and runs it whenever it likes: farmy-verify [args…]
+```
+
+`verify` names a command under `commands:`, in any profile (and in the legacy single block). `farmy start`
+accepts the key without checking it; `farmy factory start` refuses a name that is not under `commands:`,
+naming it and `commands:`, before any run container starts. Without `verify` nothing changes: no
+`farmy-verify` in the agent's container, no `verifies` in `state.json`, no verify count in `show`.
+
+**The program.** With `verify`, the agent's container has a program `farmy-verify` on its PATH. How it reaches
+farmy is farmy's choice, within: no farmy binary, no Docker socket and no broker in the agent's container (it
+works in api-key, token and login mode alike), and the agent on its run's internal network only. Nothing with a
+way out or holding a secret joins that network for it; the control container never does. Under the tests it
+runs as the fake runs an agent's command lines ("Docker in the tests": an agent's steps).
+
+**A call**, `farmy-verify [args…]`, in this order:
+
+1. **One at a time per run.** A call made while another verify of the run is running waits for it to end, then
+   goes on as a call made at that moment. Calls are numbered `k` from 1 per iteration, in the order they run. At
+   most `VERIFY_QUEUE_LIMIT` calls wait at a time ("Limits" below).
+2. **The snapshot**, made as the iteration commit would be ("An iteration") without changing anything the agent
+   sees: `protects` and `hidden` as at the run's starting commit (the protection baseline); under `writes` (all
+   paths when `writes` is unset) the agent's current files, additions and deletions included; everything else as
+   at the run branch's head; `.farmy/question.md` and `.farmy/answer.md` never in it. It is a commit that is not
+   on the run branch and never pushed; the run branch, its index and every file of the agent's tree stay exactly
+   as they were.
+3. **The verify container** `<name>-run-<id>-verify-<i>-<k>`, labels `farmy.run=<id>`, `farmy.service=<name>`,
+   `farmy.role=verify`, `farmy.iteration=<i>`, `farmy.verify=<k>`, made as the gate's test container: a new one
+   per call, the run volume read-only at `/workspace`, the definition's `mounts:` read-only, `--tmpfs
+   /scratch:exec`, the snapshot exported into `/scratch/tree` (`git -C /workspace archive <commit>`), run from
+   there (or the definition's `workdir` inside it) with HOME and TMPDIR under `/scratch`, no proxy variables, no
+   way out. Its sidecars: fresh copies in the compose project `<name>-run-<id>-verify`, made as a gate's are
+   (internal networks, no published ports, the developer's and other runs' never joined, health checks waited for
+   up to `gate.health_timeout`), removed when the verify ends. With the gate's network `none`: `--network none`
+   and no sidecars. The profile's `gate_setup` runs first when it has one. Then the named command's line with each
+   arg appended, shell-quoted as one word.
+4. **What the agent gets.** The command's stdout on farmy-verify's stdout and its stderr on stderr, each as it
+   comes, then farmy-verify exits with the command's exit code. For the command's exits 124 to 127 it adds one last
+   line on stderr:
+
+   | exit | line |
+   |---|---|
+   | 124 | `farmy-verify: the command exited 124: it timed out` |
+   | 125 | `farmy-verify: the command exited 125: it could not be run` |
+   | 126 | `farmy-verify: the command exited 126: a program it runs could not be executed` |
+   | 127 | `farmy-verify: the command exited 127: a program it runs was not found` |
+
+   When the verify could not run the command at all (the snapshot failed, Docker refused a container, a sidecar was
+   not healthy within `gate.health_timeout`, `gate_setup` failed), it prints `farmy-verify: could not run:
+   <reason>` on stderr, a sidecar named by its compose service (`sidecar postgres is not healthy`), and exits 125.
+   It returns the command's output and exit code and nothing else: no file of the snapshot or of the verify
+   container reaches anything the agent's container can see.
+
+**Limits** (record 2026-10-21-1700). Three constants of farmy, not configurable:
+
+| constant | value | counts |
+|---|---|---|
+| `VERIFY_OUTPUT_CAP` | 4 MiB (4,194,304 bytes) | the command's stdout and stderr together |
+| `VERIFY_QUEUE_LIMIT` | 4 calls | calls of a run waiting for their turn (the running one not counted) |
+| `VERIFY_PREPARE_OUTPUT_CAP` | 64 KiB (65,536 bytes) | stdout and stderr together that arrive from the verify container before the command starts (its preparation, `gate_setup`) |
+
+Each ends a call as one that could not run, exit 125, with its own line on stderr. The line stands on a line of
+its own: when what the agent got on stderr so far does not end with a newline, one comes first.
+
+- **Output.** The first 4 MiB the command prints reach the agent as they come. With the first byte beyond them the
+  command is stopped (its container and sidecars removed), nothing beyond is passed on or kept, and farmy-verify
+  prints `farmy-verify: could not run: the output exceeded 4 MiB, so the verify was stopped`. A command that
+  prints exactly 4 MiB is not stopped. The record keeps the same 4 MiB as its output, exit 125 and that reason.
+  farmy never holds more of a verify's output than the cap.
+- **Waiting calls.** A call that would be the fifth waiting fails at once: `farmy-verify: could not run: the verify
+  queue is full (4 calls are waiting)`. It leaves nothing behind anywhere the agent's container can write, and is
+  not a verify: no number `k`, no record file, not in the count. A waiting call costs farmy only its directory
+  entry: its words are read when its turn comes, never while it waits.
+- **Before the command.** Up to 64 KiB arriving before the command starts is held as before. With the first byte
+  beyond it the verify ends (container and sidecars removed) and farmy-verify prints `farmy-verify: could not run:
+  the verify container printed more than 64 KiB before the command started`; the command never runs. farmy never
+  holds more than 64 KiB of it, and the agent gets no more than that.
+
+**Time.** A verify runs while the agent waits: it counts toward `iteration_timeout` (the agent's `timeout`) and is
+never an iteration. When the agent's container ends while a verify runs (it exited, it was stopped at
+`iteration_timeout`, the run was cancelled), farmy stops that verify (its container and sidecars removed) before
+the iteration's commit, and a call still waiting never runs; both are recorded with `reason: "stopped: the
+agent's container ended"`. A verify takes no `factory.concurrency` slot of its own.
+
+**The gate is unchanged.** A verify decides nothing; the gate tests the iteration's commit as before.
+
+**The prompt.** With `verify`, the agent's prompt says it may run `farmy-verify [args…]` as often as it likes,
+names the command line it runs (`sh test/check.sh`), says it tests a snapshot of the tree as the iteration commit
+would make it (hidden folders included, though the agent cannot read them), and that its result decides nothing:
+only the gate does. Supplied even when `factory/prompt.md` omits it, as the question instructions are.
+
+**The record.** `iteration-<i>.verify-<k>.log` in the run's folder, one per call:
+
+```
+args: ["--name","only login"]
+command: "sh test/check.sh --name 'only login'"
+commit: 3f2c9a7d0e5b41c8a6f1d2e3b4c5a6978d0e1f23
+started: 2026-10-21T09:14:03Z
+ended: 2026-10-21T09:14:07Z
+exit: 3
+reason: "…"
+
+<everything the command printed, stdout and stderr, in the order it came>
+```
+
+No header value spans a line (record 2026-10-21-1700): `args` is a JSON array, `command` and `reason` are JSON
+strings, so a newline or control character in an argument is written as JSON writes it (`\n`, `\r`, `\u001b`)
+and cannot start a header line; the other values hold no such character.
+
+Header lines `key: value`: `args` a JSON array of the words farmy-verify was given; `command` the line run;
+`commit` the snapshot (`-` when none was made); `started` and `ended` RFC 3339 in UTC; `exit` the code farmy-verify
+exited with (137 for a verify that was stopped); `reason` only when the verify could not run, was stopped, or the command exited 124 to 127. Then one
+blank line and the full output. `state.json` gains `verifies`: `[{"iteration": <i>, "count": <n>}]`, one entry per
+iteration whose agent ran, 0 included. `farmy factory show` appends `  verifies <n>` to each iteration's line:
+`  1  commit 9834b253c96e  exit 1  verifies 2`.

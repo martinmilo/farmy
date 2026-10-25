@@ -21,6 +21,7 @@ include!("factory_gates.rs");
 include!("factory_pipelines.rs");
 include!("factory_notify.rs");
 include!("factory_logins.rs");
+include!("factory_verify.rs");
 
 const USAGE: &str = "usage: farmy factory start <name> --task <file or text> [--profile <name>] [--from <id|branch>] [--wait] | list [<name>] | show <id> | log <id> [<iteration>] | cancel <id> | approve <id> | answer <id> <text|file> [--wait] | prune [--older-than <n>d|h|m] | login <name> <agent>";
 /// How long the per-run version container may take before farmy removes it.
@@ -139,6 +140,10 @@ pub(crate) struct State {
     /// (result `login_blocked`); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_blocked: Option<LoginBlock>,
+    /// With the profile's `verify`: how many verifies each iteration's agent asked for, one entry per
+    /// iteration whose agent ran; absent without `verify`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifies: Vec<VerifyCount>,
 }
 
 /// An orphaned agent container of the run's factory login that was still there after every removal
@@ -193,6 +198,7 @@ struct Plan {
     red_pattern: Option<regex::Regex>,
     red_exit_codes: Option<Vec<i32>>,
     setup: Option<(String, String)>,
+    verify: Option<(String, String)>, // the command farmy-verify runs, by name and line
     health_timeout: u64,
     gate_isolated: bool, // factory.gate.network: none
 }
@@ -319,6 +325,7 @@ fn refresh(mut st: State) -> State {
         current => {
             st = current.unwrap_or(st);
             cleanup_abandoned(&st);
+            finish_abandoned_verifies(&mut st);
             st.result = Some("interrupted".into());
             st.phase = "done".into();
             st.ended = Some(now());
@@ -448,6 +455,21 @@ fn plan_with_definition(
             def.commands.keys().cloned().collect::<Vec<_>>().join(", ")
         ));
     };
+    let verify = f
+        .verify
+        .as_ref()
+        .map(|name| {
+            def.commands
+                .get(name)
+                .map(|line| (name.clone(), line.clone()))
+                .ok_or_else(|| {
+                    crate::Fail::Refuse(format!(
+                        "{path}: factory.verify is '{name}', which is not under commands: ({})",
+                        def.commands.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ))
+                })
+        })
+        .transpose()?;
     let agent_name = f.agent.clone().ok_or_else(|| {
         crate::Fail::Refuse(format!(
             "{path}: factory.agent is missing — an agent with a headless field"
@@ -623,6 +645,7 @@ fn plan_with_definition(
         red_pattern,
         red_exit_codes: opts.red_exit_codes,
         setup,
+        verify,
         health_timeout,
         agent,
         def,
@@ -646,9 +669,9 @@ struct Run<'a> {
     ctx: &'a Ctx,
     p: &'a Plan,
     id: String,
-    git_n: u32,
-    made: Vec<String>, // the networks this run made, removed at its end
-    broker: bool,      // the run's broker was started
+    git_n: std::sync::atomic::AtomicU32, // numbers the git containers; shared with a verify, which makes its snapshot in one
+    made: Vec<String>,                   // the networks this run made, removed at its end
+    broker: bool,                        // the run's broker was started
     egress_gate: bool,
 }
 
@@ -723,18 +746,13 @@ impl Run<'_> {
     /// A git container: the run volume at /workspace, the service's network, its agent socket for an SSH
     /// route; `src`: the checkout read-only at /src. Returns the exit code, stdout and stderr.
     /// Always as the checkout's owner, the dev user: git accepts the repository, and what it writes is dev's.
-    fn git(
-        &mut self,
-        script: &str,
-        src: bool,
-        extra_env: &[(&str, &str)],
-    ) -> (i32, String, String) {
+    fn git(&self, script: &str, src: bool, extra_env: &[(&str, &str)]) -> (i32, String, String) {
         let source = src.then(|| format!("{}-src", self.p.name));
         self.git_mounted(script, source.as_deref(), extra_env)
     }
 
     fn git_source(
-        &mut self,
+        &self,
         script: &str,
         source: Option<&str>,
         extra_env: &[(&str, &str)],
@@ -744,14 +762,14 @@ impl Run<'_> {
     }
 
     fn git_mounted(
-        &mut self,
+        &self,
         script: &str,
         source: Option<&str>,
         extra_env: &[(&str, &str)],
     ) -> (i32, String, String) {
-        self.git_n += 1;
+        let n = self.git_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let mut request = crate::git_container::Request::new(&self.p.name, "factory");
-        request.name = format!("{}-run-{}-git-{}", self.p.name, self.id, self.git_n);
+        request.name = format!("{}-run-{}-git-{n}", self.p.name, self.id);
         request.labels.push(("farmy.run".into(), self.id.clone()));
         request.mounts.push(format!("{}:/workspace", self.volume()));
         if let Some(source) = source {
@@ -940,6 +958,12 @@ impl Run<'_> {
         let mut env: Vec<(String, String)> = model_env.to_vec();
         for (k, v) in &p.agent.env {
             env.push((k.clone(), v.clone()));
+        }
+        // with verify: farmy-verify and the run's verify folders (FORMATS.md, "On-demand verify")
+        if p.verify.is_some() {
+            let (mounts, verify_env) = Channel::of(&p.name, &self.id).agent_args();
+            args.extend(mounts);
+            env.extend(verify_env);
         }
         env.extend(crate::filter::proxy_env("egress-gate", &["keys".into()]));
         env.push((
@@ -1678,11 +1702,11 @@ fn execute(ctx: &Ctx, p: &Plan, mut st: State, _controller: &crate::locking::Loc
         return Ok("cancelled".into());
     }
     let unlock = secrets::unlock(&ctx.cfg);
-    let mut run = Run {
+    let run = Run {
         ctx,
         p,
         id: st.id.clone(),
-        git_n: 0,
+        git_n: 0.into(),
         made: vec![],
         broker: false,
         egress_gate: false,
@@ -1785,7 +1809,7 @@ echo "base $(git rev-parse HEAD)"
         st.remote = marker(&out, "remote").as_deref() == Some("yes");
         save(&st);
     }
-    Ok(control(ctx, p, st, unlock.as_ref(), run.git_n))
+    Ok(control(ctx, p, st, unlock.as_ref(), run.git_n.into_inner()))
 }
 
 fn gated_head(st: &State) -> Option<String> {
@@ -1904,11 +1928,11 @@ fn approve(args: &[String]) -> R {
     }
     let ctx = commands::load_ctx()?;
     let p = saved_plan(&ctx, &st)?;
-    let mut run = Run {
+    let run = Run {
         ctx: &ctx,
         p: &p,
         id: st.id.clone(),
-        git_n: 1000000,
+        git_n: 1000000.into(),
         made: vec![],
         broker: false,
         egress_gate: false,
@@ -2007,7 +2031,7 @@ fn control(
         ctx,
         p,
         id: st.id.clone(),
-        git_n,
+        git_n: git_n.into(),
         made: vec![],
         broker: false,
         egress_gate: false,
@@ -2073,6 +2097,9 @@ fn control(
         if matches!(p.gate, Gate::RedFirst { .. }) {
             prompt.push_str("\nA test must fail if any check fails. Use set -e or equivalent shell error handling. Do not swallow assertions: an earlier failing command followed by a successful command must still make the test fail.\n");
         }
+        if let Some((_, line)) = &p.verify {
+            prompt.push_str(&verify_instructions(line));
+        }
         // login mode: the login's turn, held only while this agent container runs
         let turn = match login_turn(p, &mut st) {
             Ok(Turn::Granted(turn)) => turn,
@@ -2096,7 +2123,41 @@ fn control(
             result = "agent_failed".into();
             break;
         }
-        let agent_run = run.agent(i, &prompt, &model_env, &secret_values);
+        // with verify, a thread answers farmy-verify while the agent runs, and is done before the commit
+        let channel = Channel::of(&p.name, &st.id);
+        let verify = match &p.verify {
+            Some((_, line)) => match channel.prepare(line) {
+                Ok(()) => Some(line.as_str()),
+                Err(error) => {
+                    warn(format!(
+                        "[{}] factory: the verify folders in {} could not be made: {error}",
+                        p.name,
+                        channel.root.display()
+                    ));
+                    result = "agent_failed".into();
+                    break;
+                }
+            },
+            None => None,
+        };
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let (agent_run, verifies) = match verify {
+            Some(command) => std::thread::scope(|s| {
+                let server =
+                    s.spawn(|| Verifier::new(&run, i, &base, command, &channel, &ended).serve());
+                let agent_run = run.agent(i, &prompt, &model_env, &secret_values);
+                ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                (agent_run, Some(server.join().unwrap_or(0)))
+            }),
+            None => (run.agent(i, &prompt, &model_env, &secret_values), None),
+        };
+        if let Some(count) = verifies {
+            st.verifies.push(VerifyCount {
+                iteration: i,
+                count,
+            });
+            save(&st);
+        }
         // the turn passes on only once the container holding it is gone
         if turn.is_some() {
             remove_leftover(&run.agent_name(i));
@@ -2504,7 +2565,13 @@ fn show(args: &[String]) -> R {
             .find(|v| v.iteration == i)
             .map(|v| format!("exit {}", v.exit))
             .unwrap_or_else(|| "no gate".into());
-        println!("  {i}  commit {commit}  {verdict}");
+        let verifies = st
+            .verifies
+            .iter()
+            .find(|v| v.iteration == i)
+            .map(|v| format!("  verifies {}", v.count))
+            .unwrap_or_default();
+        println!("  {i}  commit {commit}  {verdict}{verifies}");
     }
     let last = (1..=st.iteration).rev().find_map(|i| {
         std::fs::read_to_string(
@@ -2584,6 +2651,7 @@ fn cancel(args: &[String]) -> R {
             .status();
     }
     cleanup_abandoned(&st);
+    finish_abandoned_verifies(&mut st);
     st.phase = "done".into();
     st.result = Some("cancelled".into());
     st.ended = Some(now());
@@ -2609,6 +2677,13 @@ fn cleanup_abandoned(st: &State) {
         .map(|d| sidecar_names(&d))
         .unwrap_or_default();
     close_gate(&st.service, id, sidecars);
+    if st
+        .profile_config
+        .as_ref()
+        .is_some_and(|p| p.verify.is_some())
+    {
+        close_abandoned_verify(&st.service, id);
+    }
     for net in [
         format!("{}-run-{id}", st.service),
         format!("{}-run-{id}-out", st.service),

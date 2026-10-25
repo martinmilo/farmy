@@ -691,6 +691,10 @@ pub(crate) struct FactoryProfile {
     pub iteration_timeout: Option<String>,
     #[serde(default)]
     pub gate: Option<GateCfg>,
+    /// A name under `commands:` the agent may run on demand with `farmy-verify` (FORMATS.md, "On-demand
+    /// verify"); left out of a saved profile without it, so older runs' records stay as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
 }
 
 /// `factory.gate`: `network: none` runs the gate without the service's sidecars, without any network.

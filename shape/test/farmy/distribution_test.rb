@@ -80,28 +80,28 @@ class DistributionTest < AcceptanceTest
   end
 
   test "a mismatched folder pin refuses the binary before any service starts and names the fix" do
-    write_file "farmy.yml", "farmy: 0.2.0\n"
+    write_file "farmy.yml", "farmy: 0.3.0\n"
 
     farmy "start", "shop"
 
     assert_exit 1
-    assert_stderr "farmy update --to 0.2.0"
+    assert_stderr "farmy update --to 0.3.0"
     refute_container "shop"
   end
 
   test "a quoted folder pin mismatch is refused by the shim before control starts" do
-    write_file "farmy.yml", "farmy: '0.2.0' # the workspace release\n"
+    write_file "farmy.yml", "farmy: '0.3.0' # the workspace release\n"
     published_release
 
     distribution_shim "init"
 
     assert_exit 1
-    assert_stderr "farmy update --to 0.2.0"
+    assert_stderr "farmy update --to 0.3.0"
     refute_container "farmy"
   end
 
   test "version remains available while the folder pin mismatches" do
-    write_file "farmy.yml", "farmy: 0.2.0\n"
+    write_file "farmy.yml", "farmy: 0.3.0\n"
 
     farmy "--version"
 
@@ -136,7 +136,7 @@ class DistributionTest < AcceptanceTest
     assert_toolbox_metadata "0.0.9", outdated: true
   end
 
-  [SHIPPED, "0.2.0"].each do |version|
+  [SHIPPED, "0.3.0"].each do |version|
     test "a toolbox built by #{version} is not marked older than the shipped #{SHIPPED}" do
       toolbox_built_by version
 
@@ -153,7 +153,7 @@ class DistributionTest < AcceptanceTest
     distribution_shim "status"
 
     assert_stderr SHIPPED
-    assert_stderr "0.2.0"
+    assert_stderr "0.3.0"
     assert_stderr "farmy update"
   end
 
@@ -168,14 +168,14 @@ class DistributionTest < AcceptanceTest
 
     test "#{file} format 2 refuses before start and names a published version that reads it" do
       formatted_file file, 2
-      published_release "0.2.0", format: 2
+      published_release "0.3.0", format: 2
 
       distribution_farmy "start", "shop"
 
       assert_exit 1
       assert_stderr file
       assert_stderr(/format.*2/i)
-      assert_stderr "0.2.0"
+      assert_stderr "0.3.0"
       refute_container "shop"
     end
 
@@ -203,7 +203,7 @@ class DistributionTest < AcceptanceTest
 
   test "latest metadata that still cannot read the requested format does not invent a capable version" do
     formatted_file "farmy.yml", 7
-    published_release "0.2.0", format: 1
+    published_release "0.3.0", format: 1
 
     distribution_farmy "start", "shop"
 

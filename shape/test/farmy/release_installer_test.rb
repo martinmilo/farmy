@@ -5,7 +5,7 @@ class ReleaseInstallerTest < AcceptanceTest
 
   test "the release's installer, run without --to, installs the release it came from even when a newer one is latest" do
     published_release SHIPPED, latest: false
-    published_release "0.2.0"
+    published_release "0.3.0"
 
     install_from_release
 
@@ -16,13 +16,13 @@ class ReleaseInstallerTest < AcceptanceTest
 
   test "the release's installer with --to installs that version" do
     published_release SHIPPED, latest: false
-    published_release "0.2.0"
+    published_release "0.3.0"
 
-    install_from_release to: "0.2.0"
+    install_from_release to: "0.3.0"
 
     assert_success
     distribution_shim "--version"
-    assert_stdout "farmy 0.2.0"
+    assert_stdout "farmy 0.3.0"
   end
 
   test "the installer ends by naming the version and the folder, and the export line when the folder is not on PATH" do
