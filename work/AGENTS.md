@@ -44,7 +44,7 @@ bug report from a user.
 **Implement the behaviour, not the example.** The tests are samples of the behaviour, and
 more samples will be added later. Code that recognises a sample (a branch for one specific
 input, a fixed output, a check for whether it is running under test) passes today and
-breaks on the next one. If a test expects `Redeemed GIFT-2041 (50 €)`, build redeeming.
+breaks on the next one. If a test expects `Redeemed GIFT-2041 ($50)`, build redeeming.
 
 **Where the tests are silent, choose the simplest reasonable behaviour** and note it. Your
 final summary lists these under "Decisions the tests did not cover", so that a test can be

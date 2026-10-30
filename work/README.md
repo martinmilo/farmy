@@ -38,7 +38,7 @@ pull and also enables source caching for targetless `update`. See
 
 ## Layout
 
-The farmy checkout (this repository) and your containers folder are two different places.
+The farmy checkout (this repository) and the folder farmy works in are two different places.
 
 ```
 farmy/                        the checkout; nothing of yours lives here
@@ -56,37 +56,42 @@ farmy/                        the checkout; nothing of yours lives here
   docs/                       what the links above point at
   bin/verify                  runs the acceptance suite from outside (bin/build compiles with cargo)
 
-~/containers/                 your containers folder; farmy runs in it
+~/.config/farmy/              the folder in use, the default home; farmy sets it up at its first command
   services/shop.yml           one definition per service: repository, image, ports, commands, sidecars
   services/shop.env           optional: settings for that service's app container only (readable inside; no secret)
   .env                        this machine's settings (the Git identity, LAN_HOST); no secret
-  farmy.yml                   optional: the secrets provider, the routes, agents, the knowledge container
+  farmy.yml                   the secrets provider, the routes, agents, the knowledge container; every key optional
+  .gitignore                  keeps .env, services/*.env, .work/ and farmy's temporary files out of git
   toolbox/                    optional: a Dockerfile that replaces farmy's toolbox
-  .work/                      farmy's state; nothing in it is promised, nothing in it is a secret
+~/.local/state/farmy/.work/   farmy's state; nothing in it is promised, nothing in it is a secret
 ```
 
 Put the shim on your PATH (`ln -s ~/farmy/farmy ~/bin/farmy`) or call it by path. Every command
-reads and writes the folder you are in.
+works in the folder in use, first match: `farmy -C <dir>`, `FARMY_DIR`, the nearest folder from the
+current one up that holds a `farmy.yml` (a project folder, its state in its own `.work/`), else the
+default home above (`$XDG_CONFIG_HOME/farmy` and `$XDG_STATE_HOME/farmy` when those are set; the same
+paths on a Mac). `farmy config path` prints it; `farmy config git` keeps it in git, so that
+`git clone` + `farmy` brings your services to another machine.
 
 ## Quickstart
 
 ```sh
 git clone https://github.com/acme/farmy.git ~/farmy
-mkdir ~/containers && cd ~/containers
-~/farmy/farmy init                  # builds the control image, writes .env, lists the services (none yet)
+~/farmy/farmy init                  # builds the control image, sets up ~/.config/farmy, writes .env there
 ~/farmy/farmy add https://github.com/acme/shop.git --image ruby:3.4-slim   # writes services/shop.yml
 ~/farmy/farmy start shop            # images, containers, the clone, the setup command
 ~/farmy/farmy                       # the session
 ```
 
 `farmy init` writes `.env` with the Git identity your host's git is configured with (the shim passes
-it in; without git on the host, farmy asks). That identity and an optional `LAN_HOST` are all
-`.env` holds. For private repositories, add a git route for the host and a secrets provider: see
+it in; without git on the host, farmy asks). `init` is optional: the first `start` writes a missing
+`.env` the same way, without a question, and says so on stderr. That identity and an optional
+`LAN_HOST` are all `.env` holds. For private repositories, add a git route for the host and a secrets provider: see
 "Keys and secrets".
 
 ## Adding a service
 
-In the containers folder:
+In the folder in use (`~/.config/farmy` unless you chose another):
 
 1. `farmy add <url> --image <image>` writes `services/<name>.yml` with the repository and the image;
    the name is the last part of the URL (`--name` for another). Or write the file by hand.
@@ -241,9 +246,13 @@ See [docs/mesh-egress.md](docs/mesh-egress.md).
 ## Commands
 
 ```
+farmy [-C <dir>] <command>    -C: the folder to use for this command (else FARMY_DIR, a farmy.yml up from here, ~/.config/farmy)
 farmy                         attach to the session (the TUI); also: farmy session. Without a terminal: the usage
 farmy session --background    make sure the session runs, without attaching
-farmy init                    prepare this folder: Docker, .env, the list of services (the shim: the control image)
+farmy init                    prepare the folder in use: Docker, .env, farmy.yml when it has none, the list of services
+                              (the shim: the control image)
+farmy config path             the folder in use, one absolute path
+farmy config git              keep the folder in use in git: .gitignore, git init, the first commit (never a .env)
 farmy add <url> [--image X] [--name N]   write services/<name>.yml with repo: and image:
 farmy start <name>...         start a service's containers (and what it start_after), then its setup command
 farmy stop [<name>...]        stop containers; none named: everything, the knowledge container too
@@ -276,6 +285,9 @@ farmy help                    the usage
 Exit codes: 0 done or nothing to do, 1 refused (something to fix first; the message names the
 file, key or command), 2 a mistake in the command line. Waiting factory commands also use 2 for a
 review or question pause. Refusals and warnings go to stderr.
+
+The session's header names the folder in use as `farmy status` prints it on its first line; with no
+service defined the list says `No services yet: farmy add <git url> [--image …]`.
 
 In the session: the arrows (or `j`) move, `s` start, `x` stop, `r` restart, `D` destroy (asks),
 `l` logs, `e` shell, `c` a command (a name from `commands:` or any words), `a` add a service (the
@@ -376,7 +388,9 @@ key are off: nothing of tmux is for the user), with the host's time zone (`TZ`, 
 replaced on the next `farmy`, so the TUI never runs stale (`farmy --version` and `farmy tui
 --version` print the build). It survives your
 terminal, your ssh connection and your laptop's lid; it does not survive the control container
-being removed (the next command after an update may select a new one). Attaching needs no secret: the brokers are
+being removed, which farmy never does while the session or a factory run is live in it (after an update,
+or from another folder, farmy refuses instead and says how to end them). On Linux the session, like
+every farmy command, runs as you, so what it writes is yours. Attaching needs no secret: the brokers are
 running with what they were loaded with.
 
 ## Tests

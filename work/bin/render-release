@@ -7,7 +7,12 @@ require "digest"
 root = File.expand_path("..", __dir__)
 config = YAML.safe_load(File.read(File.join(root, "release.yml")), aliases: false)
 version = File.read(File.join(root, "VERSION")).strip
-abort "invalid release version" unless version.match?(/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\z/)
+abort "invalid release version" unless version.match?(/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.[1-9]\d*)?\z/)
+# the commit the release is rendered from, which the rendered shim's farmy --version names
+commit = ENV.fetch("FARMY_COMMIT", "").strip
+commit = (IO.popen(["git", "-C", root, "rev-parse", "HEAD"], err: File::NULL, &:read) rescue "").to_s.strip if commit.empty?
+commit = commit[0, 7].to_s
+commit = "" unless commit.match?(/\A[0-9a-f]{7}\z/)
 owner = config.fetch("owner")
 github = config.fetch("github_url").sub(%r{/+\z}, "").sub(/\.git\z/, "")
 abort "invalid public release owner" unless owner.match?(/\A[a-z0-9][a-z0-9-]*\z/)
@@ -24,7 +29,7 @@ abort "usage: bin/render-release OUTPUT_DIRECTORY | --json" unless destination &
 FileUtils.mkdir_p(destination)
 {"farmy" => "farmy", "install" => "bin/install"}.each do |name, template|
   text = File.read(File.join(root, template))
-  {"FARMY_SHIM_VERSION" => version, "FARMY_DEFAULT_REGISTRY" => registry,
+  {"FARMY_SHIM_VERSION" => version, "FARMY_SHIM_COMMIT" => commit, "FARMY_DEFAULT_REGISTRY" => registry,
    "FARMY_DEFAULT_SOURCE" => source, "FARMY_DEFAULT_GITHUB" => github,
    "FARMY_RELEASE_VERSION" => version}.each do |key, value|
     text = text.gsub(/^#{key}=.*$/, "#{key}='#{value}'")

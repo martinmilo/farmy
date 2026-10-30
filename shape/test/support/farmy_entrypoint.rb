@@ -35,7 +35,7 @@ module FarmyEntrypoint
     change_docker_state { |state| state["entrypoint_runtime"] = true }
     entrypoint = toolbox_build(service)["entrypoint"]
     refute_empty Array(entrypoint), "Expected the app image to name its entrypoint.#{transcript}"
-    execute(File.join(Farmy::FAKES, "docker"), ["exec", "-u", "root", service, *entrypoint], shown_as: "docker", env: farmy_env)
+    execute(File.join(Farmy::FAKES, "docker"), ["exec", "-u", "root", service, *entrypoint], shown_as: "docker", env: farmy_env.compact)
   end
 
   def app_home_file_content(service, path)

@@ -13,36 +13,48 @@ clone URL is all farmy knows about a host).
 - Docker, running. On Linux, Docker Engine, with your user in the `docker` group
   (`sudo usermod -aG docker "$USER"`, then log in again) so that `docker ps` works without `sudo`.
   On a Mac, Docker Desktop or OrbStack; colima works too.
+  Windows with WSL2 and Docker Desktop is unverified: bind mounts from a WSL distro are believed to
+  keep raw uids, and whether farmy can run as you there depends on the socket's group in Docker
+  Desktop's VM. Try it, and tell us what you find; nothing in farmy refuses it.
 - The standalone `bin/install` script and a registry that publishes farmy images; see
   [distribution](distribution.md) for registry login and local development alternatives.
 
-That is all. Rust, git, tmux and compose live in the control image. The files farmy writes in your
-containers folder are yours, whichever Docker you run.
+That is all. Rust, git, tmux and compose live in the control image. The files farmy writes are
+yours, whichever Docker you run.
 
-## 1. Install farmy and make a containers folder
+## 1. Install farmy
 
 ```sh
 FARMY_REGISTRY=ghcr.io/acme sh bin/install # substitute your publisher's registry and owner
 export PATH="$HOME/.local/bin:$PATH"
-mkdir ~/containers && cd ~/containers
 ```
 
-The containers folder is yours: it holds the definitions and farmy's state, and farmy runs in it.
-Commit it if you like, except `.env` and `.work/`. The first command pulls the control image
-matching the installed shim, tags it locally as `farmy:local`, and starts the control container
-`farmy`, which stays.
+There is no folder to make. farmy keeps its configuration (`farmy.yml`, the definitions under
+`services/`, this machine's `.env`) in `~/.config/farmy` and its own state in `~/.local/state/farmy`,
+on a Mac too; `XDG_CONFIG_HOME` and `XDG_STATE_HOME` move them. The first command sets
+`~/.config/farmy` up: a `farmy.yml` with every default and a `.gitignore` that keeps `.env`,
+`services/*.env`, `.work/` and farmy's temporary files out of git; on a terminal it asks once whether
+to keep the folder in git (`farmy config git` does it later), unless it lies in a Git repository
+already. Run farmy from any folder: `farmy config path` says which folder it uses. A folder that holds a `farmy.yml` is a project folder of its own, used whenever you run farmy in
+it or below it; `farmy -C <dir>` and `FARMY_DIR` name one (README, "Where farmy keeps things").
 
-## 2. `farmy init`
+The first command also pulls the control image matching the installed shim, tags it locally as
+`farmy:local`, and starts the control container `farmy`, which stays.
+
+## 2. `farmy init` (optional)
 
 ```sh
 farmy init
 ```
 
-Four steps: Docker answers; `.env` is written with `GIT_USER_NAME` and `GIT_USER_EMAIL` taken from
-your host's `git config --global` (asked for when the host has none); the agents every app image
+You can skip it: the first `farmy start` writes `.env` itself from your host's git identity and says
+so. `init` does more, and asks on a terminal. Four steps: Docker answers; `.env` is written with
+`GIT_USER_NAME` and `GIT_USER_EMAIL` taken from your host's `git config --global` (asked for when
+the host has none); the agents every app image
 should carry are asked for (Claude Code, Codex, … from farmy's catalogue; none is a fine answer, and
 without a terminal none is what you get) and written into `farmy.yml` as `agents:`; the services are
-listed (none yet). `.env` holds that identity and, optionally, `LAN_HOST` (see the end). No token goes in it.
+listed (none yet). It works in the folder in use, `~/.config/farmy`, and names it. `.env` holds that
+identity and, optionally, `LAN_HOST` (see the end). No token goes in it.
 
 ## 3. Define a service
 
@@ -50,8 +62,8 @@ listed (none yet). `.env` holds that identity and, optionally, `LAN_HOST` (see t
 farmy add https://github.com/acme/shop.git --image ruby:3.4-slim
 ```
 
-writes `services/shop.yml` with the repository and the image. The rest is yours to add; a Rails
-app with Postgres ends up as:
+writes `~/.config/farmy/services/shop.yml` with the repository and the image. The rest is yours to
+add; a Rails app with Postgres ends up as:
 
 ```yaml
 repo: https://github.com/acme/shop.git
@@ -92,8 +104,8 @@ block: `${FARMY_PORT_32}` in a sidecar is 3132, and no other service may use tha
 
 A public repository needs nothing more. For a private one, git inside the container goes through
 the service's keys broker, which adds the token on the way out; the token never enters the app
-container. Copy `farmy.example.yml` from farmy's folder to `~/containers/farmy.yml`; as shipped it
-has what this path needs:
+container. Copy `farmy.example.yml` from farmy's folder over `~/.config/farmy/farmy.yml`; as shipped
+it has what this path needs:
 
 ```yaml
 keys:
@@ -150,7 +162,8 @@ farmy start shop
 
 What happens, in order:
 
-1. Checks: Docker, `.env` with the Git identity, the definition of `shop` (a clone URL, an image,
+1. Checks: Docker, `.env` with the Git identity (written now when there is none and your host's git
+   has one), the definition of `shop` (a clone URL, an image,
    host ports in one block that no other service has), no `app` or `keys` in the fragment.
 2. Secrets: the values from step 5, for the routes `shop` may use.
 3. Images: `farmy-keys:local` and `farmy-knowledge:local` when missing, then `farmy/shop:dev`: the

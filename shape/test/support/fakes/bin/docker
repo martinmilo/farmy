@@ -42,6 +42,10 @@ EMPTY = { "containers" => {}, "images" => {}, "volumes" => {}, "networks" => { "
 $state = File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : JSON.parse(JSON.generate(EMPTY))
 # a state a test prepared before any docker call (a log, a node on a volume) may lack the rest
 EMPTY.each { |k, v| $state[k] = JSON.parse(JSON.generate(v)) unless $state.key?(k) }
+# cli_warning: a line the docker client prints on stderr at every call before it answers, as one does whose config
+# file it cannot read (`WARNING: Error loading config file: …`). The answer on stdout and the exit code are as without
+# it (record 2026-10-29-1800).
+$stderr.puts $state["cli_warning"] if $state["cli_warning"]
 def save_fake_state
   temporary = "#{STATE_FILE}.#{Process.pid}.tmp"
   File.write(temporary, JSON.pretty_generate($state))
@@ -290,6 +294,22 @@ def cmd_inspect(argv, kind: nil)
   failed = false
   found = []
   names.each do |name|
+    # inspect_fails: {name => "error" | "empty"}: inspecting that existing container fails as a daemon that does not
+    # answer in time does, or answers nothing at all (exit 0, no output), as a test said (record 2026-10-26-2126)
+    how = (kind.nil? || kind == "container") && container_name(name) && ($state["inspect_fails"] || {})[container_name(name)]
+    # inspect_fails_once: {name => n}: of the inspects of that container from the moment a test said so, the n-th fails
+    # as a daemon that does not answer in time does; every other one answers (record 2026-10-29-1800)
+    if (kind.nil? || kind == "container") && container_name(name) && (nth = ($state["inspect_fails_once"] || {})[container_name(name)])
+      counted = ($state["inspects_counted"] ||= {})[container_name(name)] = $state["inspects_counted"].fetch(container_name(name), 0) + 1
+      how = "error" if counted == nth
+    end
+    if how == "error"
+      failed = true
+      $stderr.puts "Error response from daemon: context deadline exceeded"
+      next
+    elsif how == "empty"
+      next
+    end
     object = nil
     object = inspect_object(container_name(name), find_container(name)) if (kind.nil? || kind == "container") && find_container(name)
     object ||= image_object(name) if (kind.nil? || kind == "image") && find_image(name)
@@ -305,7 +325,18 @@ def cmd_inspect(argv, kind: nil)
                    end)
     end
   end
-  if format then found.each { |o| puts render(format, o) }
+  # Docker resolves a name with no --type to a container, an image, a volume or a network, whichever exists. A template
+  # that names a field the object does not have (.Config, .State or .Mounts of a network) is an error, exit 1: "map has
+  # no entry for key" (record 2026-10-29-1530).
+  if format
+    found.each do |o|
+      missing = (o.key?("Driver") && o.key?("Scope")) ? format.scan(/(?:\{\{-?\s*|[\s(])\.([A-Za-z_]\w*)/).flatten.uniq.reject { |k| o.key?(k) } : []
+      if missing.empty? then puts render(format, o)
+      else
+        $stderr.puts "Template parsing error: template: :1: executing \"\" at <.#{missing.first}>: map has no entry for key \"#{missing.first}\""
+        failed = true
+      end
+    end
   elsif !found.empty? || failed then puts JSON.pretty_generate(found)
   end
   exit 1 if failed
@@ -948,6 +979,31 @@ def cmd_run(argv, start: true, attached: nil, made: nil)
   image, *command = rest
   name = value(opts, "name")
   name ||= "created-#{next_seq}" unless start
+  # slow_creates: {name => seconds}: making a container of that name (docker run or create) is under way, the journal
+  # free meanwhile, as a daemon pulling and starting it is, until another docker call goes to remove or make a container
+  # of that name (docker rm, run or create naming it; a moment later), or that many seconds pass. By then a container of
+  # that name made by another call meanwhile makes this one fail as Docker refuses a name in use (record 2026-10-29-1800).
+  # Holding on the other call, not on a clock, makes two shims that both set out to make it meet mid-create however
+  # loaded the machine is; a shim that waits instead (a lock) lets the clock run out and finds the container made.
+  if name && (seconds = ($state["slow_creates"] || {})[name])
+    release_fake_state
+    calls = File.join(JOURNAL, "calls.log")
+    seen = File.readlines(calls).size
+    deadline = Time.now + seconds
+    while Time.now < deadline
+      sleep 0.05
+      if File.readlines(calls).drop(seen).any? { |l| w = (Shellwords.split(l) rescue []); w = w.drop(1) if w.first == "container"; %w[rm run create].include?(w.first) && w.include?(name) }
+        sleep 0.3
+        break
+      end
+    end
+    acquire_fake_state
+    if containers.key?(name)
+      $stderr.puts("docker: Error response from daemon: Conflict. The container name \"/#{name}\" is already in use by container " \
+                   "\"#{full_id(name + next_seq.to_s)}\". You have to remove (or rename) that container to be able to reuse that name.")
+      exit 125 # as Docker exits on a name in use
+    end
+  end
   # made: a container made earlier with docker create keeps the environment it was given then
   env, env_files = made ? made.values_at("env", "env_files") : run_env(opts)
   volumes_named, binds = split_volumes(run_volume_specs(opts), nil, {})
@@ -1011,7 +1067,11 @@ def cmd_build(argv)
                  path = dockerfile_path ? File.expand_path(dockerfile_path) : File.join(context_dir, "Dockerfile")   # -f is relative to the working directory, as for docker
                  File.exist?(path) ? File.read(path).scrub : ""
                end
-  files = context_dir && File.directory?(context_dir) ? Dir.glob("**/*", File::FNM_DOTMATCH, base: context_dir).select { |f| File.file?(File.join(context_dir, f)) }.sort : []
+  # A link in the context is sent as the link it is, never followed, as Docker does: it is listed under "links" with
+  # where it points, and nothing of what it points at is read (record 2026-10-29-1800).
+  entries = context_dir && File.directory?(context_dir) ? Dir.glob("**/*", File::FNM_DOTMATCH, base: context_dir).reject { |f| f.end_with?("/.", "/..") || %w[. ..].include?(f) } : []
+  links = entries.select { |f| File.symlink?(File.join(context_dir, f)) }.to_h { |f| [f, File.readlink(File.join(context_dir, f))] }
+  files = entries.select { |f| !File.symlink?(File.join(context_dir, f)) && File.file?(File.join(context_dir, f)) && !links.keys.any? { |l| f.start_with?("#{l}/") } }.sort
   labels = dockerfile.scan(/^\s*LABEL\s+(.*)$/i).flatten.flat_map { |line| Shellwords.split(line).map { |kv| kv.split("=", 2) } }.to_h
   entrypoint = exec_form(dockerfile.scan(/^\s*ENTRYPOINT\s+(.*)$/i).flatten.last)
   cmd = exec_form(dockerfile.scan(/^\s*CMD\s+(.*)$/i).flatten.last)
@@ -1023,7 +1083,7 @@ def cmd_build(argv)
   tags.each do |tag|
     hashes = files.first(50).to_h { |f| [f, (File.size(File.join(context_dir, f)) < 1_000_000 ? Digest::SHA256.file(File.join(context_dir, f)).hexdigest : nil)] } rescue {}
     texts = files.first(50).filter_map { |f| p = File.join(context_dir, f); [f, File.read(p).scrub] if File.size(p) < 65_536 && f.end_with?(".tsv", ".txt", ".yml", ".yaml", ".json", ".sh") } .to_h rescue {}
-    images[tag] = { "labels" => labels, "target" => value(opts, "target"), "files" => files.first(200), "file_hashes" => hashes, "file_texts" => texts, "dockerfile" => dockerfile,
+    images[tag] = { "labels" => labels, "target" => value(opts, "target"), "files" => files.first(200), "links" => links, "file_hashes" => hashes, "file_texts" => texts, "dockerfile" => dockerfile,
                     "context" => context_dir, "source" => context, "args" => values(opts, "build-arg"), "seq" => next_seq, "entrypoint" => entrypoint, "cmd" => cmd }
   end
   if flag?(opts, "q", "quiet")
@@ -1530,7 +1590,23 @@ command = argv.shift
 
 case command
 when nil then puts "Usage:  docker [OPTIONS] COMMAND"
-when "info" then puts "Client:\n Version: 27.3.1\nServer:\n Containers: #{containers.size}\n Images: #{images.size}\n Operating System: fake"
+when "info"
+  # daemon_security_options: what `docker info` reports under Security Options (record 2026-10-29-1215): a rootless
+  # daemon says rootless, a user-namespace remap says userns. A Go template that names .SecurityOptions gets the list.
+  security = ["name=seccomp,profile=builtin", "name=cgroupns", *Array($state["daemon_security_options"]).map { |o| "name=#{o}" }]
+  format = argv.each_cons(2).find { |a, _| %w[-f --format].include?(a) }&.last || argv.find { |a| a.start_with?("--format=") }&.delete_prefix("--format=")
+  # daemon_operating_system: what it says it is (Docker Desktop, say); info_format_fails: a call with a format fails as
+  # a daemon that does not answer in time does, while a plain `docker info` still answers (record 2026-10-29-1530)
+  os = $state["daemon_operating_system"] || "fake"
+  fail_with("Error response from daemon: context deadline exceeded") if format && $state["info_format_fails"]
+  known = { "{{json .SecurityOptions}}" => JSON.generate(security), "{{.SecurityOptions}}" => "[#{security.join(" ")}]",
+            "{{json .OperatingSystem}}" => JSON.generate(os), "{{.OperatingSystem}}" => os }
+  tidy = ->(t) { t.sub(/\A\{\{-?\s*/, "{{").sub(/\s*-?\}\}\z/, "}}") }
+  if format && !format.scan(/\{\{.*?\}\}/).empty? && format.scan(/\{\{.*?\}\}/).all? { |t| known.key?(tidy.(t)) }
+    puts format.gsub(/\{\{.*?\}\}/) { |t| known.fetch(tidy.(t)) }
+  else # as before, any other format gets the whole text
+    puts "Client:\n Version: 27.3.1\nServer:\n Containers: #{containers.size}\n Images: #{images.size}\n Security Options:\n#{security.map { |o| "  #{o.delete_prefix("name=").sub(",profile=", "\n   Profile: ")}" }.join("\n")}\n Operating System: #{os}"
+  end
 when "version" then puts "Client:\n Version: 27.3.1\nServer:\n Version: 27.3.1"
 when "compose" then cmd_compose(argv)
 when "ps" then cmd_ps(argv)
@@ -1578,6 +1654,8 @@ when "top"
   _, names = parse(argv, valued: [])
   c = find_container(names.first.to_s) or fail_with("Error response from daemon: No such container: #{names.first}")
   fail_with("Error response from daemon: container #{names.first} is not running") unless c["state"] == "running"
+  # top_fails: docker top of that container fails, as a daemon that does not answer in time does (record 2026-10-29-1530)
+  fail_with("Error response from daemon: context deadline exceeded") if Array($state["top_fails"]).include?(container_name(names.first.to_s))
   puts "UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD"
   procs = [(c["process"] || c["command"]).join(" ")] + (c["processes"] || [])
   procs.each_with_index { |p, i| puts "dev                 #{4242 + i}                #{i == 0 ? 4200 : 4242}                0                   12:00               ?                   00:00:00            #{p}" }

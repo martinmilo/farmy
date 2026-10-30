@@ -5,7 +5,42 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub(crate) const WORK: &str = ".work";
+/// farmy's own state, "nothing in it is promised": `.work` in a project folder, `<state>/.work` for the
+/// default home (FORMATS.md, "Where farmy keeps things"). A value of its own so that every `.work/…`
+/// path reads `PathBuf::from(WORK).join(…)` or `format!("{WORK}/…")` wherever the state folder is.
+#[derive(Clone, Copy)]
+pub(crate) struct Work;
+pub(crate) const WORK: Work = Work;
+
+impl Work {
+    pub(crate) fn path(self) -> &'static Path {
+        crate::folder::work()
+    }
+}
+
+impl AsRef<Path> for Work {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Work {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path().as_os_str()
+    }
+}
+
+impl From<Work> for PathBuf {
+    fn from(w: Work) -> PathBuf {
+        w.path().to_path_buf()
+    }
+}
+
+impl std::fmt::Display for Work {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.path().display())
+    }
+}
 
 /// Where farmy's own files are: the toolbox, the Dockerfiles of the helpers, the docs. The control
 /// image sets FARMY_HOME; a binary run from a checkout finds them two folders up (bin/farmy).
@@ -36,9 +71,13 @@ impl Settings {
     /// None when there is no .env.
     pub(crate) fn load() -> Option<Settings> {
         let text = std::fs::read_to_string(".env").ok()?;
-        Some(Settings {
-            map: parse_env(&text),
-        })
+        Some(Settings::from_text(&text))
+    }
+
+    pub(crate) fn from_text(text: &str) -> Settings {
+        Settings {
+            map: parse_env(text),
+        }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
@@ -319,8 +358,12 @@ impl Config {
                 });
             }
         };
-        let value: serde_yaml::Value =
+        let mut value: serde_yaml::Value =
             serde_yaml::from_str(&text).map_err(|e| format!("farmy.yml does not read: {e}"))?;
+        if value.is_null() {
+            // nothing but comments: every default
+            value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        }
         if let Some(map) = value.as_mapping() {
             for k in map.keys() {
                 let k = k.as_str().unwrap_or("?");
@@ -980,44 +1023,15 @@ pub(crate) fn looks_like_base64_key(value: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// What farmy writes in the containers folder is the folder owner's. On Docker Engine the control
-/// container's root writes into the bind-mounted folder as root, and the files would be root's on the
-/// host; Docker Desktop and OrbStack map ownership by themselves, and there this finds nothing to do.
-/// Only what farmy writes is looked at: `.env`, `services/`, everything under `.work/`.
-pub(crate) fn hand_to_folder_owner() {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(folder) = std::fs::metadata(".") else {
-        return;
-    };
-    let (uid, gid) = (folder.uid(), folder.gid());
-    fn walk(path: &Path, uid: u32, gid: u32, deep: bool) {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if meta.uid() != uid || meta.gid() != gid {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "best effort: a file whose owner cannot be changed stays as it was, which Docker Desktop and OrbStack need anyway"
-            )]
-            let _ = std::os::unix::fs::lchown(path, Some(uid), Some(gid));
-        }
-        if meta.is_dir() {
-            for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-                let child = entry.path();
-                if deep
-                    || child
-                        .extension()
-                        .map(|e| e == "yml" || e == "env")
-                        .unwrap_or(false)
-                {
-                    walk(&child, uid, gid, deep);
-                }
-            }
-        }
-    }
-    walk(Path::new(".env"), uid, gid, false);
-    walk(Path::new("services"), uid, gid, false);
-    walk(Path::new(WORK), uid, gid, true);
+/// `uid:gid` of the user farmy runs as. On Linux the shim runs farmy in the control container as the user
+/// who runs the shim, so that what farmy writes is that user's from the moment it is written (nothing is
+/// chowned afterwards); containers farmy runs that write into the folder or the state folder run as it too.
+pub(crate) fn running_as() -> String {
+    format!(
+        "{}:{}",
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw()
+    )
 }
 
 #[cfg(test)]

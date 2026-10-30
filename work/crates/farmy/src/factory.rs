@@ -1616,6 +1616,7 @@ fn spawn_run(st: &mut State, controller: crate::locking::Lock) -> R<std::process
     let _launch = crate::locking::Lock::take(&dir.join("launch.lock"))?;
     let child = Command::new(std::env::current_exe()?)
         .args(["factory", "run", &st.id])
+        .env("FARMY_DIR", &crate::folder::current().path)
         .stdin(controller.into_stdio())
         .stdout(log.try_clone()?)
         .stderr(log)

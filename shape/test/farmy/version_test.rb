@@ -1,8 +1,8 @@
 class VersionTest < AcceptanceTest
-  test "farmy --version and the TUI report the same build hash" do
+  test "farmy --version and the TUI report the same version and commit" do
     farmy "--version"
     assert_success
-    assert_stdout(/\Afarmy \S+ \([0-9a-f]{8,}\)\s*\z/)
+    assert_reports_build SHIPPED
     cli = stdout
 
     farmy "tui", "--version"

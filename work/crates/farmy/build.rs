@@ -17,11 +17,8 @@ fn main() {
     let version = std::fs::read_to_string(&version_path).expect("VERSION must exist");
     let version = version.trim();
     assert!(
-        version.split('.').count() == 3
-            && version.split('.').all(|s| !s.is_empty()
-                && s.bytes().all(|c| c.is_ascii_digit())
-                && (s == "0" || !s.starts_with('0'))),
-        "VERSION must be MAJOR.MINOR.PATCH"
+        valid_version(version),
+        "VERSION must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N"
     );
     println!("cargo:rustc-env=FARMY_VERSION={version}");
     let root = crates.parent().expect("the crate sits in work/crates/");
@@ -102,4 +99,59 @@ fn main() {
         "invalid control build fingerprint"
     );
     println!("cargo:rustc-env=FARMY_BUILD_HASH={hash}");
+    commit(root);
+}
+
+/// One number of a version: digits, no leading zero.
+fn number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
+}
+
+/// `MAJOR.MINOR.PATCH`, or a pre-release `MAJOR.MINOR.PATCH-rc.N` (N from 1).
+fn valid_version(version: &str) -> bool {
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    core.split('.').count() == 3
+        && core.split('.').all(number)
+        && pre.is_none_or(|p| p.strip_prefix("rc.").is_some_and(|n| number(n) && n != "0"))
+}
+
+/// The short commit (7 hex digits) the sources are built from: FARMY_COMMIT when the build is given it
+/// (an image build, whose context has no .git), else the checkout's HEAD; `commit unknown` when neither
+/// says. Rebuilt when HEAD moves.
+fn commit(root: &Path) {
+    println!("cargo:rerun-if-env-changed=FARMY_COMMIT");
+    let given = std::env::var("FARMY_COMMIT").unwrap_or_default();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let full = if given.is_empty() {
+        for path in ["HEAD", "packed-refs"] {
+            if let Some(file) = git(&["rev-parse", "--git-path", path]) {
+                println!("cargo:rerun-if-changed={}", root.join(file).display());
+            }
+        }
+        if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"])
+            && let Some(file) = git(&["rev-parse", "--git-path", &reference])
+        {
+            println!("cargo:rerun-if-changed={}", root.join(file).display());
+        }
+        git(&["rev-parse", "HEAD"]).unwrap_or_default()
+    } else {
+        given
+    };
+    let commit = if full.len() >= 7 && full.bytes().all(|b| b.is_ascii_hexdigit()) {
+        full.get(..7).unwrap_or(&full).to_ascii_lowercase()
+    } else {
+        "commit unknown".to_string()
+    };
+    println!("cargo:rustc-env=FARMY_COMMIT={commit}");
 }

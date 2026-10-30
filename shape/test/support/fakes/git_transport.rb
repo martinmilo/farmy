@@ -22,11 +22,32 @@ def play_service_clone(record, mounts)
   exit record["exit"]
 end
 
+def reaches_over_ssh?(words, env)
+  rewrites = env.select { |key, _| key.start_with?("GIT_CONFIG_KEY_") }.filter_map do |key, name|
+    base = name[/\Aurl\.(.+)\.insteadof\z/i, 1] or next
+    [env["GIT_CONFIG_VALUE_#{key.delete_prefix("GIT_CONFIG_KEY_")}"].to_s, base]
+  end
+  ssh = ->(url) { url.match?(%r{\A(?:ssh|git\+ssh)://}) || url.match?(%r{\A[\w.-]+@[\w.-]+:(?!//)}) }
+  words.join(" ").split(/\s+/).any? do |word|
+    from, to = rewrites.select { |prefix, _| !prefix.empty? && word.start_with?(prefix) }.max_by { |prefix, _| prefix.size }
+    ssh.(from ? to + word.delete_prefix(from) : word)
+  end
+end
+
 def check_git_container_transport(record, mounts)
   return unless $state["required_git_transport"]
   role = record.dig("labels", "farmy.role")
   return unless %w[git dotfiles].include?(role) || record.fetch("process", []).join(" ").match?(/\bgit\s+(?:clone|fetch|pull|push|ls-remote|archive)\b/)
   env = record.fetch("env", {})
+  # ssh needs an account for the uid it runs as. The images farmy runs git in have root and dev (1001); as any other
+  # numeric uid, a URL git reaches over ssh (ssh://, git+ssh://, user@host:path, or one an insteadOf rule in the
+  # container's git config rewrites to those) gets ssh's "No user exists for uid" (record 2026-10-29-1530).
+  uid = record["user"].to_s.split(":").first.to_s
+  uid = { "" => "0", "root" => "0", "dev" => "1001" }.fetch(uid, uid)
+  if !%w[0 1001].include?(uid) && reaches_over_ssh?(record.fetch("process", []) + [env["REPO"]].compact, env)
+    record["exit"] = 128
+    fail_with("No user exists for uid #{uid}\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.")
+  end
   nets = record.fetch("networks", [])
   config = env.select { |key, _| key.start_with?("GIT_CONFIG_KEY_") }.to_h { |key, value| [value, env["GIT_CONFIG_VALUE_#{key.delete_prefix('GIT_CONFIG_KEY_')}"]] }
   missing = []

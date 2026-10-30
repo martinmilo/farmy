@@ -15,11 +15,12 @@ current endpoint: on a Linux host a `unix://` endpoint's path, rootless Docker's
 `/var/run/docker.sock` inside; on macOS always `/var/run/docker.sock`, the socket of the VM the daemon
 runs in; an endpoint that is not a local socket, `tcp://` or `ssh://`, is refused, saying farmy needs a
 local Docker) and
-the containers folder mounted at the same path as on the host. The control container is named
+the folder in use (and its state folder, "Where farmy keeps things") mounted at the same path as on the host. The control container is named
 `farmy` and stays up: its main process is never the farmy binary, which is a command-line tool and
 exits; farmy runs in it through `docker exec`. Every farmy binary carries a build hash of its
-sources: `farmy --version` prints `farmy <version> (<hash>)` and `farmy tui --version` the same. The image carries the label `farmy.hash`, a content
-hash of the control image's build inputs; explicit local builds rebuild when those inputs
+sources, which the session compares; `farmy --version` prints `farmy <version> (<commit>)` (record 2026-10-29-1800,
+see **Distribution**), and the shim and `farmy tui --version` the same. The image carries the label `farmy.hash`, a content
+hash of the control image's build inputs, and `farmy.commit`; explicit local builds rebuild when those inputs
 change. `farmy update` follows the distribution contract below. `farmy` with no arguments on a
 terminal attaches to the persistent session: a tmux session that holds the TUI, so that it
 survives a closed terminal; tmux is never something the user operates. No tmux key is shown or
@@ -52,13 +53,146 @@ toolbox/                  optional: a Dockerfile that replaces farmy's toolbox
 ```
 
 Everything farmy creates or rewrites in this folder (`.env`, `services/<name>.yml` from `add` and from
-the port write-back, everything under `.work/`) belongs to the owner of the folder: its uid and gid as
-the control container sees them, whatever user farmy runs as. Docker Desktop and OrbStack map file
-ownership to the host user by themselves; Docker Engine on Linux does not, so a file the control
-container's root writes would be root's on the host.
+the port write-back, everything under `.work/`) belongs to the user who runs farmy from the moment it is
+written, during a session too: on Linux farmy runs as that user (see **Who farmy runs as**, record
+2026-10-29-1215), not as root with a chown afterwards. Docker Desktop and OrbStack map file ownership to the
+host user by themselves; Docker Engine on Linux does not.
 
 A `ports.yml` in the folder (the format before this one) is refused by name, pointing at `ports:`
 in the definitions.
+
+## Where farmy keeps things (record 2026-10-29-0926)
+
+**The folder in use.** Every command except `help`, `--version` and `tui --version` resolves it, first match wins:
+
+1. `-C <dir>` before the command (`farmy -C ~/containers status`). It is the folder itself, used as is: no search
+   upward, no `farmy.yml` needed. A relative value is taken from the current folder. A folder that does not exist is
+   a mistake in the command line (exit 2) naming the path; `-C` without a value is one too. Nothing is created.
+2. `FARMY_DIR`, the same way (relative from the current folder; no `farmy.yml` needed). A folder that does not
+   exist is refused (exit 1) naming `FARMY_DIR` and the path. Nothing is created.
+3. The nearest folder holding a `farmy.yml`: the current folder, then each parent up to `/`.
+4. The default home.
+
+**The default home.** Configuration: `$XDG_CONFIG_HOME/farmy`, else `$HOME/.config/farmy`. State:
+`$XDG_STATE_HOME/farmy`, else `$HOME/.local/state/farmy`. An `XDG_*` value that is empty or not absolute counts as
+unset. When the default home is reached and one of its paths needs `HOME` (its `XDG_*` value unset) while
+`HOME` is unset, empty or not absolute, farmy refuses (exit 1) naming `HOME`, and `XDG_CONFIG_HOME` /
+`XDG_STATE_HOME`, `FARMY_DIR` or `-C` as the ways out; nothing is created (record 2026-10-29-1105). macOS uses
+exactly these paths, never `~/Library` (so a Rust "config dir" helper that answers
+`~/Library/Application Support` on a Mac is wrong here). The default home's config folder is the default home
+however it is reached (`-C`, `FARMY_DIR`, or a current folder inside it, found by its `farmy.yml`).
+
+| | default home | any other folder |
+|---|---|---|
+| `farmy.yml`, `services/<name>.yml`, `services/<name>.env`, `.env`, `toolbox/`, `tools.lock`, provider paths | `~/.config/farmy/` | the folder |
+| `.work/` (everything "nothing in it is promised" covers) | `~/.local/state/farmy/.work/` | `<folder>/.work/` |
+
+Every path this file gives as `.work/…` is under the state folder's `.work/`. A project folder's state folder is the
+folder itself, so nothing changes for one: with a `farmy.yml` and no default home, nothing is created in the
+default home and nothing is copied or moved. Everything farmy creates or rewrites in either folder belongs to the
+user who runs farmy from the moment it is written (see above).
+
+**A current folder that looks like an old containers folder.** When the folder in use is the default home and
+the current folder holds no `farmy.yml` but has `services/` with a `.yml` in it or a `.env` naming
+`GIT_USER_NAME`, farmy prints on stderr, once per command:
+`farmy: using ~/.config/farmy; this folder has no farmy.yml — to keep using it: touch farmy.yml (or farmy -C .)`
+(the default home's path written as below). It never writes into the current folder.
+
+**Setting up the default home.** When the default home's config folder has no `farmy.yml`, any command that
+resolves to it first sets it up:
+- creates the folder and `services/`, and writes `farmy.yml` with every default: a comment line and `format: 1`,
+  no `farmy:` pin;
+- writes `.gitignore` when there is none (never overwrites one), exactly:
+  ```
+  # farmy: kept out of git, so that no secret is ever committed
+  .env
+  services/*.env
+  .work/
+  .*.tmp
+  ```
+  farmy's own temporary files in the folder are named `.<file>.<anything>.tmp` (written beside the file they
+  replace, then renamed over it); the last line keeps one a crash left behind out of git (record 2026-10-29-1105).
+- when stdin is a terminal (the question on stdout or stderr, never through /dev/tty), the folder is not inside a Git repository already (its own or a parent's; see **Which Git repository**), and the
+  machine has not declined before, asks `Keep ~/.config/farmy in git? [y/N] ` (the folder's path written as
+  below). `y` or `yes` (any case) runs `git init` there and commits `.gitignore`, `farmy.yml` and whatever
+  `services/` holds, then says how to commit later changes (`git -C <folder> add -A && git -C <folder> commit`).
+  Anything else, an empty line or end of input included, is a no: farmy writes its marker
+  `<state>/.work/config-git-declined` and never asks again on this machine.
+- without a terminal it asks nothing and writes no marker. The folder then has its `farmy.yml` and is not set up
+  again; `farmy config git` remains.
+
+A config folder that already has a `farmy.yml` (a `git clone` from another machine) is never set up: nothing is
+asked and nothing is written into it. The question comes at set-up, before the command does its own work.
+
+The commit's identity, first found: `GIT_USER_NAME` / `GIT_USER_EMAIL` in farmy's environment (the shim passes the
+host's on every command), `.env`, git's own configuration. With none, the repository is made, nothing is
+committed, and farmy says the commit needs a Git identity and how to give one.
+
+**Which Git repository** (record 2026-10-29-1105). The folder lies in the repository `FARMY_HOST_GIT_TOP` names
+when that is set and not empty: the shim sets it, because inside the control container a parent's `.git` is not
+mounted. Otherwise farmy asks git where it runs (`git rev-parse --show-toplevel` in the folder), which is right
+when farmy runs on the host itself. Set-up's question and `farmy config git` both go by this.
+
+**`farmy config`.**
+
+```
+farmy config path    the absolute path of the folder in use, one line, nothing else on stdout
+farmy config git     keep the folder in use in git: .gitignore when it has none, git init, the first commit
+                     (.gitignore, farmy.yml, services/). Already inside a Git repository (its own or a parent's, see above):
+                     nothing is made; stdout says `<folder> is already in the Git repository <top folder>: nothing
+                     to do` (both written as below), exit 0
+farmy config         alone or with another word: a mistake in the command line (exit 2)
+```
+
+**Paths in messages.** A path under the user's home is written `~/…`; any other path is absolute. `config path`
+and `status --json` always give absolute paths. The user's home is `FARMY_HOST_HOME` when set (the shim sets it:
+inside the control container `HOME` is not the user's), else `HOME`.
+
+**Where it looked.** Every message about no service, no definitions or an unknown service names the folder farmy
+looked in: `init`'s services step; `start`, `restart`, `rebuild` and `url` with none defined; any command naming an
+unknown service. The refusal for a missing `.env` names the folder instead of saying "this folder". `status` prints as its first line `folder` in the same column as `ports`:
+`folder       <path>`, and for the default home `folder       ~/.config/farmy (state in ~/.local/state/farmy)`.
+With no service defined it then prints, instead of any service line:
+`No services yet: farmy add <git url> [--image …]` (stdout, exit 0). `status --json` gains a top-level
+`"folder": {"path": "<absolute folder>", "state": "<absolute state folder>"}` (the same path twice for a project
+folder). The TUI's header shows the folder as `status` prints it, and its empty service list shows exactly the
+line `No services yet: farmy add <git url> [--image …]`.
+
+**`farmy init`** works in the folder in use like every command: in a plain folder that is the default home
+(`farmy -C <dir> init` prepares another). It writes `farmy.yml` with every default (as set-up does) when the folder
+has none, so the next command finds that folder; an existing `farmy.yml` is left as it is (on a terminal the agents
+block is still added as before). Docker is checked before anything is written.
+
+**The usage** begins with `farmy [-C <dir>] <command> …` and lists `config path` and `config git` under COMMANDS;
+`-C` is not listed under COMMANDS (the README test reads that list as command names).
+
+**The shim** resolves the folder on the host in the same order, with the same rules and refusals (the control
+container sees neither the current folder's parents nor the host's `HOME`), and consumes `-C` itself. Before
+mounting it creates the folder, and the state folder when the default home is in use (Docker would create a missing
+bind source as root). It mounts the folder at its own path, and the state folder at its own path when it is
+another; a control container whose mounts differ is replaced, as one for another folder is today. It reads the
+`farmy:` pin, `format:` and `.env`'s keys from the resolved folder. Every `docker exec` of farmy carries `-w
+<folder>` and, in its environment, `FARMY_DIR=<folder>`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` resolved on the
+host to absolute paths (the fallbacks applied), `FARMY_HOST_HOME=<the host's HOME>`, and the host's
+`git config --global user.name` / `user.email` as `GIT_USER_NAME` / `GIT_USER_EMAIL` when it has them, for every
+command. The binary inside then reaches the same folder and state folder. On macOS (`uname` says `Darwin`) the
+paths are the same; nothing goes under `~/Library`.
+
+On a real host the shim also (record 2026-10-29-1105):
+- **tidies every folder path it resolves** before it mounts or hands it over: no trailing `/`, no `//`
+  (`XDG_CONFIG_HOME=/home/dana/.config/` gives `/home/dana/.config/farmy`), so the mounts match what Docker reports
+  and the control container is not replaced on every command;
+- **refuses without `HOME`** as farmy does (above): exit 1 naming `HOME`, before any folder is created or any
+  `docker` call is made;
+- **hands over `FARMY_HOST_GIT_TOP=<top folder>`** on every `docker exec` of farmy when the folder in use lies
+  inside a Git repository on the host: the nearest folder holding a `.git` (folder or file), the folder in use
+  itself or a parent, found by looking, without running git. Outside any repository it hands none;
+- **on macOS runs git only when `xcode-select -p` succeeds.** Without the developer tools `/usr/bin/git` is Apple's
+  stub, which offers to install them each time it runs; the shim then runs no git at all and hands over no Git
+  identity;
+- **leaves its own environment as the user had it.** `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and the other values
+  above go on the `docker exec` only (`-e NAME=value`); the commands the shim runs on the host (the unlock
+  command, `security`, `secret-tool`) see the variables as they were.
 
 ## `.env`
 
@@ -75,7 +209,13 @@ in the definitions.
 `GIT_USER_NAME` / `GIT_USER_EMAIL` in its own environment (the shim puts the host's git
 configuration there), the global git configuration where it runs (`git config --global
 user.name` / `user.email`), a question on a terminal; else it warns and leaves the key for the
-owner to set. It never changes an existing `.env`. Of `.env`, only the Git identity reaches an
+owner to set. It never changes an existing `.env`.
+
+`start`, `restart` and `rebuild` need `.env` (record 2026-10-29-1030). When the folder in use has none, they write it
+as `init` does, taking the Git identity from `GIT_USER_NAME` / `GIT_USER_EMAIL` in their environment, then the global
+git configuration where they run (no question), say on stderr that it was written and where, and go on. With no
+identity from either, they are refused as before (exit 1, naming `.env` and `farmy init`) and write nothing. An
+existing `.env` is never changed; one without the Git identity is refused by key. Of `.env`, only the Git identity reaches an
 app container; nothing else of it reaches any container, and no key lives in it (see "Keys").
 
 ## `services/<name>.yml`
@@ -88,7 +228,8 @@ image: ruby:3.4-slim           # the image the app container is built on (an off
 dockerfile: Dockerfile         # build it from this Dockerfile in the repository (a stage written for development:
                                # a generated Rails/Node Dockerfile is a production image and is the wrong base)...
 target: base                   # ...this stage of it (optional)...
-build_files: [Gemfile, Gemfile.lock]   # ...with these files from the repository in the build context (optional)
+build_files: [Gemfile, Gemfile.lock]   # ...with these files from the repository in the build context (optional;
+                               # paths inside the repository, see **Build files and links** below)
 ports: ["3100:3000"]           # host:container pairs, as compose writes them; the first is the app's address.
                                # Optional: without it nothing is published. The hundred the host ports lie in
                                # (3100-3199) is the service's block: all its host ports lie in it, no other
@@ -166,6 +307,30 @@ owned by the dev user; a mount named `src` is refused (`/workspace` is `<name>-s
 `services/<name>.env` has `KEY=value` lines; every key reaches that service's app container and
 no other. Like everything in that container it is readable by the agent inside: it is for
 settings, not for secrets (those go through routes).
+
+### Build files and links (record 2026-10-29-1800)
+
+A service's Dockerfile and build files are read from the committed tree of `branch`, through the git container,
+whatever the transport (`https://`, `file://`, ssh). Nothing outside the repository is ever read for them.
+
+- **Entries.** `dockerfile:` and every `build_files` entry is a relative path inside the repository: not
+  absolute, no `..` part, not empty, not starting with `-`. Any other entry is refused (exit 1) before anything
+  is fetched, naming the entry and the service file. No file outside the repository is read or written for it,
+  the folder's `.env` included.
+- **A file that is a link** (a symlink committed as one) is resolved inside the repository, link by link, each
+  step staying in the committed tree; the build context gets the content as a regular file. A link that leads
+  out of the repository (above its root, or to an absolute path) or to nothing is refused (exit 1) before
+  anything is built, naming the file and saying it points outside the repository:
+
+  ```
+  [<name>] build_files: 'Gemfile.lock' points outside the repository (a link to ../.env) — farmy reads build files from the repository only
+  ```
+
+  (the wording after the file name is the worker's; the tests ask for the file and `outside the repository`).
+  The Dockerfile is held to the same rule. Nothing a refused link points at reaches a build context, an image,
+  stdout or stderr.
+- A build context never holds a link: Docker sends links as links, and the fake keeps them so, so a link left in
+  a context shows as a leak in the tests.
 
 ## Keys and secrets
 
@@ -958,9 +1123,9 @@ service's volumes and never `farmy-shared`. A factory run will not mount `farmy-
 factory record).
 
 **Bind mounts.** The daemon resolves a bind source on the host, and of the control container's
-file system only the containers folder is there (mounted at its host path). So nothing farmy
-generates bind-mounts a path outside the containers folder: farmy's own files reach a container
-through its image or a volume.
+file system only the folder in use and its state folder are there (each mounted at its host path; the
+same folder for a project folder, see "Where farmy keeps things"). So nothing farmy generates
+bind-mounts a path outside those two: farmy's own files reach a container through its image or a volume.
 
 Before the containers come up (made anew or started again) farmy removes `/workspace/.farmy-clone`
 from the checkout's volume when that volume exists (a first start leaves the volume to compose, which labels it) (`rm -f` in a `docker run --rm` of the app image), so the marker it reads
@@ -989,8 +1154,10 @@ start. A workbench (`repo: none`) gets no `REPO` and nothing is cloned.
 ## Commands, exit codes, where messages go
 
 ```
+farmy [-C <dir>] <command>    -C: the folder to use (see "Where farmy keeps things"); before the command
 farmy                         attach to the session (the TUI); also: farmy session. Without a terminal: the usage
-farmy init                    prepare this folder: Docker, .env, the list of services (the shim: the control image, built when missing or stale)
+farmy init                    prepare the folder in use: Docker, .env, farmy.yml when it has none, the list of services (the shim: the control image, built when missing or stale)
+farmy config path | git       print the folder in use; keep it in git (see "Where farmy keeps things")
 farmy add <url> [--image <image>] [--name <name>]   write services/<name>.yml with repo: and image:; the name from the URL
 farmy start <name>...         start a service's containers (and what it start_after), then its setup command;
                               ends with the addresses, or `<name>: no ports published`
@@ -1014,7 +1181,7 @@ farmy agents                  every agent of the catalogue and of farmy.yml: nam
 farmy logs | ssh              pass-through to the containers; not covered by tests
 farmy update                  the shim: build the control image again when its inputs changed
 farmy help                    the usage
-farmy --version               farmy <version> (<build hash>); farmy tui --version prints the same
+farmy --version               farmy <version> (<short commit>); the shim and farmy tui --version print the same
 ```
 
 The usage (`farmy help`, and the binary with no arguments) lists every command above, `add`,
@@ -1035,15 +1202,17 @@ refused by file name and left as it is. On success it prints `farmy start <name>
 The usage goes to stdout. Every refusal and warning goes to stderr and names what to check: the
 file (`.env`, `services/<name>.yml`, `farmy.yml`), the key, the repository, or the
 command to run (`farmy init`, `farmy start <name>`). When no service is defined, the message says
-so and points at the README section "Adding a service"; `status` then exits 0 with the same
-pointer.
+so, names the folder farmy looked in and points at the README section "Adding a service"; `status`
+then exits 0 printing its `folder` line and `No services yet: farmy add <git url> [--image …]`
+("Where farmy keeps things").
 
 ## `farmy status --json`
 
 What the session's TUI renders from, so that the tests pin the data and not the drawing:
 
 ```json
-{"generated": "2026-10-13T18:00:00Z", "lan_host": "mini.local", "bind": "0.0.0.0",
+{"generated": "2026-10-13T18:00:00Z", "folder": {"path": "/home/dana/.config/farmy", "state": "/home/dana/.local/state/farmy"},
+ "lan_host": "mini.local", "bind": "0.0.0.0",
  "egress": {"state": "registered", "name": "mini.tail1234.ts.net", "address": "100.101.102.103", "registration_url": null, "proxy": "farmy-egress:1055"},
  "services": [{"name": "shop", "state": "running", "block": "3100-3199",
    "repo": "https://github.com/acme/shop.git", "note": null, "commands": ["setup", "start", "test"],
@@ -1072,7 +1241,7 @@ What the session's TUI renders from, so that the tests pin the data and not the 
   TUI shows the most active one.
 
 `bind` is the host address published ports listen on: `127.0.0.1`, or `0.0.0.0` with `LAN_HOST`.
-`status` prints, after the egress line, `ports  127.0.0.1 only (LAN_HOST in .env opens them to the
+`status` prints its `folder` line first ("Where farmy keeps things"), then, after the egress line, `ports  127.0.0.1 only (LAN_HOST in .env opens them to the
 network)` or `ports  every interface (LAN_HOST=<name>)`, then one line per defined service: `<name>  <state>  <port block>  <repository>`,
 state being `running` or `stopped`, the block `3100-3199` or `-` for a service without ports,
 the repository being the clone URL or `none` for a workbench, followed by a note when the definition changed since the service was started
@@ -1179,6 +1348,18 @@ The fake understands the Docker CLI as it is commonly used, and the tests observ
   process's own value), then `-e`; every env file read is kept with its path and mode (`env_files`). An app
   container whose `REPO` is a `file://` URL gets a real clone in its checkout volume's folder when it is made.
   Every `docker run` also keeps when it started and ended.
+- **An inspect that does not answer** (record 2026-10-26-2126). A test can make `docker inspect` (and `docker
+  container inspect`) of a container that exists fail, as a daemon that does not answer in time does (`Error
+  response from daemon: context deadline exceeded`, exit 1), or answer nothing (exit 0, no output). `docker image
+  inspect` is not affected, and a container that is not there still answers `No such container: <name>`.
+- **Real-host noise** (record 2026-10-29-1800). A test can make the docker client print a warning line on stderr
+  at every call, answers unchanged (`cli_warning`); make only the n-th inspect of a container fail (counted over
+  `docker inspect` and `docker container inspect` of it, from when the test says so); and make the creation of a
+  named container (`docker run`/`create --name`) stay under way until another docker call goes to remove or
+  make a container of that name (`rm`, `run`, `create`), or a few seconds pass, so that two shims that both set out
+  to make it meet mid-create; a container of that name made by another call
+  meanwhile makes it fail with Docker's `Conflict. The container name "/<name>" is already in use …`
+  (exit 125). A build context keeps a link as a link (`links` in the image record): it is never followed.
 - **An agent's steps** (record 2026-10-21-1332). An agent play may have `steps`, done in order after its writes
   and before its idle time: `run: <line>` runs the line for real on the host with `/bin/sh -c`, as the agent's
   container would. Every mount target of that container that stands as a path in the line, or in a value of its
@@ -1380,7 +1561,21 @@ earlier failing command followed by a successful command cannot constitute a pas
 
 The program distribution's `VERSION` is the single version source, initially `0.1.0`.
 The binary, TUI, installed shim and farmy-owned images use it. Stable versions are exact
-`MAJOR.MINOR.PATCH` integers without leading zeros, v prefix, suffixes or ranges. Every
+`MAJOR.MINOR.PATCH` integers without leading zeros, v prefix, suffixes or ranges. A pre-release
+(record 2026-10-29-1800) is `MAJOR.MINOR.PATCH-rc.N`, N a positive integer without leading zeros, and is accepted
+wherever a version is read: `VERSION`, the shim and its own version, folder pins, `farmy update --to`, `bin/install
+--to`, `bin/release`, `bin/render-release`, `build.rs` and the binary's labels and pins. Versions are ordered as
+SemVer orders them: `0.2.0 < 0.3.0-rc.1 < 0.3.0-rc.2 < 0.3.0`; an older toolbox or control is older by that order.
+Between releases `VERSION` is the next release's pre-release, so that what these builds make is told apart from
+the last release's; at a release it is that release (now `0.3.0`, record 2026-10-30-2000). `bin/publish` and the release workflow publish stable versions only.
+
+`farmy --version` prints `farmy <version> (<commit>)`: `<commit>` is the short commit (7 or more hex digits) of the
+source the program was built from, or `commit unknown` when the build cannot tell (a `FARMY_SOURCE` URL). The
+shim answers it itself, with the checkout's commit in a checkout and, installed, the commit of the image it came
+from; the binary and `farmy tui --version` print the same line. The build hash stays inside (the session
+compares it) and is no longer printed. Control images carry the commit as `farmy.commit`.
+
+Every
 farmy-owned image (control, keys, knowledge, gate, service toolbox and other farmy builds)
 carries `farmy.version` and nonempty `farmy.hash` labels. Vendor base/sidecar images are
 not relabeled. Control images also carry `farmy.format`, highest readable format, initially 1.
@@ -1388,7 +1583,8 @@ not relabeled. Control images also carry `farmy.format`, highest readable format
 `bin/release VERSION` validates VERSION against the version source and requires
 FARMY_REGISTRY before any push. Docker buildx builds and pushes `linux/amd64,linux/arm64`
 images named `<registry>/farmy-{control,keys,knowledge,gate}:<version>`, also tagged
-`:latest`. The registry may include an owner/path and port. No registry is hard-coded.
+`:latest` for a stable version; a pre-release never moves `:latest` and is tagged `:next` instead (record
+2026-10-29-1931). The registry may include an owner/path and port. No registry is hard-coded.
 Release does not edit VERSION or user files. A failed build/push returns nonzero and
 does not claim success. CI configuration is an example, never required to run release.
 Docs show GitHub `ghcr.io/acme` and Forgejo `forgejo.example.com/acme`, based on their
@@ -1421,7 +1617,13 @@ Missing source gives an actionable refusal naming FARMY_SOURCE. A local build ne
 configured registry. Local development caching retains its content-hash behavior.
 
 `farmy update [--to VERSION]` runs on the host through the shim. It selects --to first,
-then an exact current-folder pin, else the latest control image's version label. It pulls
+then an exact current-folder pin, else the latest control image's version label. From a pre-release it never
+goes back (record 2026-10-29-1931): without `--to` or a pin it reads the version labels of control `:latest` and
+`:next` (a `:next` that is missing or cannot be pulled counts as none) and goes to the newest that is not older
+than the version it runs, by SemVer order; the same version counts as not older. When both are older it refuses
+(exit 1), the installed shim and every container as they were, with one line:
+`farmy: 0.3.0-rc.1 is newer than the latest release, 0.2.0; use --to 0.2.0 to go back`. `--to` and a pin may
+name an older version. From a stable version update reads `:latest` only, as before. It pulls
 all four exact images before atomically replacing the installed shim, preserving selected
 registry/source defaults. Any pull/extraction failure leaves the existing shim and running
 containers unchanged. Updating does not rewrite farmy.yml. Versions and formats are checked
@@ -2123,3 +2325,175 @@ exited with (137 for a verify that was stopped); `reason` only when the verify c
 blank line and the full output. `state.json` gains `verifies`: `[{"iteration": <i>, "count": <n>}]`, one entry per
 iteration whose agent ran, 0 included. `farmy factory show` appends `  verifies <n>` to each iteration's line:
 `  1  commit 9834b253c96e  exit 1  verifies 2`.
+
+## The control container and live runs (records 2026-10-26-2126, 2026-10-29-1215, 2026-10-29-1530 and 2026-10-29-1800)
+
+The shim replaces the control container (removes it and makes it anew) for three reasons: it serves another
+folder; its image is out of date (the control image is rebuilt or pulled for this farmy); it runs another farmy
+version than the shim (its image's `farmy.version`). Replacing it ends everything running inside it.
+
+**Live runs.** A control container has a live run while `docker top farmy` lists one of:
+
+- a factory run: its controller (a command line holding `factory run <id>`, e.g. `/usr/local/bin/farmy factory
+  run <id>`), a pipeline's controller (`factory pipeline run <p-id>`), or a factory command waiting in the
+  foreground (`--wait`);
+- **the session**: its tmux server (a command line starting `tmux`, e.g. `tmux new-session -d -s farmy …`),
+  attached or not.
+
+A process counts by its own words, not by text anywhere in its line: farmy's command (`farmy` or a path ending in
+`/farmy`) followed by `factory run <id>` or `factory pipeline run <p-id>`, or a factory command with `--wait`
+among its options; a run's task text that happens to read `factory run …` makes nothing live.
+
+The shim learns of live runs from `docker top farmy` only. Container labels miss the session and every run that
+has no container at that moment (queued for a slot, waiting for a login turn, between two git containers, a
+pipeline between steps). Each factory run counts as one live run, and the session as one more. The tests stage a
+factory run two ways at once, its controller in `docker top farmy` and its agent container
+`<name>-run-<id>-agent-1` (`farmy.run=<id>`, `farmy.role=agent`) running, and stage the session as its tmux
+server and `/usr/local/bin/farmy tui` in `docker top farmy`.
+
+**A control container with live runs is never replaced**: not by a folder switch, a version, an image, nor any
+command. A refused command exits 1 without being handed to the container, and without stopping, removing or
+making any container.
+
+**Another folder.** When the container serves another folder than the one this command resolved (see **Where
+farmy keeps things**) and has live runs, every command the shim would hand to it is refused (`stop`,
+`factory cancel`, `init` and a bare `farmy` included) with exactly one line on stderr:
+
+```
+farmy: the control container serves <folder> and has <n> live runs; finish or cancel them, or run this command with farmy -C <folder>
+```
+
+with `<folder>` as messages write paths (`~/…` under the user's home; for a container serving the default home,
+its config folder `~/.config/farmy`) and `1 live run` for one. `farmy -C <folder> <command>` resolves to that
+folder, so the container serves it and the command runs there. `farmy --version`, which the shim answers itself,
+is unaffected.
+
+**Read-only commands while another folder's runs are live** (record 2026-10-29-1800; this changes the paragraph
+above). `status` (with `--json`), `help`, `config path`, `factory list`, `factory show`, `factory log`, `logs`,
+`egress log` and `tui --version` are not refused when the control container serves another folder and has live
+runs, or when `docker top` of it fails. Each runs in a container of its own, `docker run --rm` of the control
+container's image, that serves this folder as the control container would (this folder and its state folder
+mounted at the same paths, the same socket, the same user): nothing is handed to the control container, and
+nothing is stopped, removed or made in its place. Every other command is refused with the line above. Where the
+container serves this folder but runs another version or an out-of-date image, read-only commands are refused as
+before.
+
+**Another version, an out-of-date image** (the container serves this folder). The shim refuses every command and
+names on stderr every live factory run's id, `the session` when it is live, the reason (the farmy version the
+container runs and this farmy's; or that its image is out of date) and the way out: wait for the runs to end or
+`farmy factory cancel <id>`, and leave the session. Two commands run in the kept container instead of being
+refused:
+
+- `farmy stop` with no name: it stops the services as always; the container and its live runs stay
+  (record 2026-10-29-1215 changed this: it used to replace the container first);
+- `farmy factory cancel <id>`: `cancel` stops a controller only where it runs.
+
+Without a live run nothing changes: the container is replaced as before.
+
+**Reading the folder.** An inspect of the control container that fails, or answers nothing, is no reason to
+replace it: the shim keeps the container. Record 2026-10-29-1800 changed what follows: the command is not run in
+it unless the shim can read who farmy runs as there (below, **Who farmy runs as**). The shim may read again; when
+it still cannot, it refuses the command (exit 1, nothing handed to the container), naming the control container
+and the daemon's error, or, for an inspect that answers nothing, that it `could not be read`.
+Only an answer that names another folder is a mismatch. A container that is gone (`No such container: farmy`)
+is made as before. A read that asks only for the mount at the folder answers nothing for a container that serves
+another folder too, so the folder has to be read in a way whose answer names it.
+
+**Reading it as a container** (record 2026-10-29-1530). `docker inspect farmy` with no `--type` answers with
+whatever is named `farmy`: once the container is removed by hand (`docker rm -f farmy`, as troubleshooting
+says) that is the `farmy` network, on which a template naming `.Config`, `.State` or `.Mounts` fails
+(`Template parsing error: … map has no entry for key …`, exit 1). The shim reads the control container as a
+container (`docker container inspect`, or `--type container`), so that a container that is gone is made anew
+by the next command, whatever else is named `farmy`.
+
+**When `docker top` fails** (record 2026-10-29-1530), the shim cannot tell whether runs are live. When the
+container would be replaced, it is kept, as a container with live runs is: the command is refused (exit 1,
+nothing handed to the container), and stderr says why with the daemon's error and, for another folder, the
+way out `farmy -C <folder>`. `farmy stop` with no name and `farmy factory cancel <id>` run in the kept
+container as they do with live runs. When no replacement is due, `docker top` is not needed.
+
+**What the docker client says on stderr** (record 2026-10-29-1800) is never read as its answer. A client prints
+warnings there at every call (`WARNING: Error loading config file: …`), before an answer that is as good as
+without them. The shim reads stdout and the exit code: a warning does not make a running container look stopped
+nor a stopped one running, and it is never quoted as the daemon's error.
+
+**One maker at a time** (record 2026-10-29-1800). The shim takes a lock around reading the control container and
+making or reusing it. The lock lives in the state home (`$XDG_STATE_HOME/farmy`, else `~/.local/state/farmy`),
+whatever folder is in use, and is made as the user farmy runs as. A second shim that finds it taken waits (and
+says once on stderr that it waits), then reads the container the first made and reuses it; nothing removes a
+container another shim has just made. The lock is released before the command runs, so commands still run side
+by side. A lock whose holder is gone (a shim killed while making the container) holds no one up. The lock file
+is the one thing the shim adds to the state home while a project folder is in use; farmy itself still makes
+nothing in the default home then (record 2026-10-29-0926).
+
+## Who farmy runs as (records 2026-10-29-1215, 2026-10-29-1530 and 2026-10-29-1800)
+
+**On Linux**, when root in a container is root on the host, the shim runs every farmy command in the control
+container as the user who runs the shim: `docker exec -u <uid>:<gid>` with the shim's `id -u` and `id -g`, the
+session (`-it`), `unlock-names` and every other exec included. Everything farmy then starts runs as that user too:
+the session's tmux server and TUI with its actions, factory and pipeline controllers, git. So every file and
+folder farmy writes in the folder and the state folder (`farmy.yml`, `services/`, `.env`, `.gitignore`,
+`.git`, `tools.lock`, `.work/` and all in it) is that user's from the moment it is written, while a session is
+still attached as much as after a command. Nothing is chowned afterwards.
+
+- **Containers farmy runs that write into the folder or the state folder** run as the user farmy runs as
+  (`--user <uid>:<gid>`): the git container that fetches a service's build files into `.work/<name>/ctx`. Agent
+  containers keep their own user (the dev user, 1001); what an agent drops into a run's verify queue is the
+  agent's.
+- **Over ssh too** (record 2026-10-29-1530): whatever the transport, a service's build files are written into
+  the state folder as the user farmy runs as, from the moment they are written. No container writes them as
+  root to chown them afterwards: a kill skips the chown and leaves root's files that block every later fetch.
+  ssh refuses a uid the git image has no account for (`No user exists for uid <n>`), and the route's agent
+  answers only its own user and root, so the step that talks ssh cannot simply be the one that writes as the
+  user. How the two are joined is the worker's choice. A repository URL reaches ssh as `ssh://`,
+  `git+ssh://`, `user@host:path`, or through an `insteadOf` rule of a git route (an `https://` URL on the
+  route's host).
+- **The control container lets that user do what root did:** reach the Docker daemon through the mounted socket
+  (its group), have a home of its own (Docker's client config, git's global config), use the hold socket, and
+  share one tmux server across commands. How is the worker's choice; the real-Docker tests check it.
+- **Files an older farmy left root's** (a run that was killed before the old hand-over, an earlier `sudo -E`) must
+  not make farmy fail. When the shim makes the control container, it hands what is root's in farmy's own folders
+  to the user farmy runs as, once (record 2026-10-29-1800 narrowed this): the default home's config folder and
+  state folder, with all in them and the two folders themselves; and `.work` of a project folder that belongs to
+  that user. Never a project folder itself or what the user keeps there (`farmy.yml`, `services/`, `.env`,
+  `.gitignore`, `.git`, `tools.lock`), and nothing at all in a folder another user owns (a shared folder): the
+  tests check that no command run as root in the control container names a path in such a folder, or outside
+  `.work` for the user's own project folder. Links are never followed, it stays on the folder's filesystem, and a
+  hand-back that fails says so in one line instead of passing in silence. A root-owned file left in a project
+  folder outside `.work` stays root's; a command that fails on it names the file.
+- **Who to run as is settled when the shim makes the control container** (record 2026-10-29-1530) and kept with
+  it. Later commands do not ask the daemon again, so a `docker info` that is slow or fails cannot change it, nor
+  replace a container for it. Record 2026-10-29-1800: nor can a read of the container that fails. Who farmy
+  runs as is read from the container; when a read fails it is never re-settled, guessed (root, or the caller) or
+  taken as a reason to replace the container: the shim reads again, or refuses (**Reading the folder**). A
+  container made to run farmy as root for a root caller is never used for a plain user's commands: without a
+  live run it is made anew for that user; with one, the command is refused as for another folder's runs. A caller with the same uid is the same user whatever its group is now (`newgrp
+  docker`, `sg docker`): its commands run in that container, which is neither replaced nor refused for it.
+- **The home** farmy runs with in the control container (Docker's client config and logins, git's global
+  config, known hosts) lies in a volume mounted into the control container, as `/root` in the `farmy-control`
+  volume did before, so what is kept there outlives the control container (record 2026-10-29-1530).
+- **When the socket's group cannot be read**, the shim says so in one line rather than making a control container
+  whose farmy cannot reach the daemon.
+- **Messages that name users** write `<uid>:<gid>`, and `root` for root; never an empty name.
+- **Where root in a container is already the user on the host**, farmy runs as root as before (no `-u`): a
+  rootless daemon (`docker info`'s security options name `rootless`; `docker info -f '{{.SecurityOptions}}'`
+  lists them), and a Mac (`uname` says `Darwin`), whose file sharing gives the user's files to the user.
+- **A daemon that remaps users** (security options name `userns`) keeps root as before. Record 2026-10-29-1215
+  said root there is the user on the host; it is not (record 2026-10-29-1530): root and every uid in a container
+  map to subordinate uids, so neither root nor `-u <uid>` writes the user's files there. Ownership under
+  userns-remap is not farmy's to fix; the docs say so.
+- **A root caller** (`id -u` is 0, e.g. `sudo farmy`) runs farmy as the owner of the containers folder (of its
+  nearest existing parent while farmy is about to make it): root for root's own folders, the folder owner's for
+  `sudo farmy -C <their folder>`, as 0.2.0 handed what it wrote to the folder owner (record 2026-10-29-1530
+  changed this: 1215 kept root).
+- **Under sudo, in the default home** (record 2026-10-29-1800): `~/.config/farmy` is never root's, whoever runs
+  farmy. A root caller whose `SUDO_UID` names another user acts for that user: farmy runs as `SUDO_UID:SUDO_GID`,
+  even when the default home is root's by then. The default home is that user's: found from `XDG_*` and `HOME` as
+  always when `HOME` belongs to that user (`sudo -E`, or a Mac's sudo), else from that user's home in the user
+  database (`SUDO_USER`), else refused (exit 1) naming `SUDO_USER`. The shim settles who farmy runs as before it
+  creates anything, and makes every folder of the default home (missing parents under the user's home included,
+  and the lock) as that user. A root login (no `SUDO_UID`) keeps root's own home and root. Other folders keep
+  the folder-owner rule above, sudo or not.
+- **WSL2 with Docker Desktop is unverified** (records 2026-10-29-1530 and 2026-10-29-1800): bind mounts from a
+  WSL distro are believed to keep raw uids, and whether farmy can run as the user there depends on the socket's
+  group in Docker Desktop's VM. The getting-started guide says it is unverified; it blocks nothing.

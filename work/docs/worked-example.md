@@ -18,7 +18,8 @@ real machine.
 ## 0. Before you start
 
 - Docker running. `docker info` answers.
-- A containers folder of your own, outside the farmy checkout: `mkdir ~/containers && cd ~/containers`.
+- No folder to make: farmy works in `~/.config/farmy` and keeps its state in `~/.local/state/farmy`
+  (README, "Where farmy keeps things"); `farmy config path` says which folder it uses.
 - The shim on your PATH: `ln -s ~/farmy/work/farmy ~/bin/farmy`.
 - The integration tests run from the checkout with Docker and Ruby there:
   `JOBS=1 bin/verify -n /Integration/`.

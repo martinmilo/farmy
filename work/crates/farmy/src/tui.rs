@@ -32,6 +32,8 @@ struct App {
     keys: Vec<(String, String)>,
     generated: String,
     egress: Value,
+    /// The folder in use, as `farmy status` prints it.
+    folder: String,
     pane: Option<Pane>,
 }
 
@@ -64,6 +66,7 @@ impl App {
             keys,
             generated: snap["generated"].as_str().unwrap_or("").to_string(),
             egress: snap["egress"].clone(),
+            folder: crate::folder::folder_text(),
             pane: None,
         }
     }
@@ -384,9 +387,11 @@ fn act(app: &mut App, args: &[String], title: &str, stdin: Option<&str>) {
     let first = format!("$ farmy {}", shell_line(args));
     let args: Vec<String> = args.to_vec();
     let input = stdin.map(String::from);
+    let folder = crate::folder::current().path.clone();
     std::thread::spawn(move || {
         let mut cmd = Command::new(&exe);
         cmd.args(&args)
+            .env("FARMY_DIR", &folder)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.stdin(if input.is_some() {
@@ -496,7 +501,10 @@ fn take_over(
         clippy::let_underscore_must_use,
         reason = "the command had the terminal and showed its own outcome there"
     )]
-    let _ = Command::new(&exe).args(args).status();
+    let _ = Command::new(&exe)
+        .args(args)
+        .env("FARMY_DIR", &crate::folder::current().path)
+        .status();
     #[expect(
         clippy::let_underscore_must_use,
         reason = "a terminal mode switch around the hand-over; if it fails there is nothing better to do than go on"
@@ -641,11 +649,16 @@ fn loop_ui(
                 Value::Null => String::new(),
                 e => format!("   egress: {}{}", text(&e["state"]), match text(&e["state"]).as_str() { "registered" => format!(" {} {}", text(&e["name"]), text(&e["address"])), "unregistered" => format!(" — register: {}", text(&e["registration_url"])), _ => String::new() }),
             };
-            let title = Paragraph::new(Line::from(vec![Span::styled(" farmy ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(format!("— one set of containers per repository   (as of {}){egress}", local_time(&app.generated)))]))
+            let title = Paragraph::new(Line::from(vec![Span::styled(" farmy ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(format!("— {}   (as of {}){egress}", app.folder, local_time(&app.generated)))]))
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(title, layout[0]);
-            let table = service_table(&app.services);
-            f.render_stateful_widget(table, layout[1], &mut app.table);
+            if app.services.is_empty() {
+                let empty = Paragraph::new(commands::NO_SERVICES).block(Block::default().borders(Borders::ALL).title(" services "));
+                f.render_widget(empty, layout[1]);
+            } else {
+                let table = service_table(&app.services);
+                f.render_stateful_widget(table, layout[1], &mut app.table);
+            }
             let mut lines: Vec<Line<'_>> = handoffs;
             if let Some(s) = app.current() {
                 lines.push(Line::from(format!("egress: {}", egress_text(s))));

@@ -278,7 +278,7 @@ impl Channel {
 
     /// The `-v` and `-e` words that give the agent's container farmy-verify and the run's folders.
     fn agent_args(&self) -> (Vec<String>, Vec<(String, String)>) {
-        // the daemon resolves a bind's source on the host, where the containers folder has the same path
+        // the daemon resolves a bind's source on the host, where the state folder (.work) has the same path
         let root = std::env::current_dir().unwrap_or_default().join(&self.root);
         let mounts = vec![
             "-v".into(),

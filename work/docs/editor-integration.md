@@ -34,6 +34,6 @@ definition has one. The toolbox installs git, curl, bash and zsh; add what you w
 
 ## From another machine
 
-Everything above works over ssh to the host: `ssh mini`, then `cd ~/containers && farmy` for the
-session, or `farmy ssh shop` for a shell. VS Code Remote-SSH to the host and then "Attach to
+Everything above works over ssh to the host: `ssh mini`, then `farmy` for the
+session (it finds `~/.config/farmy` from any folder), or `farmy ssh shop` for a shell. VS Code Remote-SSH to the host and then "Attach to
 Running Container" gives the editor the same view.

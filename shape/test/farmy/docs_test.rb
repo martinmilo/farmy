@@ -43,4 +43,8 @@ class DocsTest < AcceptanceTest
     assert_success
     assert_stdout(/^codex\s+on\s/)
   end
+
+  test "the getting-started guide says that WSL2 with Docker Desktop is unverified" do
+    assert_guide_says "docs/getting-started.md", "WSL2", "unverified"
+  end
 end

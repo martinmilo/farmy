@@ -1,12 +1,12 @@
 class DefiningServicesTest < AcceptanceTest
   def setup = settings # a folder with .env and nothing else: no services/
 
-  test "status in a folder without services says that none is defined yet and where to add one" do
+  test "status in a folder without services names the folder and says: No services yet: farmy add <git url> [--image …]" do
     farmy "status"
 
     assert_success
-    assert_stdout "no services defined yet"
-    assert_stdout "Adding a service"
+    assert_status_folder dir
+    assert_stdout "No services yet: farmy add <git url> [--image …]"
   end
 
   test "starting a service when none is defined says so" do

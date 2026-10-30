@@ -11,24 +11,50 @@ pub(crate) fn registry() -> String {
         .unwrap_or_else(|| env!("FARMY_DEFAULT_REGISTRY").into())
 }
 
-pub(crate) fn valid(value: &str) -> bool {
-    value.split('.').count() == 3
-        && value.split('.').all(|s| {
-            !s.is_empty()
-                && s.bytes().all(|c| c.is_ascii_digit())
-                && (s == "0" || !s.starts_with('0'))
-        })
+/// One number of a version: digits, no leading zero.
+fn number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
 }
+
+/// A version's parts: MAJOR, MINOR, PATCH and, for a pre-release `-rc.N`, N.
+fn parts(value: &str) -> Option<([&str; 3], Option<&str>)> {
+    let (core, pre) = match value.split_once('-') {
+        Some((core, pre)) => (
+            core,
+            Some(pre.strip_prefix("rc.").filter(|n| number(n) && *n != "0")?),
+        ),
+        None => (value, None),
+    };
+    let mut numbers = core.split('.');
+    let parts = [numbers.next()?, numbers.next()?, numbers.next()?];
+    (numbers.next().is_none() && parts.iter().all(|p| number(p))).then_some((parts, pre))
+}
+
+/// An exact version: `MAJOR.MINOR.PATCH`, or a pre-release `MAJOR.MINOR.PATCH-rc.N` (record 2026-10-29-1800).
+pub(crate) fn valid(value: &str) -> bool {
+    parts(value).is_some()
+}
+
+/// Whether `old` comes before `current` as SemVer orders them: 0.2.0 < 0.3.0-rc.1 < 0.3.0-rc.2 < 0.3.0.
 pub(crate) fn older(old: &str, current: &str) -> bool {
-    valid(old)
-        && valid(current)
-        && old
-            .split('.')
-            .zip(current.split('.'))
-            .map(|(a, b)| a.len().cmp(&b.len()).then(a.cmp(b)))
-            .find(|c| !c.is_eq())
-            .map(|c| c.is_lt())
-            .unwrap_or(false)
+    let (Some((a, a_pre)), Some((b, b_pre))) = (parts(old), parts(current)) else {
+        return false;
+    };
+    let by_number = |x: &str, y: &str| x.len().cmp(&y.len()).then(x.cmp(y));
+    let core = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| by_number(x, y))
+        .find(|c| !c.is_eq())
+        .unwrap_or(std::cmp::Ordering::Equal);
+    match core {
+        std::cmp::Ordering::Equal => match (a_pre, b_pre) {
+            (Some(x), Some(y)) => by_number(x, y).is_lt(),
+            (Some(_), None) => true,
+            _ => false,
+        },
+        other => other.is_lt(),
+    }
 }
 pub(crate) fn check_workspace() -> R {
     match std::fs::read_to_string("farmy.yml") {
@@ -187,5 +213,41 @@ mod tests {
         assert!(error.contains("services/shop.yml"));
         assert!(error.contains("format 999999"));
         assert!(error.contains("farmy update"));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::{older, valid};
+
+    #[test]
+    fn versions_are_exact_releases_or_release_candidates_in_semver_order() {
+        for v in ["0.2.0", "0.3.0-rc.1", "10.0.12-rc.23"] {
+            assert!(valid(v), "{v}");
+        }
+        for v in [
+            "0.3",
+            "v0.3.0",
+            "0.3.0-rc.0",
+            "0.3.0-rc.01",
+            "0.3.0-beta.1",
+            "0.3.0-rc",
+            "01.2.3",
+        ] {
+            assert!(!valid(v), "{v}");
+        }
+        let order = [
+            "0.2.0",
+            "0.3.0-rc.1",
+            "0.3.0-rc.2",
+            "0.3.0-rc.10",
+            "0.3.0",
+            "0.10.0",
+        ];
+        for (i, a) in order.iter().enumerate() {
+            for (j, b) in order.iter().enumerate() {
+                assert_eq!(older(a, b), i < j, "{a} < {b}");
+            }
+        }
     }
 }

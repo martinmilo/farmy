@@ -39,9 +39,15 @@ module Stranger
     assert n == 1, "Expected #{text.inspect} exactly once on stderr; it is there #{n} times.#{transcript}"
   end
 
-  def real_shim(*args)
+  # The shim with the real docker; HOME, XDG_* and FARMY_DIR as for every farmy call (support/default_home.rb).
+  def real_shim(*args, stdin: "", env: {})
     path = ([store_bin] + ENV.fetch("PATH").split(":").reject { |p| p == Farmy::FAKES }).join(":")
-    script "farmy", *args, env: store_env.merge("PATH" => path)
+    plumbing = machine_env
+    saved = plumbing.keys.to_h { |key| [key, ENV[key]] }
+    plumbing.each { |key, val| ENV[key] = val }
+    script "farmy", *args, stdin: stdin, env: store_env.merge("PATH" => path).merge(env)
+  ensure
+    saved&.each { |key, val| ENV[key] = val }
   end
 
   def define_on_http_git_host(name, repository)

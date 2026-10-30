@@ -40,7 +40,7 @@ FARMY_REGISTRY=ghcr.io/acme sh ./install
 # Or a Forgejo registry:
 FARMY_REGISTRY=forgejo.example.com/acme sh ./install
 FARMY_REGISTRY=ghcr.io/acme sh ./install --to 0.1.0 --dir "$HOME/bin"
-farmy --version
+farmy --version   # farmy 0.3.0 (1a2b3c4): the version and the commit it was built from
 ```
 
 The executable remembers its registry and matching GitHub tag source. Nonempty environment
@@ -62,6 +62,12 @@ farmy update                 # exact folder pin, otherwise newest published rele
 farmy update --to 0.1.0      # explicit target takes precedence over the folder pin
 ```
 
+From a release candidate, `farmy update` without `--to` or a pin never goes back: it reads the
+versions of control `latest` and `next` (a `next` that is missing or cannot be pulled counts as none)
+and goes to the newest that is not older than the version it runs. When both are older it refuses and
+changes nothing: `farmy: 0.4.0-rc.1 is newer than the latest release, 0.3.0; use --to 0.3.0 to go
+back`. `--to` and a pin may still name an older version. From a release it reads `latest` only.
+
 Update pulls the selected exact version of all four images: control, keys, knowledge and
 gate. It extracts and replaces the shim, preserving the selected registry and any explicit
 source override. The generated default source advances to the installed version's mirror tag.
@@ -69,7 +75,7 @@ It does not edit `farmy.yml`. The next ordinary command selects the new control 
 recreates the control container when needed; updating the executable leaves sessions running
 until that selection occurs.
 
-Pin a containers folder in `farmy.yml`:
+Pin the folder in use in its `farmy.yml`:
 
 ```yaml
 farmy: '0.1.0' # exact MAJOR.MINOR.PATCH; quotes are optional
@@ -77,8 +83,11 @@ format: 1
 ```
 
 Ordinary commands refuse a mismatched pin and show `farmy update --to <pin>`. `--version`
-and `update` remain available. Versions cannot be ranges, have a `v` prefix, leading zeros
-or a prerelease suffix. Keep compatibility fields as ordinary top-level scalars, once each;
+and `update` remain available. A version is an exact release, `MAJOR.MINOR.PATCH`, or a release candidate,
+`MAJOR.MINOR.PATCH-rc.N` (N from 1); it cannot be a range, have a `v` prefix, leading zeros or
+another suffix. Versions are ordered as SemVer orders them wherever farmy reads one: a release
+candidate comes before its release (`0.3.0-rc.1` < `0.3.0-rc.2` < `0.3.0`), so a control container
+of `0.2.0` is replaced for `0.3.0-rc.1` and the newer-control warning compares the same way. Keep compatibility fields as ordinary top-level scalars, once each;
 ambiguous values are refused without evaluating YAML or shell code on the host.
 
 Both `farmy.yml` and service definitions accept a positive integer `format`; absence means
@@ -114,7 +123,8 @@ the desired release. Release artifacts already contain the configured mirror fal
 
 In a checkout, ordinary `farmy init` checks cached control against its complete build-input digest.
 Changed inputs rebuild control and replace its stale container without requiring `FARMY_BUILD=1` or
-a version bump. Unchanged inputs reuse both. Recipes, ignore rules, copied files and directories,
+a version bump, once no factory run and no session is live in it (until then the command is refused,
+naming them; nothing is built or replaced). Unchanged inputs reuse both. Recipes, ignore rules, copied files and directories,
 contents, modes, types, and symlink targets contribute to the digest; build outputs do not.
 The binary's build hash and locally built image's hash use the same fingerprint. An unreadable or
 vanished input fails the build rather than reusing an uncertain cache entry.
@@ -130,7 +140,12 @@ Development helper images also build locally; published operation pulls matching
 Run these commands from the implementation directory containing `VERSION`. That file supplies
 the release identity for binaries, TUI, shim and farmy-owned images. Image labels carry
 `farmy.version` and nonempty `farmy.hash`; control also carries `farmy.format`, the highest
-readable document format. Vendor base images and sidecars keep their own labels.
+readable document format, and `farmy.commit`, the short commit it was built from. `farmy --version`
+(the shim, the binary and `farmy tui --version` alike) prints `farmy <version> (<short commit>)`: the
+binary takes the commit from the checkout's `HEAD` when it is built (`FARMY_COMMIT` in a build without
+`.git`, which `bin/release` and the shim pass as a build argument), so build from what is committed; a
+commit that cannot be told prints `commit unknown`. An installed shim keeps the commit of the image it
+came from. Vendor base images and sidecars keep their own labels.
 
 Publishing requires a Docker buildx builder for `linux/amd64,linux/arm64` and registry
 credentials with push access. The configured default is GHCR; an override selects another destination:
@@ -144,7 +159,8 @@ FARMY_REGISTRY=forgejo.example.com/acme bin/release "$(cat VERSION)"
 ```
 
 This publishes `farmy-control`, `farmy-keys`, `farmy-knowledge` and `farmy-gate`, with exact
-version and `latest` tags for both platforms. Registry paths and ports are supported. A
+version and `latest` tags for both platforms; a release candidate is tagged `next` instead, never
+`latest`, so installs and `farmy update` without `--to` from a release keep the newest release. Registry paths and ports are supported. A
 mismatched version is refused before publication. VERSION and user files
 are never edited. Failed build/push exits nonzero; images already pushed earlier in that
 invocation may remain published.
@@ -188,7 +204,7 @@ embeds these defaults in the shim and release installer. An environment override
 Updating a generated source default advances its version tag; a custom source override stays.
 
 From the private repository root, run `bin/publish <version>`. It requires committed input,
-a matching stable `work/VERSION`, versioned `work/releases/<version>.md` notes with contributor
+a matching stable `work/VERSION` (a release candidate is never published this way, nor by CI), versioned `work/releases/<version>.md` notes with contributor
 credits, and a readable nonempty denylist named by `PRIVATE_TERMS_FILE`, a file kept outside the repository;
 no default is written anywhere, and both `bin/publish` and `bin/scan-private` refuse to run without
 it. The ordinary test suite skips its privacy test, loudly, when the variable is unset; publication cannot.

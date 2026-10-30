@@ -16,6 +16,16 @@ class BuildFromRepositoryTest < AcceptanceTest
     assert_running "toolkit"
   end
 
+  test "the git container that fetches the build files into the state folder runs as the user farmy runs as, so the files are that user's" do
+    remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE, "Gemfile.lock" => LOCKFILE
+    define_from_remote "toolkit", "acme/toolkit"
+
+    farmy "start", "toolkit" # farmy runs as the test's user here, as the shim runs it as the invoking user on Linux
+
+    assert_success
+    assert_build_files_fetched_as invoking_user
+  end
+
   test "the Dockerfile is read from the branch the definition names" do
     remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE, "Gemfile.lock" => LOCKFILE
     remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE.sub("ruby:3.4", "ruby:3.4-slim"), on: "slim-image"
@@ -68,4 +78,91 @@ class BuildFromRepositoryTest < AcceptanceTest
 
     assert_includes proxy.targets, "http://git.example.com:80/acme/toolkit.git/info/refs"
   end
+
+  # ── links and paths: the security fix of record 2026-10-29-1800 ──
+
+  test "a build file that is a link to another file in the repository is built with that file's content" do
+    remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE, "locks/Gemfile.lock" => LOCKFILE
+    remote_repository_link "acme/toolkit", "Gemfile.lock" => "locks/Gemfile.lock"
+    define_from_remote "toolkit", "acme/toolkit"
+
+    farmy "start", "toolkit"
+
+    assert_success
+    assert_built target: "base", file_content: ["Gemfile.lock", LOCKFILE]
+  end
+
+  { "../.env" => "one folder up", "../../../../.env" => "four folders up, where the clone reaches the containers folder's .env" }.each do |target, where|
+    test "a build file that is a link #{where} (#{target}), out of the repository, stops the start, naming it, and nothing of the containers folder's .env reaches a build context or the output" do
+      the_folder_env_also_holds "DEPLOY_TOKEN=dpl_7c41e9a2"
+      remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE
+      remote_repository_link "acme/toolkit", "Gemfile.lock" => target
+      define_from_remote "toolkit", "acme/toolkit"
+
+      farmy "start", "toolkit"
+
+      assert_exit 1
+      assert_stderr "Gemfile.lock"
+      assert_stderr "outside the repository"
+      refute_in_any_build_context "dpl_7c41e9a2"
+      refute_stderr "dpl_7c41e9a2"
+      refute_container "toolkit"
+    end
+  end
+
+  test "a build file that is a link to the containers folder's .env by its absolute path stops the start, naming it, and nothing of that .env reaches a build context" do
+    the_folder_env_also_holds "DEPLOY_TOKEN=dpl_7c41e9a2"
+    remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE
+    remote_repository_link "acme/toolkit", "Gemfile.lock" => the_folder_env
+    define_from_remote "toolkit", "acme/toolkit"
+
+    farmy "start", "toolkit"
+
+    assert_exit 1
+    assert_stderr "Gemfile.lock"
+    assert_stderr "outside the repository"
+    refute_in_any_build_context "dpl_7c41e9a2"
+    refute_container "toolkit"
+  end
+
+  test "a Dockerfile that is a link out of the repository stops the start, naming it, and nothing of what it points at reaches a build or the output" do
+    the_folder_env_also_holds "DEPLOY_TOKEN=dpl_7c41e9a2"
+    remote_repository "acme/toolkit", "Gemfile" => GEMFILE, "Gemfile.lock" => LOCKFILE
+    remote_repository_link "acme/toolkit", "Dockerfile" => the_folder_env
+    define_from_remote "toolkit", "acme/toolkit"
+
+    farmy "start", "toolkit"
+
+    assert_exit 1
+    assert_stderr "Dockerfile"
+    assert_stderr "outside the repository"
+    refute_in_any_build_context "dpl_7c41e9a2"
+    refute_stdout "dpl_7c41e9a2"
+    refute_stderr "dpl_7c41e9a2"
+  end
+
+  test "a build_files entry ../.env is refused before anything is fetched, naming it, and the containers folder's .env is left as it was" do
+    remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE, "Gemfile.lock" => LOCKFILE
+    define_toolkit_with_build_files "Gemfile", "../.env"
+
+    farmy "start", "toolkit"
+
+    assert_exit 1
+    assert_stderr "../.env"
+    assert_unchanged ".env"
+    refute_container "toolkit"
+  end
+
+  test "a build_files entry naming the containers folder's .env by its absolute path is refused before anything is fetched, naming it, and that .env is left as it was" do
+    remote_repository "acme/toolkit", "Dockerfile" => DOCKERFILE, "Gemfile" => GEMFILE, "Gemfile.lock" => LOCKFILE
+    define_toolkit_with_build_files "Gemfile", the_folder_env
+
+    farmy "start", "toolkit"
+
+    assert_exit 1
+    assert_stderr the_folder_env
+    assert_unchanged ".env"
+    refute_container "toolkit"
+  end
 end
+

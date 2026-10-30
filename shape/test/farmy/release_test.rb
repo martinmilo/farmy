@@ -1,5 +1,5 @@
 class ReleaseTest < AcceptanceTest
-  test "release publishes all four images for amd64 and arm64 with version latest and metadata in the chosen registry" do
+  test "release publishes all four images for amd64 and arm64 with their version, latest for a stable version and next for a pre-release, which never moves latest, and metadata in the chosen registry" do
     release_distribution
 
     assert_success
@@ -20,7 +20,7 @@ class ReleaseTest < AcceptanceTest
     assert_default_release_builds SHIPPED
   end
 
-  ["0.x", "v#{SHIPPED}", "#{SHIPPED};touch marker", "0.3.0"].each do |version|
+  ["0.x", "v#{SHIPPED}", "#{SHIPPED};touch marker", "0.4.0"].each do |version|
     test "release version #{version} is refused because it is invalid or differs from repository VERSION" do
       release_distribution version
 

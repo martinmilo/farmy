@@ -27,7 +27,7 @@ module Workspace
   GIT_ENV = {
     "GIT_AUTHOR_NAME" => "Acceptance Tests", "GIT_AUTHOR_EMAIL" => "tests@example.com",
     "GIT_COMMITTER_NAME" => "Acceptance Tests", "GIT_COMMITTER_EMAIL" => "tests@example.com",
-    "GIT_AUTHOR_DATE" => "2026-01-15T09:00:00+01:00", "GIT_COMMITTER_DATE" => "2026-01-15T09:00:00+01:00",
+    "GIT_AUTHOR_DATE" => "2026-01-15T09:00:00-05:00", "GIT_COMMITTER_DATE" => "2026-01-15T09:00:00-05:00",
     "GIT_CONFIG_GLOBAL" => File::NULL, "GIT_CONFIG_NOSYSTEM" => "1"
   }.freeze
 

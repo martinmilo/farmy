@@ -21,13 +21,13 @@ This installs the latest release's farmy into `~/.local/bin` and, if that folder
 `PATH`, ends by printing the `export PATH=…` line to add.
 
 To verify the installer first, download the
-[install script](https://github.com/martinmilo/farmy/releases/download/v0.2.0/install) and
-[SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.2.0/SHA256SUMS) from the
+[install script](https://github.com/martinmilo/farmy/releases/download/v0.3.0/install) and
+[SHA256SUMS](https://github.com/martinmilo/farmy/releases/download/v0.3.0/SHA256SUMS) from the
 same GitHub release, check the exact downloaded bytes, then run it:
 
 ```sh
-curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.2.0/install
-curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.2.0/SHA256SUMS
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.3.0/install
+curl -fsSLO https://github.com/martinmilo/farmy/releases/download/v0.3.0/SHA256SUMS
 shasum -a 256 --check SHA256SUMS   # macOS
 sha256sum --check SHA256SUMS       # Linux
 sh ./install
@@ -55,15 +55,17 @@ contributor in the release notes.
 
 ## The first service
 
-In a folder of your own, the containers folder:
-
 ```sh
-mkdir ~/containers && cd ~/containers
-farmy init                                             # the control image, .env with your Git identity
-farmy add https://github.com/acme/shop.git --image ruby:3.4-slim   # writes services/shop.yml
-farmy start shop                                       # images, containers, the clone, the setup command
-farmy                                                  # the session
+curl -fsSL https://github.com/martinmilo/farmy/releases/latest/download/install | sh
+farmy add https://github.com/acme/shop.git --image ruby:3.4-slim   # writes ~/.config/farmy/services/shop.yml
+farmy                                                              # the session: start shop from there
 ```
+
+No folder to make and none to enter: farmy keeps its configuration in `~/.config/farmy` (see
+[Where farmy keeps things](#where-farmy-keeps-things)). Nor is there anything to prepare: the first start
+writes this machine's `.env` with the Git identity of your `git config` and says so. `farmy init` is
+optional; it does the same and asks for what it does not find. `farmy start shop` does from the command
+line what the session does.
 
 A definition, `services/shop.yml`, says what the service is:
 
@@ -81,6 +83,47 @@ mounts:
 
 Sidecars go under `compose:` as plain compose services; the full key list and more examples are in
 [work/README.md](work/README.md) and [work/FORMATS.md](work/FORMATS.md).
+
+## Where farmy keeps things
+
+Out of the box farmy needs no folder of yours, on Linux and on macOS alike:
+
+- `~/.config/farmy` holds the configuration: `farmy.yml`, the definitions `services/<name>.yml` and
+  `services/<name>.env`, this machine's `.env`, `tools.lock` (`$XDG_CONFIG_HOME/farmy` when that is set);
+- `~/.local/state/farmy` holds farmy's own state, `.work/` (`$XDG_STATE_HOME/farmy` when that is set).
+
+A project folder works as well: any folder that holds a `farmy.yml`. Run farmy in it, or in a folder
+below it, and farmy uses that folder, with its state in `.work/` beside the definitions (`farmy -C <dir>
+init` writes the `farmy.yml` of a new one). `farmy -C <dir> <command>` uses a folder for one command,
+`FARMY_DIR=<dir>` for every command of a shell. The first match wins: `-C`, `FARMY_DIR`, the nearest
+`farmy.yml` from the current folder up, then `~/.config/farmy`. `farmy config path` prints the folder in use.
+
+Track this folder in git and you can bring your services to another machine with `git clone` + `farmy`.
+`farmy config git` sets that up: a `.gitignore` keeps `.env`, `services/*.env`, `.work/` and farmy's
+temporary files out, and the first commit holds `farmy.yml` and the definitions. On a terminal, the first
+run asks once whether to; a folder that already lies in a Git repository (a dotfiles repository holding
+`~/.config`) is left to that one.
+
+Without `HOME` (a service manager may start farmy so) the default home has no path: farmy refuses and
+names the ways out, `XDG_CONFIG_HOME` and `XDG_STATE_HOME`, `FARMY_DIR` or `-C`.
+
+What farmy writes in either folder is yours from the moment it is written. On Linux farmy runs as you
+inside its control container (`docker exec -u <uid>:<gid>`), not as root with a chown afterwards;
+`sudo farmy` runs as the folder's owner, and in the default home as the user who ran sudo; on a Mac, and with a rootless Docker, root in a container already is
+you. A Docker that remaps users (userns-remap) gives files to subordinate uids whoever farmy runs as; that
+is not farmy's to fix.
+
+farmy runs in one control container, for one folder at a time. While factory runs or the session are live
+in it, the control container is never replaced. From another folder farmy refuses, naming the folder it
+serves (`status`, `logs`, `factory list` and the other read-only commands still run, in a container of their
+own):
+
+```
+farmy: the control container serves ~/.config/farmy and has 1 live run; finish or cancel them, or run this command with farmy -C ~/.config/farmy
+```
+
+After an update it waits for the runs the same way (`farmy factory cancel <id>` and `farmy stop` still
+work). [work/docs/troubleshooting.md](work/docs/troubleshooting.md) has the ways out.
 
 ## Secrets
 
@@ -144,7 +187,9 @@ their reserved child. Each gate gets fresh isolated sidecars and data. See
 
 ```
 farmy session         the session (the TUI), the same as a bare farmy; --background starts it without attaching
-farmy init            prepare the folder: Docker, .env, the list of services
+farmy init            prepare the folder in use: Docker, .env, farmy.yml when it has none, the list of services
+farmy config path     print the folder in use
+farmy config git      keep the folder in use in git: .gitignore, git init, the first commit
 farmy add <url>       write a definition for a repository (--image <image>, --name <name>)
 farmy start <name>    start a service, then its setup command
 farmy stop [<name>]   stop containers; none named: everything
@@ -167,7 +212,7 @@ farmy logs <name>     follow the containers' logs
 farmy ssh <name>      a shell in the app container, as the dev user
 farmy update          pull the selected release images and replace the shim; --to <version> selects an exact release
 farmy help            the usage
-farmy --version       the version and the build hash
+farmy --version       the version and the commit it was built from
 ```
 
 ## Guides
@@ -187,12 +232,13 @@ farmy --version       the version and the build hash
 ## Updating
 
 ```sh
-farmy update                # latest stable release, or the current folder's pin
+farmy update                # latest stable release, or the pin of the folder in use
 farmy update --to 0.1.0      # choose an exact release
 ```
 
-To pin a containers folder, add `farmy: 0.1.0` to its `farmy.yml`. A mismatch gives the update
-command to fix it. Both `farmy.yml` and service definitions accept `format: 1`; omitting it
+To pin the folder in use, add `farmy: 0.1.0` to its `farmy.yml`. A mismatch gives the update
+command to fix it. The control container is replaced for the new version only once no factory run and
+no session is live in it; until then farmy names them and how to end them. Both `farmy.yml` and service definitions accept `format: 1`; omitting it
 also means format 1. Status identifies toolboxes built by older farmy versions and names
 the `farmy rebuild <name>` command to refresh each one.
 

@@ -8,7 +8,7 @@ class AgentCliIntegrationTest < AcceptanceTest
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
   end
 
-  def teardown = (script "farmy", "destroy", "shop", stdin: "y\n" if real_docker_test?) # its volumes too; its containers go anyway
+  def teardown = (real_shim "destroy", "shop", stdin: "y\n" if real_docker_test?) # its volumes too; its containers go anyway
 
   # catalogue agent → its CLI and version line
   { "claude" => ["claude", "claude --version"], "codex" => ["codex", "codex --version"], "gemini" => ["gemini", "gemini --version"],
@@ -16,7 +16,7 @@ class AgentCliIntegrationTest < AcceptanceTest
     test "in a real Debian app image the catalogue's #{agent} CLI answers #{version} as dev and lives outside every home directory" do
       write_file "farmy.yml", "agents:\n  #{agent}: {}\n"
 
-      script "farmy", "start", "shop"
+      real_shim "start", "shop"
 
       assert_success
       assert_runs_as_dev "shop", version
@@ -27,7 +27,7 @@ class AgentCliIntegrationTest < AcceptanceTest
   test "a toolbox build whose agent CLI dev cannot execute (codex under /root, linked from /usr/local/bin) fails, naming the agent and Permission denied" do
     write_file "farmy.yml", "agents:\n  codex:\n    install: mkdir -p /root/.codex/bin && printf '#!/bin/sh\\necho codex-cli 0.0.0\\n' > /root/.codex/bin/codex && chmod 755 /root/.codex/bin/codex && ln -sf /root/.codex/bin/codex /usr/local/bin/codex\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_failure
     assert_output_names "codex", "Permission denied"
@@ -36,7 +36,7 @@ class AgentCliIntegrationTest < AcceptanceTest
   test "a toolbox build whose agent's version command never answers fails after 30 s, naming the agent and the limit" do
     write_file "farmy.yml", "agents:\n  mytool:\n    install: printf '#!/bin/sh\\nsleep 600\\n' > /usr/local/bin/mytool && chmod 755 /usr/local/bin/mytool\n    login: .mytool\n    version: mytool --version\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_failure
     assert_output_names "mytool", "30 s"
@@ -45,7 +45,7 @@ class AgentCliIntegrationTest < AcceptanceTest
   test "an agent whose install download fails fails the build at the install step, naming the agent and the download's error" do
     write_file "farmy.yml", "agents:\n  mytool:\n    install: curl -fsSL -o /tmp/mytool-install.sh https://example.com/mytool/install.sh && sh /tmp/mytool-install.sh\n    login: .mytool\n    version: mytool --version\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_failure
     assert_output_names "mytool", "curl: (22)"

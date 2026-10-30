@@ -20,7 +20,8 @@ if [ -f "$installer_root/release.yml" ]; then
   [ -n "$FARMY_DEFAULT_GITHUB" ] || FARMY_DEFAULT_GITHUB=$(release_scalar github_url "$installer_root/release.yml")
 fi
 fail() { echo "farmy install: $*" >&2; exit 1; }
-valid_version() { printf '%s\n' "$1" | awk -F. 'NR!=1 || NF!=3 {exit 1} {for(i=1;i<=3;i++) if($i!~/^[0-9]+$/ || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; }
+# An exact version: MAJOR.MINOR.PATCH, or a pre-release MAJOR.MINOR.PATCH-rc.N.
+valid_version() { printf '%s\n' "$1" | awk 'NR != 1 || $0 !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$/ { bad = 1 } END { exit bad || NR != 1 }'; }
 quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 version=; destination=${HOME}/.local/bin
 while [ "$#" -gt 0 ]; do
@@ -30,7 +31,7 @@ while [ "$#" -gt 0 ]; do
     *) fail "unknown argument $1; usage: bin/install [--to VERSION] [--dir DIR]" ;;
   esac
 done
-[ -z "$version" ] || valid_version "$version" || fail 'version must be exact MAJOR.MINOR.PATCH'
+[ -z "$version" ] || valid_version "$version" || fail 'version must be exact MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N'
 if [ -z "$version" ] && [ -n "$FARMY_RELEASE_VERSION" ]; then
   valid_version "$FARMY_RELEASE_VERSION" || fail 'the installer carries an invalid release version'
   version=$FARMY_RELEASE_VERSION
@@ -61,12 +62,15 @@ container=$(docker create "$image") || fail 'could not create an extraction cont
 docker cp "$container:/usr/local/lib/farmy/farmy" "$stage/source" || fail 'could not extract the standalone shim'
 [ -s "$stage/source" ] || fail 'the extracted shim is empty'
 sh -n "$stage/source" || fail 'the extracted shim is not valid POSIX shell'
+# the commit of the image the shim comes from, which its farmy --version names
+commit=$(docker image inspect -f '{{index .Config.Labels "farmy.commit"}}' "$image" 2>/dev/null || true)
+case "$commit" in *[!0-9a-f]*|'') commit= ;; *) commit=$(printf '%s\n' "$commit" | cut -c1-7) ;; esac
 {
-  printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$version"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "$registry"
+  printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$version"; printf '\nFARMY_SHIM_COMMIT='; quote "$commit"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "$registry"
   printf '\nFARMY_DEFAULT_SOURCE='; quote "${FARMY_SOURCE:-$default_source}"
   printf '\nFARMY_DEFAULT_GITHUB='; quote "$FARMY_DEFAULT_GITHUB"
   printf '\nFARMY_DEFAULT_SOURCE_IS_GENERATED='; quote "$source_is_generated"; printf '\n'
-  sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
+  sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_SHIM_COMMIT=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
 } > "$stage/farmy"
 chmod 755 "$stage/farmy"
 mv -f "$stage/farmy" "$destination/farmy"

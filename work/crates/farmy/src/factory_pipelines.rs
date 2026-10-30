@@ -121,6 +121,7 @@ fn spawn_pipeline(p: &mut PipelineState) -> R {
         .open(dir.join("controller.log"))?;
     let child = Command::new(std::env::current_exe()?)
         .args(["factory", "pipeline", "run", &p.id])
+        .env("FARMY_DIR", &crate::folder::current().path)
         .stdin(controller.into_stdio())
         .stdout(log.try_clone()?)
         .stderr(log)

@@ -5,6 +5,7 @@
     reason = "the command implementations: stdout is what farmy says to its user"
 )]
 use crate::agents::{self, Agent};
+use crate::folder::{folder_text, looked_in};
 use crate::model::{
     Config, Definition, PortPair, Settings, WORK, block_text, booted_definition, definition_path,
     farmy_home, known_services,
@@ -26,18 +27,22 @@ pub(crate) enum Mode {
 pub(crate) fn help() {
     println!(
         "farmy — one set of containers per repository
-Run it in the folder that defines them: services/<name>.yml (the definition: repository, image, ports,
-commands, a compose fragment), .env (this machine's settings), farmy.yml (optional: the secrets
-provider, the routes, agents, the knowledge container).
+It works in the folder in use: services/<name>.yml (the definition: repository, image, ports, commands,
+a compose fragment), .env (this machine's settings), farmy.yml (the secrets provider, the routes, agents,
+the knowledge container). That is ~/.config/farmy (its state in ~/.local/state/farmy), unless -C <dir>,
+FARMY_DIR or a farmy.yml in this folder or one above names another. farmy config path prints it.
 
 USAGE
-  farmy <command> [service…] [args…]
+  farmy [-C <dir>] <command> [service…] [args…]
 
 COMMANDS
   session               Attach to the persistent session (the TUI; a window per thing started from it).
                         --background makes sure it runs without attaching. The shim runs this for a bare `farmy`.
-  init                  Prepare this folder: Docker, .env (the Git identity from this host's git config), the services.
+  init                  Prepare the folder in use: Docker, .env (the Git identity from this host's git config),
+                        farmy.yml when it has none (so that farmy finds that folder again), the services.
                         Through the shim: the control image, built when missing or when the checkout changed.
+  config path           Print the folder in use (absolute).
+  config git            Keep the folder in use in git: .gitignore, git init, the first commit (never a .env).
   add      <url>        Write services/<name>.yml for a repository: repo: from the URL, image: from --image <image>
                         (asked on a terminal), the name from the URL or --name <name>.
   start    <svc…>       Build what is missing and bring the service's containers up: the app container (the
@@ -76,6 +81,9 @@ Full docs: README.md next to farmy; the formats in FORMATS.md."
     );
 }
 
+/// What `status` and the session say when the folder in use defines no service.
+pub(crate) const NO_SERVICES: &str = "No services yet: farmy add <git url> [--image …]";
+
 // ── the folder, read once per command ─────────────────────────────────────────────────────────
 
 pub(crate) struct Ctx {
@@ -112,9 +120,10 @@ pub(crate) fn need_docker() -> R {
 
 fn require_env(ctx: &Ctx) -> R {
     if !Path::new(".env").is_file() {
-        return refuse(
-            "no .env in this folder — run: farmy init  (it writes one; the keys are in .env.example next to farmy)",
-        );
+        return refuse(format!(
+            "no .env in {} — run: farmy init  (it writes one; the keys are in .env.example next to farmy)",
+            looked_in()
+        ));
     }
     ctx.settings.require_identity()?;
     ctx.settings.check_lan_host()
@@ -135,11 +144,13 @@ pub(crate) fn check_services(_ctx: &Ctx, names: &[String], leftover: bool) -> R 
         }
         if known.is_empty() {
             return usage(format!(
-                "unknown service '{s}' — no services are defined yet: farmy add <url> --image <image> writes services/{s}.yml (README → Adding a service)"
+                "unknown service '{s}' — no services are defined yet in {}: farmy add <url> --image <image> writes services/{s}.yml (README → Adding a service)",
+                looked_in()
             ));
         }
         return usage(format!(
-            "unknown service '{s}' — known: {}",
+            "unknown service '{s}' in {} — known: {}",
+            looked_in(),
             known.join(" ")
         ));
     }
@@ -148,9 +159,10 @@ pub(crate) fn check_services(_ctx: &Ctx, names: &[String], leftover: bool) -> R 
 
 fn need_services(_ctx: &Ctx) -> R {
     if known_services().is_empty() {
-        return usage(
-            "no services are defined yet — farmy add <url> --image <image> writes a services/<name>.yml (README → Adding a service)",
-        );
+        return usage(format!(
+            "no services are defined yet in {} — farmy add <url> --image <image> writes a services/<name>.yml (README → Adding a service)",
+            looked_in()
+        ));
     }
     Ok(())
 }
@@ -763,25 +775,67 @@ pub(crate) fn ensure_helper_image(
         return Ok(());
     }
     println!("building {tag}");
-    let df = home.join(dockerfile);
-    let ok = docker::quiet(&[
-        "build",
-        "-q",
-        "--label",
-        &format!("farmy.hash={hash}"),
-        "--label",
-        &format!("farmy.version={}", crate::version::CURRENT),
-        "-t",
-        tag,
-        "-f",
-        &df.display().to_string(),
-        &home.display().to_string(),
-    ]);
+    // The context holds only what the Dockerfile copies (`also`), as plain files: never farmy's whole
+    // folder, and never a link (Docker sends links as links).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let context = std::env::temp_dir().join(format!(
+        "farmy-context-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let made = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&context)?;
+        plain_copy(&home.join(dockerfile), &context.join("Dockerfile"))?;
+        for a in also {
+            plain_copy(&home.join(a), &context.join(a))?;
+        }
+        Ok(())
+    })();
+    let ok = made.is_ok()
+        && docker::quiet(&[
+            "build",
+            "-q",
+            "--label",
+            &format!("farmy.hash={hash}"),
+            "--label",
+            &format!("farmy.version={}", crate::version::CURRENT),
+            "-t",
+            tag,
+            "-f",
+            &context.join("Dockerfile").display().to_string(),
+            &context.display().to_string(),
+        ]);
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "removing the temporary build context; a leftover in the temporary folder harms nothing"
+    )]
+    let _ = std::fs::remove_dir_all(&context);
+    if let Err(e) = made {
+        return refuse(format!("the build context of {tag} could not be made: {e}"));
+    }
     if ok {
         Ok(())
     } else {
         refuse(format!("the build of {tag} failed — see above"))
     }
+}
+
+/// A file or a folder copied as plain files and folders: a link is left out, never followed.
+fn plain_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            plain_copy(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
 }
 
 fn ensure_knowledge(ctx: &Ctx) {
@@ -817,11 +871,14 @@ fn ensure_knowledge(ctx: &Ctx) {
     )]
     let _ = std::fs::create_dir_all("services");
     let cwd = std::env::current_dir().unwrap_or_default();
-    // only the containers folder may be bind-mounted: the daemon resolves bind sources on the host, and
-    // farmy's own files (README, docs) are in the knowledge image instead
+    // only the folder in use and its state folder may be bind-mounted: the daemon resolves bind sources on
+    // the host, and farmy's own files (README, docs) are in the knowledge image instead
     let volumes = [
-        format!("{}/services:/kb/services:ro", cwd.display()),
-        format!("{}/{WORK}/status:/kb/status:ro", cwd.display()),
+        format!("{}:/kb/services:ro", cwd.join("services").display()),
+        format!(
+            "{}:/kb/status:ro",
+            cwd.join(PathBuf::from(WORK)).join("status").display()
+        ),
     ];
     let text = format!(
         "name: farmy\nservices:\n  knowledge:\n    image: farmy-knowledge:local\n    container_name: farmy-knowledge\n    hostname: farmy-knowledge\n    init: true\n    restart: unless-stopped\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [\"no-new-privileges:true\"]\n    networks: [farmy]\n{}    volumes:\n{}\nnetworks:\n  farmy:\n    external: true\n",
@@ -871,7 +928,142 @@ fn stop_knowledge() {
     }
 }
 
-/// The repository's Dockerfile and the build_files, from a shallow sparse clone, into the build context.
+/// Whether git reaches a repository over ssh: an `ssh://`, `git+ssh://` or `user@host:path` URL, or an
+/// `https://` URL on the host of a granted git route that its `insteadOf` rule sends to ssh.
+fn reaches_over_ssh(url: &str, routes: &[&Route]) -> bool {
+    url.starts_with("ssh://")
+        || url.starts_with("git+ssh://")
+        || (!url.contains("://") && url.contains(':'))
+        || routes
+            .iter()
+            .any(|r| r.git && r.is_ssh() && url.starts_with(&format!("https://{}/", r.host)))
+}
+
+/// What the git container said of one build file, in the order asked.
+#[derive(Debug, PartialEq, Eq)]
+enum Handed {
+    /// The committed file's content, and whether it is executable.
+    File { executable: bool, bytes: Vec<u8> },
+    /// No such file in the committed tree.
+    Missing,
+    /// A link on the way leads out of the repository or to nothing: the link's own text.
+    Outside(String),
+}
+
+/// The git container's output, one record per file asked for: a line `missing`, `outside <the link's
+/// text>`, or `x <size>` (executable) / `- <size>` followed by that many bytes. `None` when the output is
+/// cut short or not in that form.
+fn handed_over(mut out: &[u8], count: usize) -> Option<Vec<Handed>> {
+    let mut files = Vec::with_capacity(count);
+    for _ in 0..count {
+        let end = out.iter().position(|&b| b == b'\n')?;
+        let head = std::str::from_utf8(out.get(..end)?).ok()?;
+        out = out.get(end + 1..)?;
+        if head == "missing" {
+            files.push(Handed::Missing);
+            continue;
+        }
+        if let Some(link) = head.strip_prefix("outside ") {
+            files.push(Handed::Outside(link.to_string()));
+            continue;
+        }
+        let (mode, size) = head.split_once(' ')?;
+        let size: usize = size.parse().ok()?;
+        files.push(Handed::File {
+            executable: mode == "x",
+            bytes: out.get(..size)?.to_vec(),
+        });
+        out = out.get(size..)?;
+    }
+    Some(files)
+}
+
+/// A `dockerfile:` or `build_files` entry farmy may read: a relative path inside the repository (record
+/// 2026-10-29-1800): not empty, not absolute, no `..` part, not starting with `-`, nothing unprintable.
+fn repository_path(entry: &str) -> bool {
+    !entry.is_empty()
+        && !entry.starts_with('/')
+        && !entry.starts_with('-')
+        && !entry.chars().any(char::is_control)
+        && entry.split('/').all(|part| part != "..")
+}
+
+/// The script that hands a service's build files over: a shallow clone without a checkout in the git
+/// container's own filesystem, and each file read from the committed tree (`git ls-tree`, `git cat-file`),
+/// never from a working tree. A link is followed inside the repository, link by link, each step staying
+/// in the committed tree; one that leads above the root, to an absolute path or to nothing is reported,
+/// and what it points at is never read.
+fn hand_over_script(selected: &str) -> String {
+    format!(
+        r#"set -eu
+src=$(mktemp -d)
+trap 'rm -rf "$src"' EXIT
+git clone --quiet --depth 1 ${{BRANCH:+--branch "$BRANCH"}} --filter=blob:none --no-checkout "$FARMY_REPO" "$src" >&2
+cd "$src"
+tab=$(printf '\t')
+# resolve PATH: prints "<mode> <object>" of the committed file PATH names; exit 2 when there is none, 3
+# (printing the last link's text) when a link on the way leads out of the repository or to nothing
+resolve() {{
+  todo=$1; at=; hops=0; link=; last=
+  while [ -n "$todo" ]; do
+    case $todo in
+      */*) part=${{todo%%/*}}; todo=${{todo#*/}} ;;
+      *) part=$todo; todo= ;;
+    esac
+    case $part in
+      ''|.) continue ;;
+      ..)
+        if [ -z "$at" ]; then printf '%s\n' "$link"; return 3; fi
+        case $at in */*) at=${{at%/*}} ;; *) at= ;; esac
+        continue ;;
+    esac
+    path=${{at:+$at/}}$part
+    entry=$(git --literal-pathspecs ls-tree HEAD -- "$path" | head -n 1)
+    if [ -z "$entry" ]; then
+      [ "$hops" = 0 ] && return 2
+      printf '%s\n' "$link"; return 3
+    fi
+    mode=${{entry%% *}}
+    object=${{entry#* * }}; object=${{object%%"$tab"*}}
+    if [ "$mode" = 120000 ]; then
+      hops=$((hops + 1))
+      link=$(git cat-file blob "$object" | tr '\n' ' ')
+      case $link in /*|'') printf '%s\n' "$link"; return 3 ;; esac
+      [ "$hops" -le 40 ] || {{ printf '%s\n' "$link"; return 3; }}
+      todo=$link${{todo:+/$todo}}
+    else
+      if [ -n "$todo" ] && [ "$mode" != 040000 ]; then
+        [ "$hops" = 0 ] && return 2
+        printf '%s\n' "$link"; return 3
+      fi
+      at=$path; last="$mode $object"
+    fi
+  done
+  printf '%s\n' "$last"
+}}
+for f in {selected}; do
+  if found=$(resolve "$f"); then code=0; else code=$?; fi
+  case "$code:$found" in
+    0:100644\ *|0:100755\ *)
+      object=${{found#* }}
+      if [ "${{found%% *}}" = 100755 ]; then m=x; else m=-; fi
+      printf '%s %s\n' "$m" "$(git cat-file -s "$object")"
+      git cat-file blob "$object" ;;
+    3:*) printf 'outside %s\n' "$found" ;;
+    *) echo missing ;;
+  esac
+done
+"#
+    )
+}
+
+/// The repository's Dockerfile and the build_files into the build context, read from the committed tree
+/// of `branch` whatever the transport (record 2026-10-29-1800): a git container clones without a checkout
+/// into its own filesystem, never into the state folder, and hands each file over on its output; farmy,
+/// running as the user, writes them into the context as regular files, so they are that user's from the
+/// moment they are written. Over ssh the git container runs as root (ssh refuses a uid the image has no
+/// account for, and the route's agent answers only its own user and root); otherwise as the user. A link
+/// that leads out of the repository stops the start before anything is written or built.
 fn fetch_build_files(
     ctx: &Ctx,
     name: &str,
@@ -880,22 +1072,18 @@ fn fetch_build_files(
     context: &Path,
     files: &[String],
 ) -> R {
-    let src = context.join(".src");
-    #[expect(
-        clippy::let_underscore_must_use,
-        reason = "removing the temporary clone; a leftover is replaced at the next fetch"
-    )]
-    let _ = std::fs::remove_dir_all(&src);
     let url = repo_url(ctx, repo);
+    let over_ssh = reaches_over_ssh(&url, &secrets::granted(&ctx.routes, name));
     let mut request = crate::git_container::Request::new(name, "build-files");
     // The app image is what this fetch is about to build. The shim's control image already has Git,
-    // SSH and nc; use its root account (there is no dev account) and the same loaded route broker.
+    // SSH and nc, and the same loaded route broker is used.
     request.image = "farmy:local".into();
-    request.user = "0".into();
-    request.mounts.push(format!(
-        "{}:/workspace",
-        std::fs::canonicalize(context)?.display()
-    ));
+    request.user = if over_ssh {
+        "0".into()
+    } else {
+        crate::model::running_as()
+    };
+    request.workdir = "/tmp".into();
     request.env.extend([
         ("FARMY_REPO".into(), url.clone()),
         ("BRANCH".into(), branch.unwrap_or("").into()),
@@ -905,22 +1093,11 @@ fn fetch_build_files(
         .map(|file| crate::git_container::shell_quote(file))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
-        r#"set -eu
-git clone --quiet --depth 1 ${{BRANCH:+--branch "$BRANCH"}} --filter=blob:none --no-checkout "$FARMY_REPO" /workspace/.src
-git -C /workspace/.src sparse-checkout set --no-cone -- {selected}
-git -C /workspace/.src checkout --quiet
-"#
-    );
-    let (code, stdout, stderr) = crate::git_container::run(ctx, request, &script);
+    let (code, stdout, stderr) =
+        crate::git_container::run_raw(ctx, request, &hand_over_script(&selected));
+    let which = branch.map(|b| format!(" ({b})")).unwrap_or_default();
     if code != 0 {
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "removing the temporary clone; a leftover is replaced at the next fetch"
-        )]
-        let _ = std::fs::remove_dir_all(&src);
-        let said = format!("{stdout}\n{stderr}");
-        let said: Vec<&str> = said
+        let said: Vec<&str> = stderr
             .lines()
             .filter(|l| !l.starts_with("warning: filtering"))
             .collect();
@@ -933,41 +1110,66 @@ git -C /workspace/.src checkout --quiet
             .collect::<Vec<_>>()
             .join("\n");
         let cause = git_cause(&said.join("\n"));
-        let which = branch.map(|b| format!(" ({b})")).unwrap_or_default();
         return refuse(format!(
             "[{name}] couldn't clone {url}{which} to read its Dockerfile: {cause} — git's last lines:\n{tail}\n[{name}]   check the git route's secret for {} (farmy keys) and repo: / branch: in {}",
             secrets::host_of(&url),
             definition_path(name)
         ));
     }
-    for f in files {
-        let from = src.join(f);
-        if !from.is_file() {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "removing the temporary clone; a leftover is replaced at the next fetch"
-            )]
-            let _ = std::fs::remove_dir_all(&src);
-            let which = branch.map(|b| format!(" ({b})")).unwrap_or_default();
-            return refuse(format!(
-                "[{name}] build_files: '{f}' is not in {repo}{which} — is it a file the target stage COPYs?"
-            ));
+    let handed = handed_over(&stdout, files.len()).ok_or_else(|| {
+        Fail::Refuse(format!(
+            "[{name}] the git container that read {url}{which} handed its files over cut short; try again"
+        ))
+    })?;
+    let kind = |i: usize| if i == 0 { "dockerfile" } else { "build_files" };
+    for (i, (f, file)) in files.iter().zip(&handed).enumerate() {
+        match file {
+            Handed::File { .. } => {}
+            Handed::Missing => {
+                return refuse(format!(
+                    "[{name}] {}: '{f}' is not in {repo}{which} — is it a file the target stage COPYs?",
+                    kind(i)
+                ));
+            }
+            Handed::Outside(link) => {
+                return refuse(format!(
+                    "[{name}] {}: '{f}' points outside the repository (a link to {}) — farmy reads build files from the repository only",
+                    kind(i),
+                    link.trim_end()
+                ));
+            }
         }
+    }
+    for (f, file) in files.iter().zip(handed) {
+        let Handed::File { executable, bytes } = file else {
+            continue;
+        };
         let to = context.join(f);
         if let Some(parent) = to.parent() {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the copy right after reports a missing folder"
-            )]
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&from, &to)?;
+        // never through a link: the context is farmy's, made empty for this fetch
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "removing what may stand there; the write right after reports a real problem"
+        )]
+        let _ = std::fs::remove_file(&to);
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(if executable { 0o755 } else { 0o644 })
+                .open(&to)?;
+            out.write_all(&bytes)?;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &to,
+            std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+        )?;
     }
-    #[expect(
-        clippy::let_underscore_must_use,
-        reason = "removing the temporary clone; a leftover is replaced at the next fetch"
-    )]
-    let _ = std::fs::remove_dir_all(&src);
     Ok(())
 }
 
@@ -989,6 +1191,17 @@ fn build_service_image(
                 .dockerfile
                 .clone()
                 .unwrap_or_else(|| "Dockerfile".into());
+            // only paths inside the repository, before anything is fetched or cleared
+            for (key, entry) in std::iter::once(("dockerfile", &dockerfile))
+                .chain(def.build_files.iter().map(|f| ("build_files", f)))
+            {
+                if !repository_path(entry) {
+                    return refuse(format!(
+                        "[{name}] {key}: '{entry}' is not a relative path inside the repository (no leading /, no .. part) — {}",
+                        definition_path(name)
+                    ));
+                }
+            }
             let context = PathBuf::from(WORK).join(name).join("ctx");
             #[expect(
                 clippy::let_underscore_must_use,
@@ -1414,6 +1627,13 @@ pub(crate) fn start(args: &[String], mode: Mode) -> R {
         return usage(format!("usage: farmy {cmd} <service> [service…]"));
     }
     need_docker()?;
+    // no .env yet: written here as init writes it, when the Git identity is found without a question
+    let ctx = if Path::new(".env").is_file() {
+        ctx
+    } else {
+        write_missing_env()?;
+        load_ctx()?
+    };
     require_env(&ctx)?;
     assign_ports()?;
     check_defined(&ctx, args)?;
@@ -1866,7 +2086,7 @@ pub(crate) fn stop(args: &[String]) -> R {
         stop_knowledge();
         egress::stop(&ctx.cfg);
     }
-    if Path::new(WORK).is_dir() {
+    if WORK.path().is_dir() {
         write_status(&ctx);
     }
     Ok(())
@@ -1945,20 +2165,13 @@ pub(crate) fn destroy(args: &[String]) -> R {
             println!("nothing destroyed");
         }
     }
-    if Path::new(WORK).is_dir() {
+    if WORK.path().is_dir() {
         write_status(&ctx);
     }
     Ok(())
 }
 
 pub(crate) fn status(args: &[String]) -> R {
-    for note in crate::toolbox::outdated() {
-        if args.iter().any(|a| a == "--json") {
-            warn(note);
-        } else {
-            println!("{note}");
-        }
-    }
     let json = args.iter().any(|a| a == "--json");
     if let Some(a) = args.iter().find(|a| *a != "--json") {
         return usage(format!(
@@ -1967,22 +2180,30 @@ pub(crate) fn status(args: &[String]) -> R {
     }
     let ctx = load_ctx()?;
     need_docker()?;
+    if !json {
+        println!("{:<12} {}", "folder", folder_text());
+    }
+    for note in crate::toolbox::outdated() {
+        if json {
+            warn(note);
+        } else {
+            println!("{note}");
+        }
+    }
     if json {
         assign_ports()?;
         println!(
             "{}",
             serde_json::to_string(&snapshot(&ctx)).unwrap_or_default()
         );
-        if Path::new(WORK).is_dir() {
+        if WORK.path().is_dir() {
             write_status(&ctx);
         }
         return Ok(());
     }
     let known = known_services();
     if known.is_empty() {
-        println!(
-            "no services defined yet — farmy add <url> --image <image> writes a services/<name>.yml (README → Adding a service)"
-        );
+        println!("{NO_SERVICES}");
         return Ok(());
     }
     assign_ports()?;
@@ -2034,7 +2255,7 @@ pub(crate) fn status(args: &[String]) -> R {
             .unwrap_or_default();
         println!("{name:<12} {state:<8} {block:<10} {repo}{urls}{note}{version_note}");
     }
-    if Path::new(WORK).is_dir() {
+    if WORK.path().is_dir() {
         write_status(&ctx);
     }
     Ok(())
@@ -2351,7 +2572,7 @@ pub(crate) fn init(args: &[String]) -> R {
             "unknown argument '{a}' — farmy init takes no arguments"
         ));
     }
-    println!("\n  farmy init — this folder, ready for farmy.");
+    println!("\n  farmy init — {}, ready for farmy.", folder_text());
     if !std::io::stdin().is_terminal() {
         println!(
             "        (not on a terminal — nothing is asked; what is not found is left for you to set)"
@@ -2364,13 +2585,19 @@ pub(crate) fn init(args: &[String]) -> R {
         );
     }
     ok_line("Docker is running");
+    // nothing is written before Docker answered: the default home is set up only now
+    crate::folder::set_up_for_init()?;
     println!("\n  [2/4] .env  (written when missing; a value already set is kept)");
+    if crate::folder::write_default_farmy_yml(Path::new("."))? {
+        ok_line(&format!(
+            "wrote farmy.yml (every default) — farmy finds {} by it from now on",
+            looked_in()
+        ));
+    }
     if Path::new(".env").is_file() {
         ok_line(".env exists");
     } else {
-        let example = std::fs::read_to_string(farmy_home().join(".env.example"))
-            .unwrap_or_else(|_| "GIT_USER_NAME=Your Name\nGIT_USER_EMAIL=you@example.com\n".into());
-        std::fs::write(".env", example)?;
+        std::fs::write(".env", env_example())?;
         println!("        ✓ wrote .env (from farmy's .env.example)");
     }
     let mut settings = Settings::load().unwrap_or_else(Settings::empty);
@@ -2383,25 +2610,12 @@ pub(crate) fn init(args: &[String]) -> R {
                 ok_line(&format!("{key} = {v} (kept)"))
             }
             _ => {
-                // first farmy's own environment (the shim passes the host's git configuration that way: the
-                // control container never sees it), then git where farmy runs, then a question on a terminal
-                let found = std::env::var(key)
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        Command::new("git")
-                            .args(["config", "--global", git_key])
-                            .output()
-                            .ok()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                            .filter(|v| !v.is_empty())
-                    })
-                    .or_else(|| {
-                        ask_line(&format!(
-                            "        {key} (git's {git_key}; written to .env): "
-                        ))
-                    });
+                // farmy's own environment, then git where farmy runs, then a question on a terminal
+                let found = identity_found(key, git_key).or_else(|| {
+                    ask_line(&format!(
+                        "        {key} (git's {git_key}; written to .env): "
+                    ))
+                });
                 match found {
                     Some(v) => {
                         set_env_key(key, &v)?;
@@ -2441,7 +2655,8 @@ pub(crate) fn init(args: &[String]) -> R {
     let services = known_services();
     if services.is_empty() {
         println!(
-            "        no services defined yet — farmy add <url> --image <image> writes a services/<name>.yml (README → Adding a service), then: farmy start <name>"
+            "        no services defined yet in {} — farmy add <url> --image <image> writes a services/<name>.yml (README → Adding a service), then: farmy start <name>",
+            looked_in()
         );
         println!("\n  Done.");
         return Ok(());
@@ -2615,6 +2830,12 @@ pub(crate) fn add(args: &[String]) -> R {
 
 fn set_env_key(key: &str, value: &str) -> R {
     let text = std::fs::read_to_string(".env").unwrap_or_default();
+    std::fs::write(".env", with_env_key(&text, key, value))?;
+    Ok(())
+}
+
+/// `.env`'s text with `key` set to `value`: its first line replaced, or one added.
+fn with_env_key(text: &str, key: &str, value: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
     let mut done = false;
     for l in lines.iter_mut() {
@@ -2626,7 +2847,53 @@ fn set_env_key(key: &str, value: &str) -> R {
     if !done {
         lines.push(format!("{key}={value}"));
     }
-    std::fs::write(".env", lines.join("\n") + "\n")?;
+    lines.join("\n") + "\n"
+}
+
+/// What a new `.env` starts from: farmy's `.env.example`.
+fn env_example() -> String {
+    std::fs::read_to_string(farmy_home().join(".env.example"))
+        .unwrap_or_else(|_| "GIT_USER_NAME=Your Name\nGIT_USER_EMAIL=you@example.com\n".into())
+}
+
+/// The Git identity a missing `.env` gets without a question: `GIT_USER_NAME` / `GIT_USER_EMAIL` in
+/// farmy's environment (the shim passes the host's git configuration that way: the control container
+/// never sees it), then the global git configuration where farmy runs.
+fn identity_found(key: &str, git_key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["config", "--global", git_key])
+                .stdin(Stdio::null())
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+/// `start`, `restart` and `rebuild` in a folder without `.env`: it is written as `init` writes it, with
+/// the Git identity found without a question, and said on stderr. Without an identity nothing is
+/// written and the start is refused as before.
+fn write_missing_env() -> R {
+    let (Some(name), Some(email)) = (
+        identity_found("GIT_USER_NAME", "user.name"),
+        identity_found("GIT_USER_EMAIL", "user.email"),
+    ) else {
+        return refuse(format!(
+            "no .env in {} and no Git identity to write one with (GIT_USER_NAME / GIT_USER_EMAIL, git config --global user.name / user.email) — run: farmy init  (it writes .env and asks for what it does not find)",
+            looked_in()
+        ));
+    };
+    let text = with_env_key(&env_example(), "GIT_USER_NAME", &name);
+    std::fs::write(".env", with_env_key(&text, "GIT_USER_EMAIL", &email))?;
+    warn(format!(
+        "wrote {} with the Git identity {name} <{email}> (farmy init does the same; LAN_HOST and the rest go there too)",
+        crate::folder::shown(&crate::folder::current().path.join(".env"))
+    ));
     Ok(())
 }
 
@@ -2661,15 +2928,28 @@ pub(crate) fn session(args: &[String]) -> R {
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "farmy".into());
-        let ok = tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            "farmy",
-            "-n",
-            "farmy",
-            &format!("{exe} tui"),
-        ]);
+        // the TUI works in the folder in use, whatever environment a tmux server already running holds
+        let folder = crate::folder::current();
+        let mut new_session: Vec<String> =
+            ["new-session", "-d", "-s", "farmy", "-n", "farmy", "-c"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        new_session.push(folder.path.display().to_string());
+        new_session.extend(["-e".into(), format!("FARMY_DIR={}", folder.path.display())]);
+        for key in [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "FARMY_HOST_HOME",
+            "GIT_USER_NAME",
+            "GIT_USER_EMAIL",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                new_session.extend(["-e".into(), format!("{key}={value}")]);
+            }
+        }
+        new_session.push(format!("{exe} tui"));
+        let ok = tmux(&new_session.iter().map(String::as_str).collect::<Vec<_>>());
         if !ok {
             return refuse(
                 "could not start the session — is tmux installed here? (the control container has it)",
@@ -2889,7 +3169,7 @@ fn snapshot(ctx: &Ctx) -> serde_json::Value {
             "egress": crate::filter::status(ctx, &name, &def),
         }));
     }
-    serde_json::json!({ "generated": unix_to_rfc3339(now), "lan_host": lan, "bind": if compose::lan_open(&ctx.settings) { "0.0.0.0" } else { "127.0.0.1" }, "egress": egress::status_json(&ctx.cfg), "services": services })
+    serde_json::json!({ "generated": unix_to_rfc3339(now), "folder": crate::folder::folder_json(), "lan_host": lan, "bind": if compose::lan_open(&ctx.settings) { "0.0.0.0" } else { "127.0.0.1" }, "egress": egress::status_json(&ctx.cfg), "services": services })
 }
 
 /// The snapshot for the TUI, which reads the folder itself.
@@ -2900,4 +3180,100 @@ pub(crate) fn snapshot_now() -> R<serde_json::Value> {
 
 pub(crate) fn states_summary() -> BTreeMap<String, String> {
     secrets::saved_states()
+}
+
+#[cfg(test)]
+mod build_files_tests {
+    use super::{Handed, Route, handed_over, reaches_over_ssh, repository_path};
+
+    fn route(auth: &str, host: &str) -> Route {
+        Route {
+            name: "git-example".into(),
+            secret: "GIT_KEY".into(),
+            upstream: "-".into(),
+            host: host.into(),
+            ssh_user: "git".into(),
+            ssh_port: None,
+            auth: auth.into(),
+            who: "-".into(),
+            git: true,
+            expose: None,
+            placeholder: None,
+            services: None,
+            encoding: None,
+        }
+    }
+
+    #[test]
+    fn a_url_reaches_ssh_by_its_form_or_through_an_ssh_git_route() {
+        let ssh = route("ssh", "git.example.com");
+        let token = route("bearer", "git.example.com");
+        for url in [
+            "ssh://git@git.example.com/acme/toolkit.git",
+            "git+ssh://git@git.example.com/acme/toolkit.git",
+            "git@git.example.com:acme/toolkit.git",
+        ] {
+            assert!(reaches_over_ssh(url, &[]), "{url}");
+        }
+        let https = "https://git.example.com/acme/toolkit.git";
+        assert!(reaches_over_ssh(https, &[&ssh]));
+        assert!(!reaches_over_ssh(https, &[&token]));
+        assert!(!reaches_over_ssh(https, &[]));
+        assert!(!reaches_over_ssh(
+            "https://other.example.com/acme/toolkit.git",
+            &[&ssh]
+        ));
+    }
+
+    #[test]
+    fn the_files_the_git_container_hands_over_are_read_in_order() {
+        let out = [
+            &b"- 6\nFROM x"[..],
+            b"missing\n",
+            b"outside ../.env\n",
+            b"x 3\n\x00\n!",
+        ]
+        .concat();
+        let files = handed_over(&out, 4).unwrap();
+        assert_eq!(
+            files[0],
+            Handed::File {
+                executable: false,
+                bytes: b"FROM x".to_vec()
+            }
+        );
+        assert_eq!(files[1], Handed::Missing);
+        assert_eq!(files[2], Handed::Outside("../.env".into()));
+        assert_eq!(
+            files[3],
+            Handed::File {
+                executable: true,
+                bytes: b"\x00\n!".to_vec()
+            }
+        );
+        assert!(handed_over(b"- 10\nshort", 1).is_none());
+        assert!(handed_over(b"- 1\na", 2).is_none());
+    }
+
+    #[test]
+    fn build_file_entries_are_relative_paths_inside_the_repository() {
+        for entry in [
+            "Dockerfile",
+            "docker/app.Dockerfile",
+            "./Gemfile.lock",
+            "a..b",
+        ] {
+            assert!(repository_path(entry), "{entry}");
+        }
+        for entry in [
+            "",
+            "/home/dana/containers/.env",
+            "../.env",
+            "a/../../.env",
+            "-x",
+            "a\nb",
+        ] {
+            assert!(!repository_path(entry), "{entry:?}");
+        }
+    }
 }

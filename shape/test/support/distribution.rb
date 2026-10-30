@@ -3,10 +3,12 @@ require "rbconfig"
 module Distribution
   REGISTRY = "registry.example.com/acme"
   RELEASE_HASH = "1234567890abcdef1234567890abcdef12345678"
-  # The version this checkout ships (work/VERSION), set by the owner for each release.
-  SHIPPED = "0.2.0"
+  # The version this checkout ships (work/VERSION), set by the owner for each release. Between releases it is the next
+  # release's pre-release (record 2026-10-29-1800), so that what those builds make is told apart from the last release's;
+  # at a release it is that release (record 2026-10-30-2000).
+  SHIPPED = "0.3.0"
 
-  def published_release(version = SHIPPED, latest: true, format: 1, registry: REGISTRY)
+  def published_release(version = SHIPPED, latest: true, next_tag: false, format: 1, registry: REGISTRY)
     artifact = version == SHIPPED ? work_file("farmy") : "#!/bin/sh\ncase \"$1\" in --version) echo 'farmy #{version} (#{RELEASE_HASH})';; *) echo 'release #{version}';; esac\n"
     change_docker_state do |state|
       remote = state["registry"] ||= {}
@@ -15,9 +17,11 @@ module Distribution
                  "artifacts" => { "/usr/local/lib/farmy/farmy" => artifact } }
         remote["#{registry}/farmy-#{role}:#{version}"] = data
         remote["#{registry}/farmy-#{role}:latest"] = data if latest
+        remote["#{registry}/farmy-#{role}:next"] = data if next_tag
       end
     end
-    note_situation "The registry publishes #{registry}/farmy-{control,keys,knowledge,gate}:#{version}#{latest ? ' and latest' : ''}, format #{format}."
+    tags = [("latest" if latest), ("next" if next_tag)].compact
+    note_situation "The registry publishes #{registry}/farmy-{control,keys,knowledge,gate}:#{version}#{tags.empty? ? '' : " and #{tags.join(' and ')}"}, format #{format}."
   end
 
   def distribution_shim(*args, env: {})
@@ -114,6 +118,11 @@ module Distribution
     %w[control keys knowledge gate].each { |role| assert_pulled "#{REGISTRY}/farmy-#{role}:#{version}" }
   end
 
+  def refute_release_pulled(version)
+    pulled = Array(docker_state["pulls"]).select { |ref| %w[control keys knowledge gate].any? { |role| ref == "#{REGISTRY}/farmy-#{role}:#{version}" } }
+    assert pulled.empty?, "Expected no image of #{version} to be pulled; pulled: #{pulled.join(", ")}.#{transcript}"
+  end
+
   def refute_control_pull
     assert_empty Array(docker_state["pulls"]).grep(/farmy-control:/), "Expected no control pull for an explicit local build.#{transcript}"
   end
@@ -157,7 +166,7 @@ module Distribution
   def newer_running_control
     shim "init"
     assert_success
-    change_docker_state { |s| s["images"].fetch(s["containers"].fetch("farmy").fetch("image"))["labels"]["farmy.version"] = "0.3.0" }
+    change_docker_state { |s| s["images"].fetch(s["containers"].fetch("farmy").fetch("image"))["labels"]["farmy.version"] = "0.4.0" }
   end
 
   def formatted_file(kind, format)
@@ -180,10 +189,59 @@ module Distribution
       assert call, "Expected buildx to publish #{tag}.#{transcript}"
       assert_equal %w[linux/amd64 linux/arm64], call["platforms"].sort, "Expected both release architectures for #{tag}.#{transcript}"
       assert call["push"], "Expected --push for #{tag}.#{transcript}"
-      assert docker_state["images"].key?("#{registry}/farmy-#{role}:latest"), "Expected a latest release tag for #{role}.#{transcript}"
+      if version.match?(/\A\d+\.\d+\.\d+\z/)
+        assert docker_state["images"].key?("#{registry}/farmy-#{role}:latest"), "Expected a latest release tag for #{role}.#{transcript}"
+      else
+        refute docker_state["images"].key?("#{registry}/farmy-#{role}:latest"), "Expected #{version}, a pre-release, never to move latest: " \
+                                                                                  "#{registry}/farmy-#{role}:latest was tagged.#{transcript}"
+        assert docker_state["images"].key?("#{registry}/farmy-#{role}:next"), "Expected #{version}, a pre-release, to be tagged next " \
+                                                                                "(#{registry}/farmy-#{role}:next), so that farmy update finds the newest pre-release.#{transcript}"
+      end
       labels = docker_state["images"].fetch(tag)["labels"]
       assert_equal version, labels["farmy.version"], "Expected release version label on #{tag}.#{transcript}"
       assert_match(/\A[0-9a-f]{8,}\z/, labels["farmy.hash"].to_s, "Expected release hash label on #{tag}.#{transcript}")
+    end
+  end
+
+  # ── which build (record 2026-10-29-1800) ──
+  #   assert_reports_build SHIPPED           stdout is `farmy <version> (<commit>)`: that version and the short commit (7
+  #                                          or more hex digits) of the checkout the program was built from
+  #   assert_reports_version "0.4.0"         stdout begins `farmy 0.4.0 (`: that version exactly, not one that starts so
+  #   assert_control_image_commit            the control image the shim built carries farmy.commit, the checkout's commit
+
+  # Updating from a pre-release (record 2026-10-29-1931) can only be seen in a pre-release build. At a stable release
+  # (SHIPPED stable) those tests skip; they run again once VERSION is the next release's pre-release.
+  def skip_unless_shipping_a_pre_release
+    skip "needs a pre-release build: this checkout ships #{SHIPPED}, a stable release" unless SHIPPED.include?("-")
+  end
+
+  def this_checkout_commit
+    out, status = Open3.capture2e("git", "-C", Target.root, "rev-parse", "HEAD")
+    raise "git rev-parse HEAD in #{Target.root} failed while preparing the test:\n#{out}" unless status.success?
+    out.strip
+  end
+
+  def assert_reports_build(version)
+    line = stdout.lines.first.to_s.chomp
+    commit = line[/\Afarmy #{Regexp.escape(version)} \(([0-9a-f]{7,40})\)\z/, 1]
+    assert commit && this_checkout_commit.start_with?(commit),
+           "Expected `farmy #{version} (<commit>)`: the version and the short commit (7 or more hex digits) of the checkout it was " \
+           "built from, which is #{this_checkout_commit[0, 7]} (#{this_checkout_commit}). It printed #{line.inspect}.#{transcript}"
+  end
+
+  def assert_reports_version(version)
+    line = stdout.lines.first.to_s.chomp
+    assert line.start_with?("farmy #{version} ("), "Expected `farmy #{version} (…)`: that version exactly. It printed #{line.inspect}.#{transcript}"
+  end
+
+  def assert_control_image_commit
+    built = docker_state["images"].select { |name, data| (name.include?("farmy-control") || name == "farmy:local") && data["context"] }
+    refute_empty built, "Expected the shim to build the control image from the checkout.#{transcript}"
+    built.each do |name, data|
+      commit = data.dig("labels", "farmy.commit").to_s
+      assert commit.match?(/\A[0-9a-f]{7,40}\z/) && this_checkout_commit.start_with?(commit),
+             "Expected the control image #{name} to carry the commit it was built from as farmy.commit, the checkout's " \
+             "#{this_checkout_commit[0, 7]} (#{this_checkout_commit}) or longer; its labels: #{data["labels"].inspect}.#{transcript}"
     end
   end
 

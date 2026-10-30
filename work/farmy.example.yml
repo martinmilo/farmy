@@ -1,4 +1,4 @@
-# farmy.yml — copy this file into the containers folder as farmy.yml, then change what differs. Every key
+# farmy.yml — copy this file over the folder's farmy.yml (~/.config/farmy), then change what differs. Every key
 # is optional. No value in here is a secret: routes name secrets, and farmy obtains them when it starts.
 #
 # As it is, it fits the plainest setup: private repositories on GitHub over https with a token, Claude Code,

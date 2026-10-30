@@ -87,8 +87,8 @@ end
     assert_stderr "Docker"
   end
 
-  test "starting without .env is refused and init is pointed at" do
-    delete_file ".env"
+  test "starting without .env and with no Git identity anywhere is refused, init is pointed at, and no .env is written" do
+    delete_file ".env" # and the suite gives farmy no global git configuration and no GIT_USER_NAME
 
     farmy "start", "shop"
 
@@ -96,6 +96,18 @@ end
     assert_stderr ".env"
     assert_stderr "farmy init"
     refute_container "shop"
+    refute_file ".env"
+  end
+
+  test "starting without .env takes the Git identity from the environment, writes .env with it, and starts" do
+    delete_file ".env"
+
+    farmy "start", "shop", env: { "GIT_USER_NAME" => "Dana Brooks", "GIT_USER_EMAIL" => "dana@example.com" }
+
+    assert_success
+    assert_running "shop"
+    assert_file ".env", includes: "GIT_USER_NAME=Dana Brooks"
+    assert_file ".env", includes: "GIT_USER_EMAIL=dana@example.com"
   end
 
   test "starting with an .env that lacks the Git identity is refused by key" do

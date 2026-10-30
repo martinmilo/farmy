@@ -8,22 +8,22 @@ class IntegrationTest < AcceptanceTest
 
   test "a real restricted container curls an allowed registry and is denied example.com with a container log" do
     egress_apps
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
-    script "farmy", "run", "shop", "curl", "--fail", "--max-time", "20", "https://registry.npmjs.org/"
+    real_shim "run", "shop", "curl", "--fail", "--max-time", "20", "https://registry.npmjs.org/"
     assert_success
-    script "farmy", "run", "shop", "curl", "--fail", "--max-time", "10", "https://example.com/"
+    real_shim "run", "shop", "curl", "--fail", "--max-time", "10", "https://example.com/"
     assert_failure
     assert_stderr(/403|denied/i)
-    script "farmy", "egress", "log", "shop"
+    real_shim "egress", "log", "shop"
     assert_success
     assert_stdout "example.com"
     assert_stdout "shop"
   end
 
   test "farmy init leaves the control container running" do
-    script "farmy", "init"
+    real_shim "init"
 
     assert_success
     assert_includes real_docker("inspect", "-f", "{{.State.Status}}", "farmy"), "running"
@@ -34,7 +34,7 @@ class IntegrationTest < AcceptanceTest
     write_file "farmy.yml", fixture("farmy/keys.yml")
     secrets_provider GIT_TOKEN: "frg_9c1e5d7b2a"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_success
     refute_includes real_docker("inspect", "shop-keys"), "frg_9c1e5d7b2a"
@@ -44,7 +44,7 @@ class IntegrationTest < AcceptanceTest
     write_file "farmy.yml", "agents:\n  claude: {}\n"
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_success
     assert_includes real_docker("exec", "-u", "dev", "shop", "sh", "-lc", "command -v claude && git --version"), "claude"
@@ -54,7 +54,7 @@ class IntegrationTest < AcceptanceTest
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
     write_file "farmy.yml", "agents:\n  mytool:\n    install: ~\n    login: .mytool\n    headless_login: mytool login --device\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_success
     assert_equal "/home/dev/.farmy-shared/mytool/.mytool", real_docker("exec", "shop", "readlink", "-f", "/home/dev/.mytool").strip
@@ -64,7 +64,7 @@ class IntegrationTest < AcceptanceTest
     write_file "farmy.yml", "setup_timeout: 3s\n"
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\ncommands:\n  setup: sleep 60\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_exit 1
     assert_stderr "setup"
@@ -74,7 +74,7 @@ class IntegrationTest < AcceptanceTest
   test "inside the container ~/.claude is on farmy-shared and ~/.claude/projects on the service's own volume" do
     write_file "farmy.yml", "agents:\n  claude: {}\n"
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
     out = real_docker "exec", "-u", "dev", "shop", "sh", "-lc", "readlink -f ~/.claude; readlink -f ~/.claude/projects"
@@ -85,7 +85,7 @@ class IntegrationTest < AcceptanceTest
 
   test "the keys broker of a service without routes stays up, with its socket, as uid 1001" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
     sleep 3
 
@@ -97,7 +97,7 @@ class IntegrationTest < AcceptanceTest
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
     write_file "farmy.yml", fixture("farmy/keys.yml")
     secrets_provider GIT_TOKEN: "ghp_9c1e5d7b2a", ANTHROPIC_API_KEY: "sk-ant-7f3a9c"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
     sleep 3
 
@@ -109,7 +109,7 @@ test "the egress node runs and its proxy port answers from another farmy contain
   write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
   write_file "farmy.yml", "egress:\n  join_timeout: 5s\n"
 
-  script "farmy", "start", "shop"
+  real_shim "start", "shop"
 
   assert_success
   assert_includes real_docker("inspect", "-f", "{{.State.Status}}", "farmy-egress"), "running"
@@ -119,7 +119,7 @@ end
 test "git in the app container reaches SSH hosts through the proxy: core.sshCommand uses nc -X 5" do
   write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
   write_file "farmy.yml", "egress:\n  join_timeout: 5s\n"
-  script "farmy", "start", "shop"
+  real_shim "start", "shop"
   assert_success
 
   assert_includes real_docker("exec", "-u", "dev", "shop", "git", "config", "core.sshCommand"), "nc -X 5 -x farmy-egress:1055"
@@ -128,7 +128,7 @@ end
   test "the egress node stays up while unregistered: no restart within 40 seconds" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
     write_file "farmy.yml", "egress:\n  join_timeout: 5s\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
     sleep 40
 
@@ -138,14 +138,14 @@ end
   test "the control container resolves the egress node by name" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
     write_file "farmy.yml", "egress:\n  join_timeout: 5s\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     refute_empty real_docker("exec", "farmy", "getent", "hosts", "farmy-egress").strip
   end
 
   test "the app image has an ssh client for git" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
     assert_includes real_docker("exec", "-u", "dev", "shop", "sh", "-c", "command -v ssh"), "/ssh"
@@ -154,14 +154,14 @@ end
   test "the egress node runs in kernel mode with a tailscale0 interface" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
     write_file "farmy.yml", "egress:\n  join_timeout: 5s\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_includes real_docker("exec", "farmy-egress", "ip", "link", "show", "tailscale0"), "tailscale0"
   end
 
   test "the entrypoint turns DEV_GIT_SSH_ROUTES into git's insteadOf rule" do
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\nenv:\n  DEV_GIT_SSH_ROUTES: https://git.example.com/=ssh://forgejo@git.example.com:2222/\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
     assert_includes real_docker("exec", "-u", "dev", "shop", "git", "config", "--system", "--get", "url.ssh://forgejo@git.example.com:2222/.insteadof"), "https://git.example.com/"
@@ -170,7 +170,7 @@ end
   test "inside the container ~/.claude.json is a file on farmy-shared and ~/.claude a folder" do
     write_file "farmy.yml", "agents:\n  claude: {}\n"
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
     out = real_docker "exec", "-u", "dev", "shop", "sh", "-c", "test -f \"$(readlink -f ~/.claude.json)\" && echo file; test -d \"$(readlink -f ~/.claude)\" && echo folder"
@@ -179,15 +179,15 @@ end
   end
 
   test "the control image has tzdata: a zone in TZ gives a local date" do
-    script "farmy", "status"
+    real_shim "status"
 
-    refute_equal "UTC", real_docker("exec", "-e", "TZ=Europe/Vienna", "farmy", "date", "+%Z").strip
+    refute_equal "UTC", real_docker("exec", "-e", "TZ=America/Denver", "farmy", "date", "+%Z").strip
   end
 
   test "the toolbox builds on an Alpine image (accepted, best effort)" do
     write_file "services/shop.yml", "repo: none\nimage: alpine:3.21\n"
 
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
 
     assert_success
   end
@@ -195,7 +195,7 @@ end
   test "a request from one service reaches another through ${url:x}" do
     write_file "services/shop.yml", "repo: none\nimage: python:3.12-slim\ncommands:\n  start: python3 -m http.server 3000 --directory /workspace\n"
     write_file "services/notes.yml", "repo: none\nimage: debian:bookworm-slim\nstart_after: [shop]\nenv:\n  HUB_URL: ${url:shop}\n"
-    script "farmy", "start", "notes"
+    real_shim "start", "notes"
     assert_success
     real_docker "exec", "-d", "-u", "dev", "shop", "sh", "-lc", "cd /workspace && python3 -m http.server 3000"
     sleep 2
@@ -206,27 +206,27 @@ end
   end
 
   test "the control image has the infisical CLI" do
-    script "farmy", "status"
+    real_shim "status"
 
     assert_success
     assert_includes real_docker("exec", "farmy", "sh", "-lc", "command -v infisical && infisical --version"), "infisical"
   end
 
   test "the control image has docker buildx" do
-    script "farmy", "status"
+    real_shim "status"
 
     assert_includes real_docker("exec", "farmy", "docker", "buildx", "version"), "buildx"
   end
 
   test "the session starts, detaches and reattaches" do
-    script "farmy", "session", "--background"
+    real_shim "session", "--background"
 
     assert_success
     assert_includes real_docker("exec", "farmy", "tmux", "list-sessions"), "farmy"
   end
 
   test "bare farmy without a terminal prints the usage instead of attaching" do
-    script "farmy"
+    real_shim
 
     assert_success
     assert_stdout(/^\s+start\b/)
@@ -254,7 +254,7 @@ end
   test "with shared_logins: false ~/.claude is on the service's own volume, not farmy-shared" do
     write_file "farmy.yml", "agents:\n  claude: {}\n"
     write_file "services/shop.yml", "repo: none\nimage: debian:bookworm-slim\nshared_logins: false\n"
-    script "farmy", "start", "shop"
+    real_shim "start", "shop"
     assert_success
 
     assert_equal "/home/dev/.farmy-service/logins/claude/.claude", real_docker("exec", "-u", "dev", "shop", "readlink", "-f", "/home/dev/.claude").strip
@@ -263,13 +263,68 @@ end
   test "a factory run on a real Docker: an agent of your own fixes a file, the gate passes, the run branch has the commit" do
     write_file "services/shop.yml", fixture("definitions/factory-workbench.yml") # a workbench whose setup makes a repository with src/app.txt "broken"
     write_file "farmy.yml", fixture("farmy/factory-agent.yml")                  # fixer: headless "sh -c 'echo fixed > src/app.txt'", its token from FIXER_TOKEN
-    script "farmy", "start", "shop", stdin: "FIXER_TOKEN=fx_4e7b1c\n"
+    real_shim "start", "shop", stdin: "FIXER_TOKEN=fx_4e7b1c\n"
     assert_success
 
-    script "farmy", "factory", "start", "shop", "--task", "Fix src/app.txt.", "--wait"
+    real_shim "factory", "start", "shop", "--task", "Fix src/app.txt.", "--wait"
 
     assert_success
     id = run_id
     assert_includes real_docker("run", "--rm", "-v", "shop-run-#{id}:/w", "--entrypoint", "git", "farmy/shop:dev", "-C", "/w", "log", "--format=%s", "-1", "farmy/shop/#{id}"), "farmy: iteration 1"
+  end
+
+  # Record 2026-10-29-1215: on Linux what farmy writes is the user's from the moment it is written, a session included.
+  # As a plain user: the test's own when it is not root, else uid 4242 with the Docker socket's group.
+
+  test "a first bare farmy through the real shim makes the default home the invoking user's while its session is still attached" do
+    on_a_fresh_machine
+
+    real_session_attached do
+      assert_owned_by_the_user "~/.config/farmy", "~/.config/farmy/farmy.yml", "~/.config/farmy/services",
+                               "~/.config/farmy/.gitignore", "~/.local/state/farmy/.work",
+                               "~/.local/state/farmy/.work/config-git-declined"
+    end
+  end
+
+  test "farmy init through the real shim writes .env in the default home as the invoking user's" do
+    on_a_fresh_machine
+    host_git_identity "Dana Brooks", "dana@example.com"
+
+    real_shim_as_the_user "init"
+
+    assert_success
+    assert_owned_by_the_user "~/.config/farmy/.env", "~/.config/farmy/farmy.yml"
+  end
+
+  # Record 2026-10-29-1800: under sudo -E farmy acts for the user who ran sudo; the one-time hand-back covers farmy's own
+  # folders only. These stage root's files, so they need a root runner, as the Mini's is.
+
+  test "sudo -E farmy init on a fresh machine through the real shim makes the default home the user's who ran sudo, not root's" do
+    on_a_fresh_machine
+    host_git_identity "Dana Brooks", "dana@example.com"
+
+    real_shim_under_sudo_e "init"
+
+    assert_success
+    assert_owned_by_the_user "~/.config/farmy", "~/.config/farmy/farmy.yml", "~/.config/farmy/.env", "~/.local/state/farmy"
+  end
+
+  test "a default home left root's by an earlier sudo -E is the user's again once the user's farmy has made the control container" do
+    on_a_fresh_machine
+    default_home_left_root_s
+
+    real_shim_as_the_user "status"
+
+    assert_success
+    assert_owned_by_the_user "~/.config/farmy", "~/.config/farmy/farmy.yml", "~/.local/state/farmy", "~/.local/state/farmy/.work"
+  end
+
+  test "a shared containers folder of root's keeps its owner, and its farmy.yml and .env stay root's, when a plain user's farmy makes the control container for it" do
+    shared = shared_folder_of_root_s
+
+    real_shim_as_the_user "-C", shared, "status"
+
+    assert_includes real_docker("inspect", "-f", "{{.State.Status}}", "farmy"), "running"
+    assert_root_s shared, File.join(shared, "farmy.yml"), File.join(shared, ".env"), File.join(shared, "services")
   end
 end

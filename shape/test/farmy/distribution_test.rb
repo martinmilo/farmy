@@ -5,11 +5,18 @@ class DistributionTest < AcceptanceTest
     assert_equal SHIPPED, work_file("VERSION").strip
   end
 
-  test "farmy --version names the shipped version with a build hash" do
+  test "farmy --version names the shipped version and the commit it was built from" do
     farmy "--version"
 
     assert_success
-    assert_stdout(/\Afarmy #{Regexp.escape(SHIPPED)} \([0-9a-f]{8,}\)\s*\z/)
+    assert_reports_build SHIPPED
+  end
+
+  test "the shim's farmy --version prints the shipped version and the checkout's short commit, as the binary does" do
+    shim "--version"
+
+    assert_success
+    assert_reports_build SHIPPED
   end
 
   test "farmy-built service and gate images carry version and hash labels" do
@@ -26,6 +33,13 @@ class DistributionTest < AcceptanceTest
 
     assert_success
     assert_image_release_labels
+  end
+
+  test "the control image the shim builds from a checkout carries the checkout's commit as farmy.commit" do
+    shim "init"
+
+    assert_success
+    assert_control_image_commit
   end
 
   test "a published control is pulled first and reports the pull without a local build" do
@@ -80,28 +94,28 @@ class DistributionTest < AcceptanceTest
   end
 
   test "a mismatched folder pin refuses the binary before any service starts and names the fix" do
-    write_file "farmy.yml", "farmy: 0.3.0\n"
+    write_file "farmy.yml", "farmy: 0.4.0\n"
 
     farmy "start", "shop"
 
     assert_exit 1
-    assert_stderr "farmy update --to 0.3.0"
+    assert_stderr(/farmy update --to 0\.4\.0\b(?!-)/) # the pin exactly, not a pre-release of it
     refute_container "shop"
   end
 
   test "a quoted folder pin mismatch is refused by the shim before control starts" do
-    write_file "farmy.yml", "farmy: '0.3.0' # the workspace release\n"
+    write_file "farmy.yml", "farmy: '0.4.0' # the workspace release\n"
     published_release
 
     distribution_shim "init"
 
     assert_exit 1
-    assert_stderr "farmy update --to 0.3.0"
+    assert_stderr(/farmy update --to 0\.4\.0\b(?!-)/) # the pin exactly, not a pre-release of it
     refute_container "farmy"
   end
 
   test "version remains available while the folder pin mismatches" do
-    write_file "farmy.yml", "farmy: 0.3.0\n"
+    write_file "farmy.yml", "farmy: 0.4.0\n"
 
     farmy "--version"
 
@@ -136,7 +150,15 @@ class DistributionTest < AcceptanceTest
     assert_toolbox_metadata "0.0.9", outdated: true
   end
 
-  [SHIPPED, "0.3.0"].each do |version|
+  test "a toolbox built by 0.2.0, an earlier release, is marked older than the shipped #{SHIPPED}" do
+    toolbox_built_by "0.2.0"
+
+    farmy "status", "--json"
+
+    assert_toolbox_metadata "0.2.0", outdated: true
+  end
+
+  [SHIPPED, "0.4.0-rc.2", "0.4.0"].each do |version|
     test "a toolbox built by #{version} is not marked older than the shipped #{SHIPPED}" do
       toolbox_built_by version
 
@@ -153,7 +175,7 @@ class DistributionTest < AcceptanceTest
     distribution_shim "status"
 
     assert_stderr SHIPPED
-    assert_stderr "0.3.0"
+    assert_stderr(/\b0\.4\.0\b(?!-)/) # the running control's version
     assert_stderr "farmy update"
   end
 
@@ -168,14 +190,14 @@ class DistributionTest < AcceptanceTest
 
     test "#{file} format 2 refuses before start and names a published version that reads it" do
       formatted_file file, 2
-      published_release "0.3.0", format: 2
+      published_release "0.4.0", format: 2
 
       distribution_farmy "start", "shop"
 
       assert_exit 1
       assert_stderr file
       assert_stderr(/format.*2/i)
-      assert_stderr "0.3.0"
+      assert_stderr(/\b0\.4\.0\b(?!-)/) # the published version that reads it
       refute_container "shop"
     end
 
@@ -203,7 +225,7 @@ class DistributionTest < AcceptanceTest
 
   test "latest metadata that still cannot read the requested format does not invent a capable version" do
     formatted_file "farmy.yml", 7
-    published_release "0.3.0", format: 1
+    published_release "0.4.0", format: 1
 
     distribution_farmy "start", "shop"
 

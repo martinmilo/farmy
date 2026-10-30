@@ -41,12 +41,12 @@ class PublishingDefaultsTest < AcceptanceTest
 
   test "update without a registry override obtains all four roles from the configured GHCR namespace" do
     install_default_distribution
-    default_published_distribution "0.3.0"
+    default_published_distribution "0.4.0"
 
     distribution_shim "update", env: { "FARMY_REGISTRY" => "" }
 
     assert_success
-    assert_default_images_pulled "control", "keys", "knowledge", "gate", version: "0.3.0"
+    assert_default_images_pulled "control", "keys", "knowledge", "gate", version: "0.4.0"
   end
 
   test "the README links the GitHub installer release asset and documents exact SHA256SUMS verification" do

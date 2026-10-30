@@ -3,10 +3,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 fail() { echo "farmy release: $*" >&2; exit 1; }
-valid_version() { printf '%s\n' "$1" | awk -F. 'NR!=1 || NF!=3 {exit 1} {for(i=1;i<=3;i++) if($i!~/^[0-9]+$/ || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; }
+# An exact version: MAJOR.MINOR.PATCH, or a pre-release MAJOR.MINOR.PATCH-rc.N.
+valid_version() { printf '%s\n' "$1" | awk 'NR != 1 || $0 !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$/ { bad = 1 } END { exit bad || NR != 1 }'; }
 [ "$#" -gt 0 ] || fail 'usage: bin/release VERSION [--image ROLE --output ARCHIVE]'
 version=$1; shift
-valid_version "$version" || fail 'VERSION must be exact MAJOR.MINOR.PATCH'
+valid_version "$version" || fail 'VERSION must be exact MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N'
 [ "$version" = "$(cat VERSION)" ] || fail "requested version differs from repository VERSION ($(cat VERSION))"
 role=; archive=
 while [ "$#" -gt 0 ]; do
@@ -29,15 +30,25 @@ else
   fi
 fi
 hash=$(FARMY_HASH_ONLY=1 sh ./farmy) || fail 'cannot fingerprint build inputs'
+# the commit the images are built from: farmy.commit, and what the binary inside prints with its version
+commit=$(git rev-parse HEAD 2>/dev/null | cut -c1-7 || true)
+case "$commit" in *[!0-9a-f]*|'') commit= ;; esac
 for image in ${role:-control keys knowledge gate}; do
   set -- buildx build --platform linux/amd64,linux/arm64 --file release.Dockerfile --target "$image" \
     --build-arg "FARMY_VERSION=$version" --build-arg "FARMY_HASH=$hash" \
     --label "farmy.version=$version" --label "farmy.hash=$hash"
+  [ -z "$commit" ] || set -- "$@" --build-arg "FARMY_COMMIT=$commit" --label "farmy.commit=$commit"
   [ "$image" != control ] || set -- "$@" --label farmy.format=1
   if [ -n "$archive" ]; then set -- "$@" --output "type=oci,dest=$archive"
   else
     registry=${FARMY_REGISTRY%/}
-    set -- "$@" --tag "$registry/farmy-$image:$version" --tag "$registry/farmy-$image:latest" --push
+    set -- "$@" --tag "$registry/farmy-$image:$version"
+    # a pre-release never moves latest: it is tagged next, where farmy update from a pre-release looks
+    case "$version" in
+      *-*) set -- "$@" --tag "$registry/farmy-$image:next" ;;
+      *) set -- "$@" --tag "$registry/farmy-$image:latest" ;;
+    esac
+    set -- "$@" --push
   fi
   docker "$@" . || fail "build/export failed for $image"
 done

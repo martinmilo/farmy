@@ -3,7 +3,7 @@
 #
 #   farmy "start", "shop"                                   run farmy (stdin:, env: as cli)
 #   settings lan_host: "workshop.local"                   write .env (the Git identity by default)
-#   host_git_identity "Ines Hartmann", "ines@hartmann.dev" what the host's Git is configured with
+#   host_git_identity "Dana Brooks", "dana@example.com" what the host's Git is configured with
 #   docker_is_down                                         Docker does not answer
 #   remote_repository "acme/toolkit", "Dockerfile" => "...", on: "main"   files committed on the test's own
 #                                                          git host: a folder of bare repositories
@@ -64,6 +64,7 @@ module Farmy
     plumbing = farmy_env
     saved = plumbing.keys.to_h { |key| [key, ENV[key]] }
     plumbing.each { |key, val| ENV[key] = val }
+    env = { "GIT_CONFIG_GLOBAL" => @host_gitconfig }.merge(env) if @host_gitconfig
     script "farmy", *args, stdin: stdin, env: env
   ensure
     saved&.each { |key, val| ENV[key] = val }
@@ -133,7 +134,7 @@ module Farmy
     assert lines.size == count, "Expected the image #{tag} to have been built #{count} time#{"s" unless count == 1}; it was built #{lines.size} time#{"s" unless lines.size == 1}.\n\n#{docker_situation}#{transcript}"
   end
 
-  def settings(name: "Ines Hartmann", email: "ines@hartmann.dev", lan_host: nil, **more)
+  def settings(name: "Dana Brooks", email: "dana@example.com", lan_host: nil, **more)
     pairs = { "GIT_USER_NAME" => name, "GIT_USER_EMAIL" => email, "LAN_HOST" => lan_host }.merge(more.transform_keys(&:to_s))
     write_file ".env", pairs.compact.map { |key, val| "#{key}=#{val}\n" }.join
     note_situation ".env holds: #{pairs.map { |key, val| "#{key}=#{val.nil? ? "(not set)" : val}" }.join("  ")}"
@@ -529,9 +530,10 @@ module Farmy
   private
 
   def farmy_env
+    # HOME, XDG_* and FARMY_DIR come from machine_env (support/default_home.rb): the test's folder is the containers folder.
     # the control container's holder of unlocking values listens on a socket of the test's own, gone after it
     env = { "PATH" => "#{store_bin}:#{FAKES}:#{ENV.fetch("PATH")}", "FAKE_DOCKER_JOURNAL" => docker_journal, "FARMY_BUILD" => "1",
-            "FARMY_HOLD_SOCKET" => File.join(scratch, "hold", "hold.sock") }.merge(store_env).merge(@fake_env || {})
+            "FARMY_HOLD_SOCKET" => File.join(scratch, "hold", "hold.sock") }.merge(machine_env).merge(store_env).merge(@fake_env || {})
     env["FAKE_DOCKER_DOWN"] = "1" if @docker_down
     env
   end

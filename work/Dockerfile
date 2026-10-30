@@ -15,6 +15,8 @@ COPY providers ./providers
 COPY release.yml ./
 COPY bin/build bin/release bin/render-release bin/install ./bin/
 ARG FARMY_HASH
+# the commit the sources come from, which farmy --version prints (build.rs; the context has no .git)
+ARG FARMY_COMMIT
 RUN case "$FARMY_HASH" in *[!0-9a-fA-F]*|'') FARMY_HASH=$(FARMY_HASH_ONLY=1 sh ./farmy);; esac; FARMY_SOURCE_HASH="$FARMY_HASH" cargo build --release --locked
 RUN bin/render-release /out
 

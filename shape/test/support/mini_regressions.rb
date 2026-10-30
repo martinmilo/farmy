@@ -135,7 +135,7 @@ module MiniRegressions
     entrypoint = toolbox_build("shop")["entrypoint"]
     refute_empty Array(entrypoint), "Expected the emitted toolbox image to identify its executable entrypoint.#{transcript}"
     execute(File.join(Farmy::FAKES, "docker"), ["exec", "-u", "root", "shop", *entrypoint],
-      shown_as: "docker", env: farmy_env)
+      shown_as: "docker", env: farmy_env.compact)
     assert_stdout " ready."
   end
 

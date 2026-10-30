@@ -393,7 +393,7 @@ fn fetch(url: &str) -> R<Vec<u8>> {
     reason = "`farmy toolbox bump` reports each new version to the user"
 )]
 fn bump(cfg: &Config, names: &[String]) -> R {
-    let _lock = crate::locking::Lock::take(Path::new(".work/toolbox.lock"))?;
+    let _lock = crate::locking::Lock::take(&crate::model::WORK.path().join("toolbox.lock"))?;
     let all = catalogue(cfg)?;
     let mut names = names.to_vec();
     if names.is_empty() {
@@ -513,8 +513,8 @@ fn bump(cfg: &Config, names: &[String]) -> R {
         println!("{name}: {}", e.version);
         locked["tools"][&name] = serde_yaml::to_value(e).map_err(|e| e.to_string())?;
     }
-    let tmp = format!(".work/tools.lock.{}.tmp", std::process::id());
-    std::fs::create_dir_all(".work")?;
+    // written beside and renamed: in the folder itself, since the state folder may be another mount
+    let tmp = format!(".tools.lock.{}.tmp", std::process::id());
     std::fs::write(
         &tmp,
         serde_yaml::to_string(&locked).map_err(|e| e.to_string())?,

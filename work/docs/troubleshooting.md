@@ -10,18 +10,99 @@ what to do.
 - **The control image takes long**: the first `farmy` builds `farmy:local` (a Rust build in
   Docker, a few minutes). Afterwards it is instant. After a `git pull` of farmy, `farmy init` or
   `farmy update` builds it again when its inputs changed (the label `farmy.hash`).
-- **`farmy` opens the wrong folder**: the control container is bound to the folder you ran the
-  shim in; running it from another folder makes the container anew for that folder. One containers
-  folder per machine is the intended use.
-- **The session is gone**: `farmy update` or `docker rm farmy` removes the control container and
-  its tmux session with it; the services keep running. `farmy` makes a new session.
+- **`farmy: 0.4.0-rc.1 is newer than the latest release, 0.3.0; use --to 0.3.0 to go back`**: you run a
+  release candidate, and neither the latest release nor a newer candidate (`next`) is published yet.
+  `farmy update` without `--to` never goes back; nothing was changed. Stay on it, or go back on purpose
+  with the `--to` it names.
+- **`farmy` opens the wrong folder**: the control container serves one folder (and its state
+  folder); running farmy for another folder makes the container anew for that one, unless runs are
+  live in it (next item). `farmy config path` says which folder a command uses.
+- **`farmy: the control container serves ~/.config/farmy and has 1 live run; finish or cancel them, or
+  run this command with farmy -C ~/.config/farmy`**: a factory run, a pipeline or the session is live in
+  the control container, which serves another folder than this command's, and replacing it would end
+  them. Either run the command in that folder (`farmy -C ~/.config/farmy status`, or from inside it), or
+  end what is live there: `farmy -C ~/.config/farmy factory list` shows the runs,
+  `farmy -C ~/.config/farmy factory cancel <id>` cancels one, and the session ends with
+  `docker exec [-u <uid>:<gid>] farmy tmux kill-server` (detaching keeps it). The next command for
+  this folder then makes the container anew. Meanwhile the read-only commands for this folder (`status`,
+  `help`, `config path`, `factory list`, `factory show`, `factory log`, `logs`, `egress log`, `tui
+  --version`) still run, each in a container of its own (`docker run --rm` of the control image).
+- **`farmy: the control container is due to be replaced (it runs farmy 0.1.0, and this farmy is
+  0.2.0), but runs are live in it`** (or `its image is out of date`): after an update or a rebuild of
+  the control image the container waits for the runs it names. Wait for them to end, or cancel each
+  with the `farmy factory cancel <id>` it gives, and end the session as it says; `farmy stop` (no
+  name) and `farmy factory cancel <id>` run in the kept container meanwhile. The next command after
+  that replaces it.
+- **`whether runs are live in it cannot be told: docker top farmy failed: …`**: the control container
+  is due to be replaced (another folder, version, image or user), and Docker did not say what runs in it
+  (a daemon that does not answer in time: `context deadline exceeded`). It is kept as if runs were live,
+  and the command is not run. Try again once Docker answers (`docker top farmy` works); from another
+  folder, `farmy -C <the folder it names> <command>` runs there meanwhile, as do this folder's read-only
+  commands in a container of their own, and in a container due for another version `farmy stop` and
+  `farmy factory cancel <id>` run in it.
+- **`the control container farmy could not be read (docker container inspect farmy: …)`** (or `… answered
+  nothing`): Docker did not answer three reads of the control container. farmy keeps it, does not guess
+  who it runs farmy as, and runs nothing. Try again once `docker container inspect farmy` answers; a daemon
+  that does not answer in time (`context deadline exceeded`) usually does after a moment, else restart
+  Docker.
+- **`another farmy is making or reading the control container; waiting for it`**: two farmy commands
+  started at the same moment; the second waits until the first has made or reused the control container
+  (a build of the control image can take minutes), then runs in it. The lock is `control.lock` in
+  `~/.local/state/farmy` (`$XDG_STATE_HOME/farmy`); one left by a farmy that was killed is taken over by
+  the next command, so there is nothing to remove by hand.
+- **`the control container runs farmy as root and has 1 live run`**: it was made by `sudo farmy` (or a
+  root login) for a folder of root's, and it is never used for your commands. Finish or cancel what is
+  live as root (`sudo farmy factory cancel <id>`); the next command then makes it anew for you.
+  Read-only commands run meanwhile in a container of their own.
+- **`Error response from daemon: No such container: farmy`**: an older shim after the control container
+  was removed (`docker rm -f farmy`, or `FARMY_BUILD=1 farmy update`) while the `farmy` network stayed:
+  its plain `docker inspect farmy` found the network. This farmy reads the container as a container and
+  makes it anew.
+- **`it runs farmy as 1000:1000, and you are 1001:1001`**: the control container was made for another
+  user (uid) of this machine; it is made anew for you when nothing is live in it. A shell whose group
+  changed (`newgrp docker`) is the same user and is not refused.
+- **`cannot read the group of the Docker socket …`**: on Linux farmy runs as you in the control
+  container and reaches Docker through the socket's group; `ls -l` the socket the message names, and make
+  it readable for you (`stat -L -c %g <socket>` must answer). Nothing was made.
+- **`handing root's files in … to 1000:1000 failed: …`** (or **`could not make farmy's home …`**): the
+  one-time hand-back when the control container was made could not change everything (it covers farmy's
+  own folders: the default home's two, and `.work` of a project folder of yours); the line says what.
+  farmy goes on, and may fail where a file is still root's: `sudo chown -R "$(id -u):$(id -g)"` on what it
+  names, or `docker rm -f farmy` and the next command tries again.
+- **Files of farmy's on Linux belong to a uid that is not yours**: a Docker daemon that remaps users
+  (`userns-remap`): root and every uid in a container map to subordinate uids there, so farmy cannot write
+  as you; this is not farmy's to fix. Use a daemon without remapping, or a rootless one.
+- **`sudo farmy` wrote files as another user**: run as root, farmy runs as the owner of the folder (of its
+  nearest existing parent while it makes it): the folder owner for `sudo farmy -C <their folder>`, root
+  for root's own folders. In the default home it runs as the user who ran sudo (`SUDO_UID:SUDO_GID`), and
+  makes the default home's folders as that user.
+- **`under sudo the default home is dana's, and neither HOME nor the user database names a home of
+  theirs`**: `sudo` without `-E` gave farmy root's `HOME`, and no home was found for `SUDO_USER`. Use
+  `sudo -E farmy`, run farmy as that user, or name the folder with `-C <dir>`.
+- **Files of farmy's that are root's on Linux** (left by an older farmy whose run was killed):
+  the shim hands them back to you when it makes the control container, in the default home and in
+  `.work` of a project folder of yours; `docker rm -f farmy` and any farmy command make it anew (when
+  nothing is live in it). farmy itself runs as you there, so it writes no root files any more. A
+  root-owned file elsewhere in a project folder (`farmy.yml`, `services/`, `.env`) stays root's, and the
+  command that fails on it names it: `sudo chown "$(id -u):$(id -g)"` it.
+- **The session is gone**: `docker rm farmy`, or the control container made anew (for another folder,
+  another version, a new image: never while the session or a run is live in it), removes it with its
+  tmux session; the services keep running. `farmy` makes a new session.
+- **`the default home needs HOME, which is not set or not an absolute path`**: farmy was started
+  without `HOME` (a service manager does that) and found no other folder. Set `HOME`, or
+  `XDG_CONFIG_HOME` and `XDG_STATE_HOME`, or name the folder with `FARMY_DIR` or `farmy -C <dir>`.
+- **A Mac offers to install the developer tools**: the shim runs git only when `xcode-select -p`
+  succeeds, so this comes from elsewhere; without the tools farmy hands over no Git identity, and a
+  start without `.env` asks you to run `farmy init`.
 
 ## Before anything starts
 
-- **`no .env in this folder — run: farmy init`**, **`GIT_USER_NAME is not set in .env`**: `farmy
-  init` writes `.env` and fills the identity from `git config --global`; set it by hand otherwise.
-- **`unknown service 'x' — known: notes shop`**: there is no `services/x.yml`; `farmy add <url>
-  --image <image>` writes one.
+- **`no .env in ~/.config/farmy and no Git identity to write one with`**, **`GIT_USER_NAME is not set
+  in .env`**: a start writes a missing `.env` itself when it finds your Git identity
+  (`GIT_USER_NAME` / `GIT_USER_EMAIL`, or `git config --global user.name` / `user.email`); `farmy init`
+  writes it and asks for what it does not find; set it by hand otherwise.
+- **`unknown service 'x' in ~/.config/farmy — known: notes shop`**: there is no `services/x.yml` in
+  the folder in use; `farmy add <url> --image <image>` writes one.
 - **`ports.yml is not read any more`**: the host ports went into each definition as
   `ports: ["3100:3000"]`; delete the file.
 - **`services/shop.yml: no repo:`**, **`repo: acme/shop is not a clone URL`**: `repo:` is the full
@@ -133,6 +214,17 @@ what to do.
   secret for that host (`farmy keys`), or `repo:` / `branch:` in the definition.
 - **`build_files: 'Gemfile.lock' is not in acme/toolkit`**: a file the stage COPYs that is not
   in the repository on that branch.
+- **`build_files: 'Gemfile.lock' points outside the repository (a link to ../.env)`**: the file is a link
+  committed in the repository that leads above its root, to an absolute path or to nothing. farmy reads
+  build files from the committed tree only and follows links only inside it; commit the file itself, or a
+  link to a file in the repository. The same holds for `dockerfile:`.
+- **`build_files: '../.env' is not a relative path inside the repository`**: `dockerfile:` and every
+  `build_files` entry name a path inside the repository: no leading `/`, no `..` part, not empty, not
+  starting with `-`. Fix the entry in the service file the message names.
+- **`the git container that read … handed its files over cut short`**: the git container clones the branch
+  into its own filesystem and hands the build files to farmy on its output, which farmy (as you) writes
+  into `.work/<name>/ctx`; the output ended early (the container was stopped, or Docker failed). Run the
+  command again.
 - **`the toolbox did not build on ruby:3.4-alpine`**: `install.sh` needs apt or apk in the image;
   anything else needs a `toolbox/` of your own. The build's output is above the message.
 - **`farmy toolbox: x has no install line for an apk base`**: the catalogue entry has no apk line

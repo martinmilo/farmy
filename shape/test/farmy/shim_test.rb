@@ -16,9 +16,9 @@ class ShimTest < AcceptanceTest
   end
 
 test "the control container gets the host's TZ, so the session's clock is local" do
-  shim "init", env: { "TZ" => "Europe/Berlin" }
+  shim "init", env: { "TZ" => "America/Chicago" }
 
-  assert_env "farmy", "TZ", "Europe/Berlin"
+  assert_env "farmy", "TZ", "America/Chicago"
 end
 
   test "local development init twice builds the control image once" do

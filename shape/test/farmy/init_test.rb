@@ -2,17 +2,17 @@ class InitTest < AcceptanceTest
   # Each test starts in an empty folder: the containers folder on a machine that is new to farmy.
 
   test "init writes .env with the name and email the host's Git is configured with" do
-    host_git_identity "Ines Hartmann", "ines@hartmann.dev"
+    host_git_identity "Dana Brooks", "dana@example.com"
 
     farmy "init"
 
     assert_success
-    assert_file ".env", includes: "GIT_USER_NAME=Ines Hartmann"
-    assert_file ".env", includes: "GIT_USER_EMAIL=ines@hartmann.dev"
+    assert_file ".env", includes: "GIT_USER_NAME=Dana Brooks"
+    assert_file ".env", includes: "GIT_USER_EMAIL=dana@example.com"
   end
 
   test "init leaves an existing .env as it is" do
-    write_file ".env", "GIT_USER_NAME=Ines Hartmann\nGIT_USER_EMAIL=ines@hartmann.dev\nLAN_HOST=workshop.local\n"
+    write_file ".env", "GIT_USER_NAME=Dana Brooks\nGIT_USER_EMAIL=dana@example.com\nLAN_HOST=workshop.local\n"
 
     farmy "init"
 
@@ -21,7 +21,7 @@ class InitTest < AcceptanceTest
   end
 
   test "init without Docker running stops at Docker and writes nothing" do
-    host_git_identity "Ines Hartmann", "ines@hartmann.dev"
+    host_git_identity "Dana Brooks", "dana@example.com"
     docker_is_down
 
     farmy "init"
@@ -32,7 +32,7 @@ class InitTest < AcceptanceTest
   end
 
   test "init in a folder without services says so and names the README section" do
-    host_git_identity "Ines Hartmann", "ines@hartmann.dev"
+    host_git_identity "Dana Brooks", "dana@example.com"
 
     farmy "init"
 
@@ -42,7 +42,7 @@ class InitTest < AcceptanceTest
   end
 
   test "init without a git route says that only public repositories will clone" do
-    host_git_identity "Ines Hartmann", "ines@hartmann.dev"
+    host_git_identity "Dana Brooks", "dana@example.com"
 
     farmy "init"
 
@@ -52,19 +52,31 @@ class InitTest < AcceptanceTest
   test "init takes the identity from GIT_USER_NAME and GIT_USER_EMAIL in its environment when the host has no git configuration" do
     host_git_identity "", "" # the control container never sees the host's git config; the shim passes it in the environment
 
-    farmy "init", env: { "GIT_USER_NAME" => "Ines Hartmann", "GIT_USER_EMAIL" => "ines@hartmann.dev" }
+    farmy "init", env: { "GIT_USER_NAME" => "Dana Brooks", "GIT_USER_EMAIL" => "dana@example.com" }
 
     assert_success
-    assert_file ".env", includes: "GIT_USER_NAME=Ines Hartmann"
-    assert_file ".env", includes: "GIT_USER_EMAIL=ines@hartmann.dev"
+    assert_file ".env", includes: "GIT_USER_NAME=Dana Brooks"
+    assert_file ".env", includes: "GIT_USER_EMAIL=dana@example.com"
   end
 
-  test "init without a terminal turns no agent on, writes no farmy.yml, and says how to turn one on" do
+  test "init without a terminal turns no agent on: the farmy.yml it writes turns none on, and it says how to turn one on" do
+    farmy "init"
+    assert_success
+    assert_file "farmy.yml"
+    assert_stdout "agents:"
+
+    farmy "add", "https://github.com/acme/billing.git", "--image", "ruby:3.4-slim"
+
+    assert_stdout "agents: none"
+  end
+
+  test "init leaves an existing farmy.yml as it is" do
+    host_git_identity "Dana Brooks", "dana@example.com"
+    write_file "farmy.yml", "egress:\n  restrict: audit\n"
+
     farmy "init"
 
     assert_success
-    refute_file "farmy.yml"
-    assert_stdout "agents:"
-    assert_stdout "farmy.yml"
+    assert_unchanged "farmy.yml"
   end
 end

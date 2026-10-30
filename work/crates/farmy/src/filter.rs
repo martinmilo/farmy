@@ -260,7 +260,10 @@ fn allow(args: &[String]) -> R {
     if let Some(name) = service
         && !Path::new(&model::definition_path(name)).is_file()
     {
-        return refuse(format!("unknown service {name}"));
+        return refuse(format!(
+            "unknown service {name} in {}",
+            crate::folder::looked_in()
+        ));
     }
     let text = std::fs::read_to_string("farmy.yml").unwrap_or_default();
     let mut root: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
@@ -303,8 +306,8 @@ fn allow(args: &[String]) -> R {
     }) {
         list.push(serde_yaml::Value::String(value.clone()));
     }
-    std::fs::create_dir_all(WORK)?;
-    let temp = PathBuf::from(WORK).join(format!("egress-policy-{}.yml", std::process::id()));
+    // written beside and renamed: in the folder itself, since the state folder may be another mount
+    let temp = PathBuf::from(format!(".farmy.yml.{}.tmp", std::process::id()));
     std::fs::write(
         &temp,
         serde_yaml::to_string(&root).map_err(|e| e.to_string())?,

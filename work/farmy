@@ -2,17 +2,21 @@
 # farmy — runs farmy in its control container. The host needs Docker and nothing else.
 #
 #   farmy                 attach to the persistent session (the TUI); without a terminal: the usage
-#   farmy <command> …     any farmy command, in the containers folder you are in
+#   farmy <command> …     any farmy command, in the folder in use: ~/.config/farmy, or the nearest folder
+#                         up from here that holds a farmy.yml, or FARMY_DIR
+#   farmy -C <dir> …      the same in that folder
 #   farmy update          install the folder's pinned release, otherwise the newest published release
 #
-# The control container holds the Docker socket and this folder (at the same path, so the paths in the
-# compose files hold for the daemon). The values farmy asks the host for (farmy unlock-names: those under
+# The control container holds the Docker socket, the folder in use and its state folder (each at the
+# same path, so the paths in the compose files hold for the daemon). The values farmy asks the host for
+# (farmy unlock-names: those under
 # farmy.yml's secrets.unlock, and without a provider every route's secret) come from one source on the
 # host, never from a file: the command in
 # FARMY_UNLOCK_COMMAND, the macOS Keychain or the Linux secret service (under <FARMY_SECRET_PREFIX><NAME>,
 # default farmy/<NAME>), else a hidden prompt; they are piped to farmy, never on a command line.
 set -eu
 FARMY_SHIM_VERSION='@VERSION@'
+FARMY_SHIM_COMMIT=''
 FARMY_DEFAULT_REGISTRY=''
 FARMY_DEFAULT_SOURCE=''
 FARMY_DEFAULT_GITHUB=''
@@ -33,8 +37,10 @@ if [ -f "$HERE/release.yml" ]; then
   [ -n "$FARMY_DEFAULT_REGISTRY" ] || FARMY_DEFAULT_REGISTRY="ghcr.io/$(release_scalar owner "$HERE/release.yml")/farmy"
   [ -n "$FARMY_DEFAULT_GITHUB" ] || FARMY_DEFAULT_GITHUB=$(release_scalar github_url "$HERE/release.yml")
 fi
+FROM_CHECKOUT=
 # A checkout reads VERSION; release artifacts embed it and need no neighboring files.
 if [ "$FARMY_SHIM_VERSION" = '@VERSION@' ]; then
+  FROM_CHECKOUT=1
   [ -f "$HERE/VERSION" ] || { echo 'farmy: missing embedded version or VERSION file' >&2; exit 1; }
   FARMY_SHIM_VERSION=$(cat "$HERE/VERSION")
 fi
@@ -46,8 +52,51 @@ FARMY_SOURCE=${FARMY_SOURCE:-$FARMY_DEFAULT_SOURCE}
 FARMY_BUILD=${FARMY_BUILD-}
 export FARMY_REGISTRY FARMY_SOURCE FARMY_BUILD DOCKER_CLI_HINTS=false
 fail() { echo "farmy: $*" >&2; exit 1; }
-valid_version() { printf '%s\n' "$1" | awk -F. 'NR!=1 || NF!=3 {exit 1} {for(i=1;i<=3;i++) if($i!~/^[0-9]+$/ || (length($i)>1 && substr($i,1,1)=="0")) exit 1}'; }
-version_older() { awk -v a="$1" -v b="$2" 'BEGIN {split(a,x,".");split(b,y,".");for(i=1;i<=3;i++){if(length(x[i])!=length(y[i]))exit !(length(x[i])<length(y[i]));if(x[i]!=y[i])exit !(x[i]+0<y[i]+0)}exit 1}'; }
+# An exact version (record 2026-10-29-1800): MAJOR.MINOR.PATCH, or a pre-release MAJOR.MINOR.PATCH-rc.N.
+valid_version() { printf '%s\n' "$1" | awk 'NR != 1 || $0 !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$/ { bad = 1 } END { exit bad || NR != 1 }'; }
+# Whether $1 comes before $2 as SemVer orders them: 0.2.0 < 0.3.0-rc.1 < 0.3.0-rc.2 < 0.3.0.
+version_older() { awk -v a="$1" -v b="$2" '
+  function cmp(x, y) { if (length(x) != length(y)) return length(x) < length(y) ? -1 : 1; return x == y ? 0 : (x < y ? -1 : 1) }
+  BEGIN {
+    pa = index(a, "-rc."); pb = index(b, "-rc.")
+    split(pa ? substr(a, 1, pa - 1) : a, x, "."); split(pb ? substr(b, 1, pb - 1) : b, y, ".")
+    for (i = 1; i <= 3; i++) { c = cmp(x[i] "", y[i] ""); if (c) exit c > 0 }
+    if (!pa) exit 1
+    if (!pb) exit 0
+    exit cmp(substr(a, pa + 4) "", substr(b, pb + 4) "") >= 0
+  }'; }
+# The commit this farmy came from (record 2026-10-29-1800): installed, the one of the control image it came
+# from (FARMY_SHIM_COMMIT, written by update and the installer); in a checkout, its HEAD, read from .git
+# (git need not be installed); `commit unknown` when neither says. Seven hex digits, as the binary prints it.
+checkout_commit() {
+  d=$HERE
+  while :; do
+    if [ -d "$d/.git" ]; then g=$d/.git; break; fi
+    if [ -f "$d/.git" ]; then
+      g=$(sed -n 's/^gitdir: //p' "$d/.git"); case $g in /*) ;; *) g=$d/$g ;; esac; break
+    fi
+    [ "$d" != / ] || return 1
+    d=$(dirname "$d")
+  done
+  common=$g
+  if [ -f "$g/commondir" ]; then common=$(cat "$g/commondir"); case $common in /*) ;; *) common=$g/$common ;; esac; fi
+  head=$(cat "$g/HEAD" 2>/dev/null) || return 1
+  case $head in
+    'ref: '*)
+      ref=${head#ref: }
+      if [ -f "$g/$ref" ]; then head=$(cat "$g/$ref")
+      elif [ -f "$common/$ref" ]; then head=$(cat "$common/$ref")
+      else head=$(awk -v r="$ref" '$2 == r { print $1; exit }' "$common/packed-refs" 2>/dev/null || true); fi ;;
+  esac
+  case $head in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#head}" -ge 40 ] || return 1
+  printf '%s\n' "$head" | cut -c1-7
+}
+shim_commit() {
+  if [ -n "$FARMY_SHIM_COMMIT" ]; then printf '%s\n' "$FARMY_SHIM_COMMIT"
+  elif [ -n "$FROM_CHECKOUT" ] && checkout_commit; then :
+  else echo 'commit unknown'; fi
+}
 quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 # One fingerprint for local control builds, release exports and the embedded binary identity.
 # Only declared build inputs are visited; generated binaries and user workspaces are excluded.
@@ -102,7 +151,139 @@ inputs_hash() (
 )
 if [ "${FARMY_HASH_ONLY:-}" = 1 ]; then inputs_hash || fail 'cannot fingerprint control build inputs'; exit 0; fi
 valid_version "$FARMY_SHIM_VERSION" || fail 'invalid installed version; reinstall farmy'
-case "${1:-}" in --version|-V|version) printf 'farmy %s\n' "$FARMY_SHIM_VERSION"; exit 0 ;; esac
+# -C <dir> before the command: the folder to use. The shim consumes it; farmy gets the folder as FARMY_DIR.
+HAVE_C=; DASH_C=
+if [ "${1:-}" = -C ]; then
+  [ "$#" -ge 2 ] || { echo 'farmy: -C needs a folder — farmy -C <dir> <command>' >&2; exit 2; }
+  HAVE_C=1; DASH_C=${2:-.}; shift 2
+fi
+case "${1:-}" in --version|-V|version) printf 'farmy %s (%s)\n' "$FARMY_SHIM_VERSION" "$(shim_commit)"; exit 0 ;; esac
+
+# The folder in use, resolved here on the host (the control container sees neither this folder's parents
+# nor this HOME), first match: -C, FARMY_DIR, the nearest folder from here up that holds a farmy.yml, the
+# default home: $XDG_CONFIG_HOME/farmy (else ~/.config/farmy), its state in $XDG_STATE_HOME/farmy (else
+# ~/.local/state/farmy). The same paths on macOS: nothing goes under ~/Library. Every path is tidied (no
+# trailing /, no //), so that the mounts match what Docker reports. The shim's own environment stays as the
+# user had it: what farmy inside needs goes on its docker exec only.
+tidy() { printf '%s\n' "$1" | sed -e 's://*:/:g' -e 's:\(.\)/$:\1:'; }
+owner_of() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null; }
+USER_HOME=
+case "${HOME:-}" in /*) USER_HOME=$(tidy "$HOME") ;; esac
+XDG_CONFIG=${XDG_CONFIG_HOME:-}; XDG_STATE=${XDG_STATE_HOME:-}
+# Under sudo (record 2026-10-29-1800) the default home is never root's: a root caller whose SUDO_UID names
+# another user acts for that user in it (SUDO_FOR: <uid>:<gid>). Its home is HOME, with XDG_*, when HOME is
+# that user's (sudo -E, a Mac's sudo), else that user's home in the user database, without root's XDG_*; when
+# neither, the default home is refused naming SUDO_USER. What the shim makes in that user's home (the default
+# home's folders, missing parents included, and the lock) it makes as that user (MAKE_AS). A root login (no
+# SUDO_UID) keeps root's own home.
+SUDO_FOR=; MAKE_AS=
+user_db_home() {
+  for who in "${SUDO_USER:-}" "$SUDO_UID"; do
+    [ -n "$who" ] || continue
+    h=$(getent passwd "$who" 2>/dev/null | cut -d: -f6 || true)
+    [ -n "$h" ] || h=$(dscl . -read "/Users/$who" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p' || true)
+    case "$h" in /*) tidy "$h"; return 0 ;; esac
+  done
+  return 1
+}
+if [ "$(id -u)" = 0 ]; then
+  case "${SUDO_UID:-}" in ''|0|*[!0-9]*) ;; *)
+    case "${SUDO_GID:-}" in ''|*[!0-9]*) ;; *)
+      SUDO_FOR=$SUDO_UID:$SUDO_GID; MAKE_AS=$SUDO_FOR
+      if [ -z "$USER_HOME" ] || [ "$(owner_of "$USER_HOME" || true)" != "$SUDO_UID" ]; then
+        USER_HOME=$(user_db_home || true); XDG_CONFIG=; XDG_STATE=
+      fi ;;
+    esac ;;
+  esac
+fi
+# make_folders <folder>…: each made with its missing parents, every one made handed to MAKE_AS
+make_folders() {
+  for d in "$@"; do
+    made=; p=$d
+    while [ ! -e "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do made="$p
+$made"; p=$(dirname "$p"); done
+    mkdir -p "$d" || return 1
+    if [ -n "$MAKE_AS" ] && [ -n "$made" ]; then
+      old_ifs=$IFS; IFS='
+'; set -f
+      for m in $made; do chown "$MAKE_AS" "$m" || { IFS=$old_ifs; set +f; return 1; }; done
+      IFS=$old_ifs; set +f
+    fi
+  done
+}
+shown() { # a path as messages write it: ~/… under the home
+  case "$1" in
+    "$USER_HOME") [ -n "$USER_HOME" ] && printf '~\n' || printf '%s\n' "$1" ;;
+    "$USER_HOME"/*) [ -n "$USER_HOME" ] && [ "$USER_HOME" != / ] && printf '~/%s\n' "${1#"$USER_HOME"/}" || printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+xdg_dir() { # an absolute XDG value, else the fallback under HOME; nothing without either
+  case "$1" in
+    /*) tidy "$1" ;;
+    *) [ -z "$USER_HOME" ] || tidy "$USER_HOME/$2" ;;
+  esac
+}
+from_here() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac; }
+folder_at() { (CDPATH='' cd "$(from_here "$1")" 2>/dev/null && tidy "$(pwd)"); }
+physical() { (CDPATH='' cd "$1" 2>/dev/null && pwd -P); }
+CONFIG_HOME=$(xdg_dir "$XDG_CONFIG" .config)
+STATE_HOME=$(xdg_dir "$XDG_STATE" .local/state)
+HOME_CONFIG=${CONFIG_HOME:+$CONFIG_HOME/farmy}
+HOME_STATE=${STATE_HOME:+$STATE_HOME/farmy}
+no_home() {
+  [ -z "$SUDO_FOR" ] || fail "under sudo the default home is ${SUDO_USER:-the user $SUDO_UID}'s, and neither HOME nor the user database names a home of theirs — use sudo -E, run farmy as ${SUDO_USER:-that user}, or name the folder with FARMY_DIR or -C <dir>; nothing was created"
+  fail 'the default home needs HOME, which is not set or not an absolute path — set HOME (or XDG_CONFIG_HOME and XDG_STATE_HOME), or name the folder with FARMY_DIR or -C <dir>; nothing was created'
+}
+# help needs no folder: a -C or FARMY_DIR naming none does not stop it
+LENIENT=
+case "${1:-}" in help|-h|--help) LENIENT=1 ;; '') [ -t 0 ] && [ -t 1 ] || LENIENT=1 ;; esac
+FOLDER=
+if [ -n "$HAVE_C" ]; then
+  if ! FOLDER=$(folder_at "$DASH_C"); then
+    FOLDER=
+    [ -n "$LENIENT" ] || { echo "farmy: -C $(shown "$(from_here "$DASH_C")"): no such folder — -C names a folder that exists; nothing was created" >&2; exit 2; }
+  fi
+elif [ -n "${FARMY_DIR:-}" ]; then
+  if ! FOLDER=$(folder_at "$FARMY_DIR"); then
+    FOLDER=
+    [ -n "$LENIENT" ] || fail "FARMY_DIR names $(shown "$(from_here "$FARMY_DIR")"), which is no folder — make it, or unset FARMY_DIR to use $(if [ -n "$HOME_CONFIG" ]; then shown "$HOME_CONFIG"; else echo the default home; fi); nothing was created"
+  fi
+else
+  dir=$(tidy "$PWD")
+  while [ -n "$dir" ]; do
+    if [ -f "$dir/farmy.yml" ]; then FOLDER=$dir; break; fi
+    [ "$dir" != / ] || break
+    dir=$(dirname "$dir")
+  done
+fi
+# the default home's config folder is the default home however it is reached
+IS_HOME=
+if [ -z "$FOLDER" ] || { [ -n "$HOME_CONFIG" ] && [ "$FOLDER" = "$HOME_CONFIG" ]; }; then IS_HOME=1
+elif [ -n "$HOME_CONFIG" ] && [ -d "$HOME_CONFIG" ] && [ "$(physical "$FOLDER")" = "$(physical "$HOME_CONFIG")" ]; then IS_HOME=1
+fi
+if [ -n "$IS_HOME" ]; then
+  # refused before anything is made or Docker is asked when one of its paths needs a HOME there is not
+  [ -n "$HOME_CONFIG" ] && [ -n "$HOME_STATE" ] || no_home
+  FOLDER=$HOME_CONFIG; STATE=$HOME_STATE
+  # a current folder that looks like a containers folder from before the default home: said, never written
+  if [ -z "$LENIENT" ] && [ ! -f farmy.yml ] && [ "$(pwd -P)" != "$(physical "$FOLDER")" ]; then
+    old=
+    for definition in services/*.yml; do
+      if [ -f "$definition" ]; then old=1; break; fi
+    done
+    if [ -z "$old" ] && [ -f .env ] && grep -q 'GIT_USER_NAME' .env 2>/dev/null; then old=1; fi
+    if [ -n "$old" ]; then
+      echo "farmy: using $(shown "$FOLDER"); this folder has no farmy.yml — to keep using it: touch farmy.yml (or farmy -C .)" >&2
+    fi
+  fi
+  # made here, as this user (under sudo: as the user farmy acts for), before Docker would make a missing
+  # bind source as root
+  make_folders "$FOLDER" "$STATE" || fail "cannot make $(shown "$FOLDER") and $(shown "$STATE")"
+else
+  STATE=$FOLDER
+fi
+cd "$FOLDER" || fail "cannot enter $(shown "$FOLDER")"
 
 # Read only ordinary top-level compatibility scalars. No evaluation and no host YAML dependency.
 scalar() {
@@ -131,8 +312,194 @@ if [ "${1:-}" != update ] && [ -n "$pin" ] && [ "$pin" != "$FARMY_SHIM_VERSION" 
   fail "farmy.yml pins $pin, but this shim is $FARMY_SHIM_VERSION: farmy update --to $pin"
 fi
 command -v docker >/dev/null 2>&1 || fail 'docker is not installed — it is the one thing farmy needs on this machine'
-docker info >/dev/null 2>&1 || fail "Docker isn't running — start it (OrbStack, Docker Desktop or colima), then try again"
+INFO=$(docker info 2>/dev/null) || fail "Docker isn't running — start it (OrbStack, Docker Desktop or colima), then try again"
+# What the docker client says on stderr is never its answer (record 2026-10-29-1800): a client prints warnings
+# there at every call (`WARNING: Error loading config file: …`) before an answer as good as without them.
+# docker_read <docker arguments…>: OUT its stdout, RC its exit code, ERR the first line it said on stderr that
+# is no warning (empty when there is none), ERR_ALL every such line.
+docker_read() {
+  errors=$(mktemp "${TMPDIR:-/tmp}/farmy-docker.XXXXXX" 2>/dev/null) || errors=
+  if OUT=$(docker "$@" 2>"${errors:-/dev/null}"); then RC=0; else RC=$?; fi
+  ERR=; ERR_ALL=
+  if [ -n "$errors" ]; then
+    ERR_ALL=$(grep -v -e "^WARNING" -e "^\$" "$errors" || true); rm -f "$errors"
+    ERR=$(printf "%s\n" "$ERR_ALL" | head -n 1)
+  fi
+}
+# Users as messages name them: <uid>:<gid>, and root for root (farmy run as root has no -u: an empty name).
+who() { case "$1" in ''|0|0:*) echo root ;; *) echo "$1" ;; esac; }
+uid_of() { case "$1" in '') echo 0 ;; *) echo "${1%%:*}" ;; esac; }
+
+# The control container, read as a container (record 2026-10-29-1530: `docker inspect farmy` with no --type
+# answers with whatever is named farmy, the farmy network once the container is removed by hand), in one
+# read that names every field, the last line a mark that it answered in full (record 2026-10-29-1800). A
+# read that fails or answers nothing is no reason to replace the container: the shim reads again, twice,
+# and then refuses the command, keeping the container (CTRL=unreadable, CTRL_ERROR the daemon's words).
+# CTRL=gone when Docker says there is no such container; CTRL=read with C_RUNNING (true or false), C_IMAGE
+# (its image's ID), C_IMAGE_NAME, its labels C_FOLDER, C_STATE, C_USER (who farmy runs as there) and
+# C_VERSION, C_NETWORKS, and C_BINDS (the folders it binds, one per line, for one an older farmy made).
+CTRL_FIELDS='{{.State.Running}}
+{{.Image}}
+{{.Config.Image}}
+{{index .Config.Labels "farmy.folder"}}
+{{index .Config.Labels "farmy.state"}}
+{{index .Config.Labels "farmy.user"}}
+{{index .Config.Labels "farmy.version"}}
+{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}
+farmy-binds
+{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}
+{{end}}{{end}}farmy-read'
+CTRL=; CTRL_ERROR=; C_RUNNING=; C_IMAGE=; C_IMAGE_NAME=; C_FOLDER=; C_STATE=; C_USER=; C_VERSION=; C_NETWORKS=; C_BINDS=
+read_control() {
+  tries=0
+  while :; do
+    tries=$((tries + 1))
+    docker_read container inspect -f "$CTRL_FIELDS" "$NAME"
+    if [ "$RC" = 0 ]; then
+      first=$(printf '%s\n' "$OUT" | sed -n 1p)
+      if [ "$(printf '%s\n' "$OUT" | sed -n '$p')" = farmy-read ] && [ "$(printf '%s\n' "$OUT" | sed -n 9p)" = farmy-binds ] &&
+        { [ "$first" = true ] || [ "$first" = false ]; }; then
+        CTRL=read; break
+      fi
+      CTRL_ERROR=
+    else
+      case "$ERR" in *'No such container'*|*'No such object'*) CTRL=gone; return 0 ;; esac
+      CTRL_ERROR=${ERR:-docker container inspect $NAME failed (exit $RC)}
+    fi
+    if [ "$tries" -ge 3 ]; then CTRL=unreadable; return 0; fi
+    sleep 1
+  done
+  field() { v=$(printf '%s\n' "$OUT" | sed -n "$1p"); [ "$v" = '<no value>' ] || printf '%s\n' "$v"; }
+  C_RUNNING=$(field 1); C_IMAGE=$(field 2); C_IMAGE_NAME=$(field 3)
+  C_FOLDER=$(field 4); C_STATE=$(field 5); C_USER=$(field 6); C_VERSION=$(field 7); C_NETWORKS=$(field 8)
+  C_BINDS=$(printf '%s\n' "$OUT" | sed -e '1,9d' -e '$d' | grep -v -e '^/var/run/docker.sock$' -e '^$' || true)
+}
+refuse_unreadable() {
+  release_lock
+  if [ -n "$CTRL_ERROR" ]; then
+    fail "the control container $NAME could not be read (docker container inspect $NAME: $CTRL_ERROR); it is kept, and this command is not run — try again once Docker answers"
+  fi
+  fail "the control container $NAME could not be read (docker container inspect $NAME answered nothing); it is kept, and this command is not run — try again once Docker answers"
+}
+
+# One maker at a time (record 2026-10-29-1800): a lock file in the state home, taken around reading the
+# control container and making or reusing it, released before the command runs. A second shim that finds
+# it taken waits (saying so once), then reads the container the first made and reuses it. A lock whose
+# holder is gone (a shim killed while it made the container) holds no one up. It is made as the user the
+# shim acts for (MAKE_AS under sudo); without a state home there is no lock.
+LOCK=
+alive() { kill -0 "$1" 2>/dev/null || [ -d "/proc/$1" ] || ps -p "$1" >/dev/null 2>&1; }
+take_lock() {
+  [ -n "$HOME_STATE" ] || return 0
+  make_folders "$HOME_STATE" 2>/dev/null || return 0
+  lock=$HOME_STATE/control.lock; waiting=; empty=0; tries=0
+  while ! ( set -C; printf "%s\n" "$$" > "$lock" ) 2>/dev/null; do
+    if [ ! -f "$lock" ]; then
+      # gone meanwhile: again; one that cannot be made at all (the state home not writable): no lock
+      tries=$((tries + 1)); [ "$tries" -le 3 ] || return 0
+      continue
+    fi
+    holder=$(cat "$lock" 2>/dev/null || true)
+    case "$holder" in
+      "") # being written, or its writer gone before it wrote: ten seconds
+        empty=$((empty + 1))
+        if [ "$empty" -gt 10 ]; then rm -f "$lock" || return 0; continue; fi ;;
+      *[!0-9]*) rm -f "$lock" || return 0; continue ;;
+      *)
+        empty=0
+        if ! alive "$holder"; then
+          if [ "$(cat "$lock" 2>/dev/null || true)" = "$holder" ]; then rm -f "$lock" || return 0; fi
+          continue
+        fi ;;
+    esac
+    [ -n "$waiting" ] || { echo "farmy: another farmy is making or reading the control container; waiting for it" >&2; waiting=1; }
+    sleep 1
+  done
+  LOCK=$lock
+  [ -z "$MAKE_AS" ] || chown "$MAKE_AS" "$lock" 2>/dev/null || true
+  trap release_lock EXIT
+  trap 'release_lock; exit 129' HUP
+  trap 'release_lock; exit 130' INT
+  trap 'release_lock; exit 143' TERM
+}
+release_lock() {
+  [ -n "$LOCK" ] || return 0
+  [ "$(cat "$LOCK" 2>/dev/null || true)" != "$$" ] || rm -f "$LOCK"
+  LOCK=
+  trap - EXIT HUP INT TERM
+}
+
+# Live runs in the control container (records 2026-10-26-2126 and 2026-10-29-1530), learnt from `docker top`
+# alone: RUNS, one line per live run (`run <id>`: a factory run's controller; `pipeline <id>`: a pipeline's;
+# `wait <n>`: a factory command waiting in the foreground; `session`: the session's tmux server, attached or
+# not), LIVE their count. A process counts by its own words, its command line from the CMD column on: farmy's
+# command (farmy, or a path ending in /farmy) followed by `factory run <id>` or `factory pipeline run <id>`,
+# or by `factory` with --wait among the words after it; the session is a command line starting tmux. A run's
+# task text that reads `factory run …` makes nothing live. A container that is gone or not running has no
+# live runs; when `docker top` fails, whether runs are live cannot be told: TOP_ERROR holds the daemon's words.
+live_runs() {
+  RUNS=; LIVE=0; TOP_ERROR=
+  [ "$CTRL" = read ] && [ "$C_RUNNING" = true ] || return 0
+  docker_read top "$NAME"
+  if [ "$RC" != 0 ]; then
+    case "$ERR" in *'No such container'*|*'is not running'*) return 0 ;; esac
+    TOP_ERROR=${ERR:-docker top failed (exit $RC)}
+    return 0
+  fi
+  RUNS=$(printf '%s\n' "$OUT" | awk '
+    !header && ($1 == "UID" || $1 == "PID" || $1 == "USER") {
+      header = 1; at = NF
+      for (i = 1; i <= NF; i++) if ($i == "CMD" || $i == "COMMAND") at = i
+      next
+    }
+    NF {
+      c = at ? at : 1; command = $c; sub(/.*\//, "", command)
+      if (command == "tmux" || command == "tmux:") { session = 1; next }
+      if (command != "farmy" || $(c + 1) != "factory") next
+      if ($(c + 2) == "run" && $(c + 3) != "") key = "run " $(c + 3)
+      else if ($(c + 2) == "pipeline" && $(c + 3) == "run" && $(c + 4) != "") key = "pipeline " $(c + 4)
+      else {
+        key = ""
+        for (i = c + 2; i <= NF; i++) if ($i == "--wait") key = "wait " NR
+        if (key == "") next
+      }
+      if (!(key in seen)) { seen[key] = 1; print key }
+    }
+    END { if (session) print "session" }')
+  LIVE=$(printf '%s' "$RUNS" | grep -c . || true)
+}
+# A control container due to be replaced (WHY says why) is kept while runs are live in it, or while `docker
+# top` fails: the command is refused, naming each live run (or the daemon's error) and the way out.
+refuse_live() {
+  release_lock
+  as=$C_USER; case "$as" in 0|0:*) as= ;; esac
+  {
+    if [ -n "$TOP_ERROR" ]; then
+      echo "farmy: the control container is due to be replaced ($WHY), but whether runs are live in it cannot be told: docker top farmy failed: $TOP_ERROR"
+      echo "  it is kept, and this command is not run: try again once Docker answers"
+    else
+      echo "farmy: the control container is due to be replaced ($WHY), but runs are live in it: it is kept, and this command is not run"
+    fi
+    printf '%s\n' "$RUNS" | while read -r kind id; do
+      case "$kind" in
+        run) echo "  factory run $id: wait for it to end, or cancel it: farmy factory cancel $id" ;;
+        pipeline) echo "  pipeline $id: wait for it to end, or cancel it: farmy factory pipeline cancel $id" ;;
+        wait) echo "  a factory command waiting in the foreground: let it end, or stop it where it runs" ;;
+        session) echo "  the session: leave it and end it (detaching keeps it): docker exec ${as:+-u $as }$NAME tmux kill-server" ;;
+      esac
+    done
+    echo "  meanwhile farmy stop and farmy factory cancel <id> run in it; once nothing is live in it, the next command replaces it"
+  } >&2
+  exit 1
+}
 pull() { echo "pulling $1" >&2; docker pull "$1" >/dev/null; }
+# the version of the newest pre-release, control :next: nothing when it is missing or cannot be pulled
+next_version() {
+  next_image=${FARMY_REGISTRY%/}/farmy-control:next
+  echo "pulling $next_image" >&2
+  docker pull "$next_image" >/dev/null 2>&1 || return 0
+  docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$next_image" 2>/dev/null || true
+}
 latest_version() {
   [ -n "$FARMY_REGISTRY" ] || fail 'set FARMY_REGISTRY to select published releases'
   latest=${FARMY_REGISTRY%/}/farmy-control:latest
@@ -182,11 +549,14 @@ build_image() {
       echo "farmy: pull failed for $published; trying a local build" >&2
     else echo 'farmy: FARMY_REGISTRY is unset; trying a local build' >&2; fi
   fi
-  if [ -f "$HERE/Dockerfile" ]; then context=$HERE
+  # the commit it is built from, as the label farmy.commit and for the binary inside (a checkout's HEAD; a
+  # FARMY_SOURCE URL's is unknown here, and the image says nothing of it)
+  commit=
+  if [ -f "$HERE/Dockerfile" ]; then context=$HERE; commit=$(checkout_commit || true)
   elif [ -n "$FARMY_SOURCE" ]; then context=$FARMY_SOURCE
   else fail 'no checkout to build; set FARMY_SOURCE to a Docker remote build context URL'; fi
   echo "building the control image $IMAGE" >&2
-  docker build -q --label "farmy.hash=$HASH" --label "farmy.version=$FARMY_SHIM_VERSION" --label farmy.format=1 --build-arg "FARMY_VERSION=$FARMY_SHIM_VERSION" --build-arg "FARMY_HASH=$HASH" -t "$IMAGE" "$context" >/dev/null
+  docker build -q --label "farmy.hash=$HASH" --label "farmy.version=$FARMY_SHIM_VERSION" ${commit:+--label "farmy.commit=$commit"} --label farmy.format=1 --build-arg "FARMY_VERSION=$FARMY_SHIM_VERSION" --build-arg "FARMY_HASH=$HASH" ${commit:+--build-arg "FARMY_COMMIT=$commit"} -t "$IMAGE" "$context" >/dev/null
 }
 image_stale() {
   docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
@@ -197,19 +567,40 @@ image_stale() {
     fi
     return 1
   elif [ "$FARMY_BUILD" = 1 ]; then
+    # an image of another farmy version is out of date whatever the command (a release before this one)
+    [ "$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$IMAGE" 2>/dev/null)" = "$FARMY_SHIM_VERSION" ] || return 0
     case "${1:-}" in init|update) [ "$(docker image inspect -f '{{index .Config.Labels "farmy.hash"}}' "$IMAGE" 2>/dev/null)" != "$HASH" ] ;; *) return 1 ;; esac
   else [ "$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$IMAGE" 2>/dev/null)" != "$FARMY_SHIM_VERSION" ]; fi
 }
 if [ "${1:-}" = update ]; then
   shift; target=
   case "$#" in 0) ;; 2) [ "$1" = --to ] || fail 'usage: farmy update [--to VERSION]'; target=$2 ;; *) fail 'usage: farmy update [--to VERSION]' ;; esac
-  [ -z "$target" ] || valid_version "$target" || fail 'update version must be exact MAJOR.MINOR.PATCH'
+  [ -z "$target" ] || valid_version "$target" || fail 'update version must be exact MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N'
   if [ "$FARMY_BUILD" = 1 ] && [ -z "$target" ] && [ -f "$HERE/Dockerfile" ]; then
-    if image_stale update; then build_image; docker rm -f "$NAME" >/dev/null 2>&1 || true; echo 'farmy updated'; else echo 'farmy is up to date'; fi
+    if image_stale update; then
+      # a control container with live runs is never replaced: the update waits for them
+      take_lock; read_control; [ "$CTRL" != unreadable ] || refuse_unreadable
+      WHY='its image is out of date'; live_runs; { [ "$LIVE" = 0 ] && [ -z "$TOP_ERROR" ]; } || refuse_live
+      build_image; docker rm -f "$NAME" >/dev/null 2>&1 || true; echo 'farmy updated'
+    else echo 'farmy is up to date'; fi
     exit 0
   fi
   [ -n "$target" ] || target=$pin
-  [ -n "$target" ] || target=$(latest_version)
+  if [ -z "$target" ]; then
+    case "$FARMY_SHIM_VERSION" in
+      *-*)
+        # From a pre-release update never goes back (record 2026-10-29-1931): of control :latest and :next (one
+        # missing or not pulled counts as none), the newest that is not older than this version, else refused.
+        latest=$(latest_version); next=$(next_version)
+        for candidate in "$latest" "$next"; do
+          valid_version "$candidate" || continue
+          ! version_older "$candidate" "$FARMY_SHIM_VERSION" || continue
+          if [ -z "$target" ] || version_older "$target" "$candidate"; then target=$candidate; fi
+        done
+        [ -n "$target" ] || fail "$FARMY_SHIM_VERSION is newer than the latest release, $latest; use --to $latest to go back" ;;
+      *) target=$(latest_version) ;;
+    esac
+  fi
   [ -n "$FARMY_REGISTRY" ] || fail 'set FARMY_REGISTRY to update'
   for role in control keys knowledge gate; do pull "${FARMY_REGISTRY%/}/farmy-$role:$target" || fail "pull failed for farmy-$role:$target; installed shim unchanged"; done
   stage=$(mktemp -d "$HERE/.farmy-update.XXXXXX"); container=
@@ -220,39 +611,47 @@ if [ "${1:-}" = update ]; then
   docker cp "$container:/usr/local/lib/farmy/farmy" "$stage/source" || fail 'shim extraction failed; installed shim unchanged'
   [ -s "$stage/source" ] || fail 'extracted shim is empty; installed shim unchanged'
   sh -n "$stage/source" || fail 'invalid extracted shim; installed shim unchanged'
+  commit=$(docker image inspect -f '{{index .Config.Labels "farmy.commit"}}' "${FARMY_REGISTRY%/}/farmy-control:$target" 2>/dev/null || true)
+  case "$commit" in *[!0-9a-f]*|'') commit= ;; *) commit=$(printf '%s\n' "$commit" | cut -c1-7) ;; esac
   {
-    printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$target"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "${FARMY_REGISTRY%/}"
+    printf '#!/bin/sh\nFARMY_SHIM_VERSION='; quote "$target"; printf '\nFARMY_SHIM_COMMIT='; quote "$commit"; printf '\nFARMY_DEFAULT_REGISTRY='; quote "${FARMY_REGISTRY%/}"
     next_source=$FARMY_SOURCE
     if [ "$FARMY_SOURCE_IS_GENERATED" = 1 ] && [ -n "$FARMY_DEFAULT_GITHUB" ]; then next_source="${FARMY_DEFAULT_GITHUB%.git}.git#v$target:work"; fi
     printf '\nFARMY_DEFAULT_SOURCE='; quote "$next_source"
     printf '\nFARMY_DEFAULT_GITHUB='; quote "$FARMY_DEFAULT_GITHUB"
     printf '\nFARMY_DEFAULT_SOURCE_IS_GENERATED='; quote "$FARMY_SOURCE_IS_GENERATED"; printf '\n'
-    sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
+    sed '/^FARMY_SHIM_VERSION=/d;/^FARMY_SHIM_COMMIT=/d;/^FARMY_DEFAULT_REGISTRY=/d;/^FARMY_DEFAULT_SOURCE=/d;/^FARMY_DEFAULT_GITHUB=/d;/^FARMY_DEFAULT_SOURCE_IS_GENERATED=/d' "$stage/source"
   } > "$stage/farmy"
   chmod 755 "$stage/farmy"
   mv -f "$stage/farmy" "$SELF"
   echo "farmy updated to $target"
   exit 0
 fi
-running_version=
-for field in '{{.Image}}' '{{.Config.Image}}'; do
-  running_image=$(docker inspect -f "$field" "$NAME" 2>/dev/null || true)
-  if [ -n "$running_image" ]; then
-    running_version=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$running_image" 2>/dev/null || true)
-    valid_version "$running_version" && break
-  fi
+# The control container, read once under the lock (above); a read that fails is refused, never guessed.
+take_lock
+read_control
+[ "$CTRL" != unreadable ] || refuse_unreadable
+# the farmy version it runs: its image's label (by the image's ID, else its name), else its own label
+running_version=; running_image=
+for running_image in "$C_IMAGE" "$C_IMAGE_NAME"; do
+  [ -n "$running_image" ] || continue
+  running_version=$(docker image inspect -f '{{index .Config.Labels "farmy.version"}}' "$running_image" 2>/dev/null || true)
+  valid_version "$running_version" && break
 done
-if ! valid_version "$running_version"; then
-  running_version=$(docker inspect -f '{{index .Config.Labels "farmy.version"}}' "$NAME" 2>/dev/null || true)
-fi
+valid_version "$running_version" || running_version=$C_VERSION
 if valid_version "$running_version" && version_older "$FARMY_SHIM_VERSION" "$running_version"; then
   echo "farmy: this shim is $FARMY_SHIM_VERSION, running control is newer ($running_version); farmy update" >&2
 fi
-if image_stale "${1:-}"; then build_image; docker rm -f "$NAME" >/dev/null 2>&1 || true; fi
-if valid_version "$running_version" && [ "$running_version" != "$FARMY_SHIM_VERSION" ]; then docker rm -f "$NAME" >/dev/null 2>&1 || true; fi
+# Why the control container is due to be replaced for this farmy (empty: it is not): its image is out of
+# date, or it runs another farmy version. Nothing is built or removed before the live runs were asked.
+WHY=; STALE=
+if image_stale "${1:-}"; then STALE=1; WHY='its image is out of date'; fi
 if [ "$LOCAL_INIT" = 1 ] && [ -n "${running_image:-}" ]; then
   running_hash=$(docker image inspect -f '{{index .Config.Labels "farmy.hash"}}' "$running_image" 2>/dev/null || true)
-  [ "$running_hash" = "$HASH" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true
+  [ "$running_hash" = "$HASH" ] || WHY='its image is out of date'
+fi
+if valid_version "$running_version" && [ "$running_version" != "$FARMY_SHIM_VERSION" ]; then
+  WHY="it runs farmy $running_version, and this farmy is $FARMY_SHIM_VERSION"
 fi
 # The current local Docker context supplies the control socket.
 ENDPOINT=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
@@ -260,36 +659,276 @@ case "${ENDPOINT:-unix:///var/run/docker.sock}" in
   unix://*) SOCK=${ENDPOINT#unix://}; [ -n "$SOCK" ] || SOCK=/var/run/docker.sock ;;
   *) fail "the Docker context points at $ENDPOINT — farmy needs a local Docker, reached through its socket (docker context use default, or a unix:// context)" ;;
 esac
-[ "$(uname -s)" = Darwin ] && SOCK=/var/run/docker.sock
+OS=$(uname -s 2>/dev/null || true)
+[ "$OS" != Darwin ] || SOCK=/var/run/docker.sock
 TZV=${TZ:-$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')}
 
-# the control container: one per containers folder; made anew when the folder (its mount) changed
-WANT="$PWD"
-HAVE=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "'"$WANT"'"}}{{.Source}}{{end}}{{end}}' "$NAME" 2>/dev/null || true)
+# Who farmy runs as in the control container (records 2026-10-29-1215, 2026-10-29-1530 and 2026-10-29-1800).
+# On Linux, where root in a container is root on the host, the user who runs this shim (uid:gid), so that
+# every file farmy writes in the folder and the state folder is that user's from the moment it is written. A
+# root caller under sudo, in the default home, acts for the user who ran sudo (SUDO_FOR, above). Any other
+# root caller runs farmy as the owner of the folder, or of its nearest existing parent while farmy is about
+# to make it: root for root's own folders, the folder owner for sudo farmy -C <their folder>. ME: that user
+# (empty: root). Root, as before, where root in a container is already the user on the host (a rootless
+# daemon, Docker Desktop, a Mac), and under a daemon that remaps users, where neither root nor -u <uid> writes
+# the user's files: ownership there is not farmy's to fix.
+ME=
+if [ "$OS" != Darwin ]; then
+  if [ "$(id -u)" = 0 ]; then
+    if [ -n "$SUDO_FOR" ] && [ -n "$IS_HOME" ]; then ME=$SUDO_FOR
+    else
+      dir=$FOLDER
+      while [ ! -e "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
+      ME=$(stat -c '%u:%g' "$dir" 2>/dev/null || true)
+      case "$ME" in 0:*|*[!0-9:]*) ME= ;; esac
+    fi
+  else ME="$(id -u):$(id -g)"; fi
+fi
+# That is settled when the shim makes the control container, asking the daemon then (its formatted answers,
+# else the words of the plain docker info above), and kept with the container (its label farmy.user): later
+# commands do not ask the daemon again, so a docker info that is slow or fails changes nothing, nor does a read
+# of the container that fails. RUN_AS: the user a control container made now runs farmy as (empty: root);
+# RUN_LABEL: its farmy.user, 0:0 for one made to run farmy as root for a root caller where root is root on the
+# host, so that it is never used for a plain user's commands.
+RUN_AS=; RUN_LABEL=; SETTLED=
+settle_run_as() {
+  [ -z "$SETTLED" ] || return 0
+  SETTLED=1
+  [ "$OS" != Darwin ] || return 0
+  options=$(docker info -f '{{.SecurityOptions}}' 2>/dev/null) || options=$INFO
+  case "$options" in *rootless*|*userns*) return 0 ;; esac
+  system=$(docker info -f '{{.OperatingSystem}}' 2>/dev/null) || system=$INFO
+  case "$system" in *'Docker Desktop'*) return 0 ;; esac
+  RUN_AS=$ME; RUN_LABEL=${ME:-0:0}
+}
+# the socket's group, added so that this user reaches the daemon from inside as from here; one that cannot be
+# read is said, rather than running farmy where it cannot reach the daemon
+SOCK_GID=
+settle_socket() {
+  [ -n "$RUN_AS" ] && [ -e "$SOCK" ] || return 0
+  SOCK_GID=$(stat -L -c %g "$SOCK" 2>/dev/null || true)
+  case "$SOCK_GID" in ''|*[!0-9]*) release_lock; fail "cannot read the group of the Docker socket $SOCK, which farmy run as $(who "$RUN_AS") needs to reach Docker from the control container; nothing was made" ;; esac
+}
+# farmy's home there, for a user: in the farmy-home volume (Docker's client config, git's global config, known
+# hosts), so that what farmy keeps there outlives the control container, as root's /root in farmy-control does
+home_of() { echo "/home/farmy/${1%%:*}"; }
+
+# The control container: one per folder in use. It mounts the folder, and the state folder when that is
+# another, each at its own path, and says so in its labels (farmy.folder, farmy.state), with the user farmy
+# runs as in it (farmy.user). What the read above says of it: gone; or the folder it serves, with LABELLED
+# when its labels say so (one an older farmy made has none: it runs farmy as root, which nothing settled, and
+# the folders it binds say what it serves); unknown when it says neither.
+CONTROL=; SERVES=; SERVES_STATE=; MADE_FOR=; LABELLED=
+if [ "$CTRL" = gone ]; then CONTROL=gone
+elif [ -n "$C_FOLDER" ]; then
+  CONTROL=known; LABELLED=1; SERVES=$C_FOLDER; SERVES_STATE=${C_STATE:-$C_FOLDER}; MADE_FOR=$C_USER
+elif [ -n "$C_BINDS" ]; then
+  CONTROL=known
+  if printf '%s\n' "$C_BINDS" | grep -qxF -e "$FOLDER" && { [ "$STATE" = "$FOLDER" ] || printf '%s\n' "$C_BINDS" | grep -qxF -e "$STATE"; }; then
+    SERVES=$FOLDER; SERVES_STATE=$STATE
+  else
+    SERVES=$(printf '%s\n' "$C_BINDS" | head -n 1); SERVES_STATE=$SERVES
+  fi
+else CONTROL=unknown; fi
+OTHER=
+if [ "$CONTROL" = known ] && { [ "$SERVES" != "$FOLDER" ] || [ "$SERVES_STATE" != "$STATE" ]; }; then OTHER=1; fi
+# Who it runs farmy as (EXEC_AS): as it was made to, read from it (root, no -u, for 0:0). A caller with the same
+# uid is the same user whatever its group is now (newgrp docker, sg docker): its commands run in that
+# container, neither replaced nor refused for it. Another user's are due a container of their own; one made
+# to run farmy as root for a root caller is never used for a plain user's commands (ROOT_MADE). One an older
+# farmy made is settled now.
+EXEC_AS=$MADE_FOR; ROOT_MADE=
+case "$MADE_FOR" in 0|0:*) EXEC_AS=; [ "$(uid_of "$ME")" = 0 ] || ROOT_MADE=1 ;; esac
+if [ "$CONTROL" = known ] && [ -z "$WHY" ]; then
+  if [ -n "$LABELLED" ]; then
+    if [ -n "$MADE_FOR" ] && [ "$(uid_of "$MADE_FOR")" != "$(uid_of "$ME")" ]; then
+      WHY="it runs farmy as $(who "$MADE_FOR"), and you are $(who "$ME")"
+    fi
+  elif [ -z "$OTHER" ]; then
+    settle_run_as
+    [ -z "$RUN_AS" ] || WHY="it runs farmy as root, and farmy now runs as $(who "$RUN_AS")"
+  fi
+fi
+[ "$CONTROL" != unknown ] || { settle_run_as; EXEC_AS=$RUN_AS; }
+# The read-only commands (record 2026-10-29-1800): they run beside another folder's live runs, in a container
+# of their own
+read_only() {
+  case "${1:-}" in
+    status) [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = --json ]; } ;;
+    help|-h|--help|logs) return 0 ;;
+    config) [ "$#" -eq 2 ] && [ "$2" = path ] ;;
+    factory) case "${2:-}" in list|show|log) return 0 ;; *) return 1 ;; esac ;;
+    egress) [ "${2:-}" = log ] ;;
+    tui) [ "$#" -eq 2 ] && [ "$2" = --version ] ;;
+    *) return 1 ;;
+  esac
+}
+# A control container with live runs is never replaced (records 2026-10-26-2126 and 2026-10-29-1215), nor one
+# whose live runs cannot be told because docker top fails (record 2026-10-29-1530). docker top is asked only
+# when a replacement is due. Kept for another folder (or, made for root, kept from a plain user), a read-only
+# command runs in a container of its own for this folder (APART: docker run --rm of its image, serving this
+# folder as the control container would); every other command is refused in one line.
+KEEP=; APART=; LIVE=0; TOP_ERROR=
+if [ "$CONTROL" != gone ] && { [ -n "$OTHER" ] || [ -n "$WHY" ]; }; then live_runs; fi
+if [ "$LIVE" != 0 ] || [ -n "$TOP_ERROR" ]; then
+  runs="$LIVE live runs"; [ "$LIVE" != 1 ] || runs='1 live run'
+  if [ -n "$OTHER" ] || [ -n "$ROOT_MADE" ]; then
+    if read_only "$@"; then APART=1
+    else
+      release_lock
+      if [ -n "$OTHER" ]; then
+        [ -z "$TOP_ERROR" ] || fail "the control container serves $(shown "$SERVES"), and whether runs are live in it cannot be told (docker top farmy failed: $TOP_ERROR); try again once Docker answers, or run this command with farmy -C $(shown "$SERVES")"
+        fail "the control container serves $(shown "$SERVES") and has $runs; finish or cancel them, or run this command with farmy -C $(shown "$SERVES")"
+      fi
+      [ -z "$TOP_ERROR" ] || fail "the control container runs farmy as root, and whether runs are live in it cannot be told (docker top farmy failed: $TOP_ERROR); try again once Docker answers"
+      fail "the control container runs farmy as root and has $runs; finish or cancel them as root (sudo farmy …), then run this command again"
+    fi
+  else
+    # two commands run in the kept container: farmy stop with no name, and cancel, which stops a controller
+    # only where it runs; as the container was made to run them
+    case "${1:-} ${2:-}" in
+      'stop ') [ "$#" -eq 1 ] && KEEP=1 ;;
+      'factory cancel') KEEP=1 ;;
+      'factory pipeline') [ "${3:-}" = cancel ] && KEEP=1 ;;
+    esac
+    [ -n "$KEEP" ] || refuse_live
+  fi
+fi
 # on the farmy network, where the egress node and the knowledge container resolve by name
 docker network inspect farmy >/dev/null 2>&1 || docker network create farmy >/dev/null
-if [ "$HAVE" != "$WANT" ]; then
+# make_control: the control container for this folder, made as RUN_AS settles. A name another shim took
+# meanwhile (one that holds no lock of this user's: another user's, an older farmy) is reused when that
+# container serves this folder for the same user, else refused; nothing removes a container another shim has
+# just made. MADE: 1 when this shim made it.
+MADE=
+make_control() {
+  set -- --label "farmy.folder=$FOLDER" --label "farmy.state=$STATE"
+  [ "$STATE" = "$FOLDER" ] || set -- "$@" -v "$STATE:$STATE"
+  [ -z "$RUN_AS" ] || set -- ${SOCK_GID:+--group-add "$SOCK_GID"} -v farmy-home:/home/farmy "$@"
+  [ -z "$RUN_LABEL" ] || set -- --label "farmy.user=$RUN_LABEL" "$@"
+  docker_read run -d --name "$NAME" --init --restart unless-stopped --network farmy \
+    -v "$SOCK:/var/run/docker.sock" -v "$FOLDER:$FOLDER" "$@" -w "$FOLDER" \
+    -e DOCKER_CLI_HINTS=false -e FARMY_REGISTRY -e FARMY_SOURCE -e FARMY_BUILD ${TZV:+-e TZ="$TZV"} -v farmy-control:/root "$IMAGE" tail -f /dev/null
+  if [ "$RC" = 0 ]; then MADE=1; C_RUNNING=true; C_NETWORKS=farmy; return 0; fi
+  made_rc=$RC; made_err=$ERR_ALL
+  case "$made_err" in
+    *Conflict*)
+      read_control
+      if [ "$CTRL" = read ] && [ "$C_FOLDER" = "$FOLDER" ] && [ "${C_STATE:-$C_FOLDER}" = "$STATE" ] &&
+        [ "$(uid_of "$C_USER")" = "$(uid_of "$RUN_LABEL")" ]; then
+        EXEC_AS=$C_USER; case "$EXEC_AS" in 0|0:*) EXEC_AS= ;; esac
+        return 0
+      fi
+      release_lock
+      fail "another farmy made the control container while this one was making it, and it is not one for $(shown "$FOLDER") run as $(who "$RUN_AS"); run the command again" ;;
+  esac
+  release_lock
+  [ -z "$made_err" ] || printf '%s\n' "$made_err" >&2
+  exit "$made_rc"
+}
+# Made for a user, the control container gets, once, as root: that user's home in the farmy-home volume (exit
+# 3 when it cannot), and what is root's in farmy's own folders handed to that user (record 2026-10-29-1800
+# narrowed this), files an older farmy or an earlier sudo left root's: the default home's config folder and
+# state folder, with all in them and the two folders themselves; .work of a project folder that belongs to
+# that user. Never a project folder itself or what the user keeps there, and nothing in a folder another user
+# owns: those paths are never handed to it. Only what is root's; a link is changed itself, never followed;
+# never off the filesystem each starts on. Exit 1 when a change fails, with find's or chown's words.
+HAND_BACK='u=$1; h=$2; shift 2
+mkdir -p "$h" && chown "$u" "$h" && chmod 700 "$h" || exit 3
+bad=0
+for p in "$@"; do
+  if [ -e "$p" ] || [ -L "$p" ]; then find "$p" -xdev -user 0 -exec chown -h "$u" {} + || bad=1; fi
+done
+exit $bad'
+hand_back() {
+  [ -n "$RUN_AS" ] || return 0
+  set --
+  if [ "$STATE" != "$FOLDER" ]; then set -- "$FOLDER" "$STATE"
+  elif [ "$(owner_of "$FOLDER" || true)" = "$(uid_of "$RUN_AS")" ]; then set -- "$FOLDER/.work"
+  fi
+  docker_read exec -u 0 "$NAME" sh -c "$HAND_BACK" farmy-hand-back "$RUN_AS" "$(home_of "$RUN_AS")" "$@"
+  case "$RC" in
+    0) ;;
+    3) echo "farmy: could not make farmy's home $(home_of "$RUN_AS") in the control container: ${ERR:-exit 3}" >&2 ;;
+    *) echo "farmy: handing root's files in $(shown "$FOLDER") to $(who "$RUN_AS") failed: ${ERR:-exit $RC}" >&2 ;;
+  esac
+}
+if [ -n "$APART" ]; then
+  settle_run_as; settle_socket
+  EXEC_AS=$RUN_AS
+elif [ -z "$KEEP" ] && { [ "$CONTROL" = gone ] || [ -n "$OTHER" ] || [ -n "$WHY" ]; }; then
+  settle_run_as; settle_socket
+  [ -z "$STALE" ] || build_image
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  docker run -d --name "$NAME" --init --restart unless-stopped --network farmy \
-    -v "$SOCK:/var/run/docker.sock" -v "$WANT:$WANT" -w "$WANT" \
-    -e DOCKER_CLI_HINTS=false -e FARMY_REGISTRY -e FARMY_SOURCE -e FARMY_BUILD ${TZV:+-e TZ="$TZV"} -v farmy-control:/root "$IMAGE" tail -f /dev/null >/dev/null
+  make_control
+  if [ -n "$MADE" ]; then EXEC_AS=$RUN_AS; hand_back; fi
 fi
-docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -q true || docker start "$NAME" >/dev/null
-# a control container from an older farmy, on the default bridge: attached to farmy as well
-docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$NAME" 2>/dev/null | grep -qw farmy || docker network connect farmy "$NAME" >/dev/null 2>&1 || true
+if [ -z "$APART" ]; then
+  [ "$C_RUNNING" = true ] || docker start "$NAME" >/dev/null
+  # a control container from an older farmy, on the default bridge: attached to farmy as well
+  case " $C_NETWORKS " in *' farmy '*) ;; *) docker network connect farmy "$NAME" >/dev/null 2>&1 || true ;; esac
+fi
+release_lock
+
+# What every docker exec of farmy carries, so that farmy inside reaches the same folder and state folder,
+# each as -e NAME=value on the exec only (the shim's own environment, and so every command it runs here,
+# stays as the user had it): the folder (its workdir and FARMY_DIR), XDG_CONFIG_HOME and XDG_STATE_HOME
+# resolved here, this host's HOME as FARMY_HOST_HOME, the top folder of the Git repository the folder
+# lies in as FARMY_HOST_GIT_TOP (the nearest .git, folder or file, at or above it, found by looking:
+# inside the control container a parent's .git is not mounted), and the host's git identity, when the
+# host has git and one, as GIT_USER_NAME / GIT_USER_EMAIL. The control container never sees the host's
+# git configuration itself. On a Mac git runs only with the developer tools (xcode-select -p): without
+# them /usr/bin/git is Apple's stub, which offers to install them each time it runs.
+GIT_TOP=
+dir=$FOLDER
+while [ -n "$dir" ]; do
+  if [ -e "$dir/.git" ]; then GIT_TOP=$dir; break; fi
+  [ "$dir" != / ] || break
+  dir=$(dirname "$dir")
+done
+HOST_GIT_NAME=; HOST_GIT_EMAIL=
+if command -v git >/dev/null 2>&1 && { [ "$OS" != Darwin ] || xcode-select -p >/dev/null 2>&1; }; then
+  HOST_GIT_NAME=$(git config --global user.name 2>/dev/null || true)
+  HOST_GIT_EMAIL=$(git config --global user.email 2>/dev/null || true)
+fi
+# Run as the user (EXEC_AS, above), farmy gets a home of its own, in the farmy-home volume (made with the
+# container), and its holder's socket in a folder of its own under /tmp: in the control container that user
+# may have no account (Docker would give it HOME=/), and /run/farmy is root's. The user's tmux server is the
+# one every command of that user shares.
+EXEC_HOME=; HOLD_DIR=
+[ -z "$EXEC_AS" ] || { EXEC_HOME=$(home_of "$EXEC_AS"); HOLD_DIR=/tmp/farmy-${EXEC_AS%%:*}; }
+# A read-only command beside another folder's live runs (APART) runs in a container of its own: docker run
+# --rm of the control container's image (as it names it, else by its ID), serving this folder as the
+# control container would: this folder and its state folder at their paths, the socket, the same user and
+# home, the farmy network. It has no holder: nothing that needs one is read-only.
+APART_IMAGE=${C_IMAGE_NAME:-${C_IMAGE:-$IMAGE}}
+[ -z "$APART" ] || HOLD_DIR=
+in_farmy() { # in_farmy run|exec '<docker exec options>' <farmy's arguments…>: farmy in the control container
+  how=$1; opts=$2; shift 2
+  target=$NAME; [ -z "$APART" ] || target=$APART_IMAGE
+  set -- ${EXEC_AS:+-u "$EXEC_AS"} ${EXEC_HOME:+-e "HOME=$EXEC_HOME"} ${HOLD_DIR:+-e "FARMY_HOLD_SOCKET=$HOLD_DIR/hold.sock"} \
+    -e "FARMY_DIR=$FOLDER" ${CONFIG_HOME:+-e "XDG_CONFIG_HOME=$CONFIG_HOME"} \
+    ${STATE_HOME:+-e "XDG_STATE_HOME=$STATE_HOME"} ${USER_HOME:+-e "FARMY_HOST_HOME=$USER_HOME"} \
+    ${GIT_TOP:+-e "FARMY_HOST_GIT_TOP=$GIT_TOP"} ${HOST_GIT_NAME:+-e "GIT_USER_NAME=$HOST_GIT_NAME"} \
+    ${HOST_GIT_EMAIL:+-e "GIT_USER_EMAIL=$HOST_GIT_EMAIL"} -w "$FOLDER" "$target" farmy "$@"
+  if [ -n "$APART" ]; then
+    [ "$STATE" = "$FOLDER" ] || set -- -v "$STATE:$STATE" "$@"
+    if [ -n "$RUN_AS" ]; then set -- ${SOCK_GID:+--group-add "$SOCK_GID"} -v farmy-home:/home/farmy "$@"
+    else set -- -v farmy-control:/root "$@"; fi
+    set -- --rm --network farmy -v "$SOCK:/var/run/docker.sock" -v "$FOLDER:$FOLDER" \
+      -e DOCKER_CLI_HINTS=false -e FARMY_REGISTRY -e FARMY_SOURCE -e FARMY_BUILD ${TZV:+-e TZ="$TZV"} "$@"
+    [ "$how" != exec ] || exec docker run $opts "$@"
+    docker run $opts "$@"
+    return
+  fi
+  [ "$how" != exec ] || exec docker exec $opts "$@"
+  docker exec $opts "$@"
+}
 
 TTY=""; [ -t 0 ] && [ -t 1 ] && TTY="-t"
 if [ "$#" -eq 0 ]; then
-  [ -n "$TTY" ] && exec docker exec -i $TTY -w "$WANT" "$NAME" farmy session
-  exec docker exec -i -w "$WANT" "$NAME" farmy help
-fi
-# farmy init: the host's git identity, when the host has git, goes in through the environment; the control
-# container never sees the host's git configuration (farmy asks on a terminal for what is still missing)
-IDENT=""
-if [ "${1:-}" = init ] && command -v git >/dev/null 2>&1; then
-  GIT_USER_NAME=$(git config --global user.name 2>/dev/null || true); export GIT_USER_NAME
-  GIT_USER_EMAIL=$(git config --global user.email 2>/dev/null || true); export GIT_USER_EMAIL
-  IDENT="-e GIT_USER_NAME -e GIT_USER_EMAIL"
+  [ -n "$TTY" ] && in_farmy exec "-i $TTY" session
+  in_farmy exec -i help
 fi
 
 # Unlocking values (farmy unlock-names: secrets.unlock, and without a provider every route's secret). farmy
@@ -301,10 +940,10 @@ fi
 # Only the names the control container does not hold yet are asked (farmy unlock-names --missing): it keeps
 # what it was given until farmy lock or a restart of the container. A locked keychain is unlocked once
 # (security unlock-keychain, on the terminal). What the source does not have is asked for here, hidden.
-# FARMY_SECRET_PREFIX and FARMY_UNLOCK_COMMAND: the environment, else .env of the containers folder
+# FARMY_SECRET_PREFIX and FARMY_UNLOCK_COMMAND: the environment, else .env of the folder in use
 from_env_file() {  # $1: the key; prints its value in .env (quotes taken off), nothing when absent
-  [ -f "$WANT/.env" ] || return 0
-  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$WANT/.env" | tail -1 | sed 's/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/'
+  [ -f "$FOLDER/.env" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$FOLDER/.env" | tail -1 | sed 's/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/'
 }
 if [ -z "${FARMY_SECRET_PREFIX+set}" ]; then
   FARMY_SECRET_PREFIX=$(from_env_file FARMY_SECRET_PREFIX)
@@ -382,7 +1021,7 @@ UNLOCK=""
 SS_DOWN="${TMPDIR:-/tmp}/farmy-secret-service-down.$$"   # a file: each lookup runs in a subshell
 rm -f "$SS_DOWN"
 if [ -n "$LOADS" ]; then
-  for n in $(docker exec -w "$WANT" "$NAME" farmy unlock-names --missing 2>/dev/null || true); do
+  for n in $(in_farmy run "" unlock-names --missing 2>/dev/null || true); do
     v=$(unlock_value "$n" || true)
     [ -n "$v" ] || [ -z "$TTY" ] || v=$(ask_hidden "$n")
     # base64, so that a multi-line value (an SSH key) arrives byte for byte
@@ -395,5 +1034,5 @@ fi
 rm -f "$SS_DOWN"
 # with the values on stdin docker exec cannot have -t: tell farmy that its output reaches a terminal
 OUTTTY=""; [ -t 1 ] && OUTTTY="-e FARMY_TTY=1"
-if [ -n "$UNLOCK" ]; then printf '%s' "$UNLOCK" | docker exec -i $OUTTTY $IDENT -w "$WANT" "$NAME" farmy "$@"
-else exec docker exec -i $TTY $IDENT -w "$WANT" "$NAME" farmy "$@"; fi
+if [ -n "$UNLOCK" ]; then printf '%s' "$UNLOCK" | in_farmy run "-i $OUTTTY" "$@"
+else in_farmy exec "-i $TTY" "$@"; fi

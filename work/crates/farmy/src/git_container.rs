@@ -110,9 +110,16 @@ pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Create first, join farmy, then start: older Docker engines accept only one network at
-/// creation. No Git process runs before both its broker and its proxy are reachable.
+/// [`run_raw`], with what the script printed as text.
 pub(crate) fn run(ctx: &Ctx, request: Request, script: &str) -> Output {
+    let (code, stdout, stderr) = run_raw(ctx, request, script);
+    (code, String::from_utf8_lossy(&stdout).into(), stderr)
+}
+
+/// Create first, join farmy, then start: older Docker engines accept only one network at
+/// creation. No Git process runs before both its broker and its proxy are reachable. What the
+/// script printed comes back byte for byte.
+pub(crate) fn run_raw(ctx: &Ctx, request: Request, script: &str) -> (i32, Vec<u8>, String) {
     let routes = secrets::granted(&ctx.routes, &request.service);
     let proxy = egress::proxy_env(&ctx.cfg, &["keys".into(), request.service.clone()]);
     let mut config = vec![
@@ -190,11 +197,11 @@ pub(crate) fn run(ctx: &Ctx, request: Request, script: &str) -> Output {
         Ok(o) => {
             return (
                 o.status.code().unwrap_or(1),
-                String::new(),
+                vec![],
                 String::from_utf8_lossy(&o.stderr).into(),
             );
         }
-        Err(e) => return (1, String::new(), e.to_string()),
+        Err(e) => return (1, vec![], e.to_string()),
     }
     docker::ensure_network("farmy");
     if let Err(error) = docker::out(&["network", "connect", "farmy", &request.name]) {
@@ -205,7 +212,7 @@ pub(crate) fn run(ctx: &Ctx, request: Request, script: &str) -> Output {
         let _ = docker::out(&["rm", "-f", &request.name]);
         return (
             1,
-            String::new(),
+            vec![],
             format!(
                 "the git container {} could not join the farmy network: {error}",
                 request.name
@@ -219,7 +226,7 @@ pub(crate) fn run(ctx: &Ctx, request: Request, script: &str) -> Output {
     {
         Ok(o) => (
             o.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&o.stdout).into(),
+            o.stdout,
             String::from_utf8_lossy(&o.stderr).into(),
         ),
         Err(e) => {
@@ -228,7 +235,7 @@ pub(crate) fn run(ctx: &Ctx, request: Request, script: &str) -> Output {
                 reason = "removing the helper container; the error that led here is what is reported"
             )]
             let _ = docker::out(&["rm", "-f", &request.name]);
-            (1, String::new(), e.to_string())
+            (1, vec![], e.to_string())
         }
     }
 }

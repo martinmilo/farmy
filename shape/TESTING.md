@@ -103,7 +103,7 @@ end
   in section 9.3.
 - **Expected values are written out.** Never compute them, and never read them from the
   same fixture the program reads. The reader should see the expected value on the line.
-- **Realistic data.** Emma Clarke with a 50 € voucher, never `foo`, `test@test.com` or
+- **Realistic data.** Emma Clarke with a $50 voucher, never `foo`, `test@test.com` or
   `Company A`. Show only the values the behaviour depends on; give the rest defaults in a
   helper.
 - **`setup` is for one line** that states the starting situation every test in the class
@@ -171,7 +171,7 @@ the test is about; those stay visible in the test.
 | check what it printed | `assert_stdout "text"` · `assert_stderr /pattern/` · `refute_stdout "text"` · `refute_stderr "text"` |
 | check the whole output | `assert_stdout_is expected("list_shop.txt")` |
 | check the shape of a screen | `assert_lines_within 80` (every line fits) · `assert_stdout_lines 3` (exactly that many) |
-| say in a failure what a helper set up | `note_situation "GIFT-2041 is a 50 € voucher"` (shown under the transcript; for helpers, not tests) |
+| say in a failure what a helper set up | `note_situation "GIFT-2041 is a $50 voucher"` (shown under the transcript; for helpers, not tests) |
 | check files | `assert_file path` · `assert_file path, includes: "text"` · `assert_file path, is: expected("file")` · `refute_file path` |
 | check nothing else changed | `assert_nothing_written` · `assert_unchanged path` · `assert_written_only path` (all compare with the moment before the last command) |
 | read test data | `fixture("vouchers/GIFT-3050.json")` · `expected("list_shop.txt")` · `stdout` · `stderr` · `read_file path` |
@@ -221,7 +221,7 @@ Run `ruby test/run.rb` and go through this list.
     $ VOUCHERS_TODAY=2026-10-09 vouchers redeem GIFT-1187
     exit 0
     stdout:
-      Redeemed GIFT-1187 (120 €)
+      Redeemed GIFT-1187 ($120)
     stderr: (empty)
   ```
 
@@ -244,7 +244,7 @@ Good:
 test "an active voucher is redeemed" do
   redeem "GIFT-2041"
   assert_success
-  assert_stdout "Redeemed GIFT-2041 (50 €)"
+  assert_stdout "Redeemed GIFT-2041 ($50)"
 
   cli "list"
   assert_stdout(/GIFT-2041 .+ redeemed/)
@@ -269,7 +269,7 @@ def test_redeem
     assert status.success?
     voucher = JSON.parse(File.read("#{dir}/vouchers/GIFT-2041.json"))
     assert_equal "redeemed", voucher["status"]
-    assert_equal "Redeemed #{voucher["code"]} (#{voucher["amount"]} €)\n", out
+    assert_equal "Redeemed #{voucher["code"]} ($#{voucher["amount"]})\n", out
   end
 end
 ```
@@ -323,7 +323,7 @@ must produce a full sentence as its test name.
 
 ```ruby
 { 9 => "at least 10", 501 => "at most 500" }.each do |amount, limit|
-  test "issuing a voucher for #{amount} € is refused because the amount must be #{limit}" do
+  test "issuing a voucher for $#{amount} is refused because the amount must be #{limit}" do
     issue amount
 
     assert_exit 1
@@ -333,7 +333,7 @@ must produce a full sentence as its test name.
 end
 
 [10, 500].each do |amount|
-  test "issuing a voucher for #{amount} € is accepted" do
+  test "issuing a voucher for $#{amount} is accepted" do
     issue amount
 
     assert_success
